@@ -161,6 +161,9 @@ class StrideAppstoreService : Service() {
 
         val plan = UpdatePlan.compute(catalog, installedApps(), deviceProfile())
         AppstoreState.completeCheck(catalog, plan)
+        // Only cache what parsed. Storing the raw body first would let one bad deploy poison every
+        // subsequent start with a catalog we already know we cannot read.
+        cacheCatalog(this, body)
 
         // Third-party updates proceed on their own; Stride's own upgrade waits for a tap.
         UpdatePlan.backgroundInstallable(plan, catalog.bundledPackages).forEach { item ->
@@ -337,49 +340,11 @@ class StrideAppstoreService : Service() {
 
     // ----------------------------------------------------------------- device
 
-    private fun installedApps(): List<InstalledApp> {
-        val pm = packageManager
-        // The <queries> block in the manifest is what makes this honest under package-visibility
-        // filtering; we deliberately do not hold QUERY_ALL_PACKAGES (see AndroidManifest.xml).
-        return pm.getInstalledPackages(0).mapNotNull { info ->
-            val name = info.packageName.orEmpty()
-            if (name.isBlank()) return@mapNotNull null
-            val code = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
-                info.longVersionCode
-            } else {
-                @Suppress("DEPRECATION")
-                info.versionCode.toLong()
-            }
-            InstalledApp(name, code, info.versionName ?: "")
-        }
-    }
+    private fun installedApps(): List<InstalledApp> = installedApps(this)
 
-    private fun deviceProfile(): DeviceProfile = DeviceProfile(
-        sdkInt = Build.VERSION.SDK_INT,
-        supportedAbis = Build.SUPPORTED_ABIS?.toList() ?: emptyList(),
-        selfPackage = packageName,
-        hasGms = hasUsableGms(),
-    )
+    private fun deviceProfile(): DeviceProfile = deviceProfile(this)
 
-    /**
-     * Whether Google Play Services is present and enabled.
-     *
-     * This used to additionally require `FLAG_SYSTEM`, on the reasoning that Play Services must live
-     * in `/system/priv-app` to hold its signature-level permissions, so a user-space sideload would
-     * install and then be inert. That was tested on this hardware on 2026-08-14 and is **not** what
-     * happens: an ordinary `PackageInstaller` sideload of GSF Login, GSF, GMS Core (base plus its
-     * density split) and the Play Store, installed in that order and followed by a reboot, gives a
-     * Play Store that signs in and installs apps. See `docs/APPSTORE.md` §11.
-     *
-     * So the check is now presence and enablement, which is what callers actually meant. Requiring
-     * `FLAG_SYSTEM` would report false on a console where Play demonstrably works, and mark every
-     * `requiresGms` app ineligible on the one device that had just earned them.
-     */
-    private fun hasUsableGms(): Boolean = try {
-        packageManager.getApplicationInfo(GMS_PACKAGE, 0).enabled
-    } catch (e: PackageManager.NameNotFoundException) {
-        false
-    }
+    private fun hasUsableGms(): Boolean = hasUsableGms(this)
 
     // ----------------------------------------------------------- foreground
 
@@ -425,6 +390,7 @@ class StrideAppstoreService : Service() {
         private const val PREFS = "stride_appstore"
         private const val KEY_CATALOG_URL = "catalog_url"
         private const val KEY_LAST_CHECK = "last_check_wall_ms"
+        private const val KEY_CATALOG = "last_catalog_json"
         private const val CHANNEL_ID = "stride_spikes_appstore"
         private const val NOTIFICATION_ID = 4322
         private const val TAG = "StrideAppstore"
@@ -483,12 +449,98 @@ class StrideAppstoreService : Service() {
          * The timestamp is persisted rather than kept in [AppstoreState], which lives only as long
          * as the process: a launcher restart would otherwise always look like "never checked" and
          * this would fetch the catalog every single time.
+         *
+         * When the guard says "too soon", restore the last result from disk instead of doing
+         * nothing. Persisting only the timestamp made a restart within the interval suppress the
+         * check *and* leave the launcher with an empty [AppstoreState] - so the store read "not
+         * checked yet" and the header badge showed nothing, hiding a pending update until the rider
+         * happened to tap Check now. Suppressing the network call is right; forgetting what it
+         * returned is not.
          */
         fun checkOnStart(context: Context) {
             val prefs = context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
             val last = prefs.getLong(KEY_LAST_CHECK, 0L)
-            if (!UpdatePlan.shouldCheckOnStart(last, System.currentTimeMillis())) return
+            if (!UpdatePlan.shouldCheckOnStart(last, System.currentTimeMillis())) {
+                restoreCached(context)
+                return
+            }
             check(context)
+        }
+
+        /**
+         * Seed [AppstoreState] from the last catalog this console successfully parsed.
+         *
+         * The plan is *recomputed* rather than cached: what is installed can change between
+         * processes - by our own installer, by adb, by an uninstall - and a stale plan would offer
+         * an update for something already updated. Only the catalog bytes are worth keeping; the
+         * verdict is cheap and must be current.
+         *
+         * Never overwrites a live result, and stays silent on a bad cache: this runs on the launcher
+         * start path, where the correct failure is simply "not checked yet" and a real check.
+         */
+        internal fun restoreCached(context: Context) {
+            if (AppstoreState.catalog != null) return
+            val prefs = context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+            val body = prefs.getString(KEY_CATALOG, null) ?: return
+            val checkedAt = prefs.getLong(KEY_LAST_CHECK, 0L)
+            try {
+                val catalog = CatalogManifest.parse(body)
+                val plan = UpdatePlan.compute(catalog, installedApps(context), deviceProfile(context))
+                AppstoreState.restore(catalog, plan, checkedAt)
+            } catch (e: Exception) {
+                Log.w(TAG, "cached catalog unusable, leaving state empty", e)
+            }
+        }
+
+        /** Stored so a launcher restart can show the last known state without hitting the network. */
+        internal fun cacheCatalog(context: Context, body: String) {
+            context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+                .edit { putString(KEY_CATALOG, body) }
+        }
+
+        internal fun installedApps(context: Context): List<InstalledApp> {
+            val pm = context.packageManager
+            // The <queries> block in the manifest is what makes this honest under package-visibility
+            // filtering; we deliberately do not hold QUERY_ALL_PACKAGES (see AndroidManifest.xml).
+            return pm.getInstalledPackages(0).mapNotNull { info ->
+                val name = info.packageName.orEmpty()
+                if (name.isBlank()) return@mapNotNull null
+                val code = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
+                    info.longVersionCode
+                } else {
+                    @Suppress("DEPRECATION")
+                    info.versionCode.toLong()
+                }
+                InstalledApp(name, code, info.versionName ?: "")
+            }
+        }
+
+        internal fun deviceProfile(context: Context): DeviceProfile = DeviceProfile(
+            sdkInt = Build.VERSION.SDK_INT,
+            supportedAbis = Build.SUPPORTED_ABIS?.toList() ?: emptyList(),
+            selfPackage = context.packageName,
+            hasGms = hasUsableGms(context),
+        )
+
+        /**
+         * Whether Google Play Services is present and enabled.
+         *
+         * This used to additionally require `FLAG_SYSTEM`, on the reasoning that Play Services must
+         * live in `/system/priv-app` to hold its signature-level permissions, so a user-space
+         * sideload would install and then be inert. That was tested on this hardware on 2026-08-14
+         * and is **not** what happens: an ordinary `PackageInstaller` sideload of GSF Login, GSF,
+         * GMS Core (base plus its density split) and the Play Store, installed in that order and
+         * followed by a reboot, gives a Play Store that signs in and installs apps. See
+         * `docs/APPSTORE.md` §11.
+         *
+         * So the check is now presence and enablement, which is what callers actually meant.
+         * Requiring `FLAG_SYSTEM` would report false on a console where Play demonstrably works, and
+         * mark every `requiresGms` app ineligible on the one device that had just earned them.
+         */
+        internal fun hasUsableGms(context: Context): Boolean = try {
+            context.packageManager.getApplicationInfo(GMS_PACKAGE, 0).enabled
+        } catch (e: PackageManager.NameNotFoundException) {
+            false
         }
 
         /**
