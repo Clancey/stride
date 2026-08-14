@@ -55,12 +55,42 @@ jobs:
         # The single most dangerous failure here is a debug-signed APK: it installs fine, looks
         # normal, and is silently un-updatable on every console that has the real key. Assert the
         # fingerprint rather than trusting that the unlock step worked.
+        #
+        # Every stage below fails loudly on its own. The first version of this step piped
+        # apksigner straight into grep|awk, so when apksigner could not be found the pipeline
+        # still exited 0, ACTUAL came back empty, and the job reported "signed with , expected
+        # <key>" - which reads like a signing failure and is in fact a lookup failure. Never
+        # compare a value that a masked pipeline failure can leave empty.
         run: |
+          set -o pipefail
           EXPECTED=92534d3c0cf814e027b8338ea4cfda0f54adc5d5eff34d33463526f572887e59
-          APKSIGNER="$(find "$ANDROID_HOME/build-tools" -name apksigner | sort -V | tail -1)"
-          ACTUAL="$("$APKSIGNER" verify --print-certs \
-            apps/spikes/build/app/outputs/flutter-apk/app-release.apk \
-            | grep -i 'Signer #1 certificate SHA-256 digest' | awk '{print $NF}')"
+          APK=apps/spikes/build/app/outputs/flutter-apk/app-release.apk
+
+          if [ ! -f "$APK" ]; then
+            echo "::error::no APK at $APK - the build step did not produce what this expects"
+            find apps/spikes/build -name '*.apk' 2>/dev/null || true
+            exit 1
+          fi
+
+          SDK="${ANDROID_HOME:-${ANDROID_SDK_ROOT:-/usr/local/lib/android/sdk}}"
+          APKSIGNER="$(find "$SDK" -name apksigner -type f 2>/dev/null | sort -V | tail -1)"
+          if [ -z "$APKSIGNER" ]; then
+            echo "::error::apksigner not found under $SDK (ANDROID_HOME='${ANDROID_HOME:-unset}',"
+            echo "::error::ANDROID_SDK_ROOT='${ANDROID_SDK_ROOT:-unset}'). Cannot prove which key"
+            echo "::error::signed this APK, so it must not be published."
+            exit 1
+          fi
+          echo "apksigner: $APKSIGNER"
+
+          CERTS="$("$APKSIGNER" verify --print-certs "$APK")"
+          ACTUAL="$(printf '%s\n' "$CERTS" \
+            | awk '/Signer #1 certificate SHA-256 digest/ {print $NF}')"
+          if [ -z "$ACTUAL" ]; then
+            echo "::error::could not read a signer digest out of apksigner. Full output:"
+            printf '%s\n' "$CERTS"
+            exit 1
+          fi
+
           echo "signer: $ACTUAL"
           if [ "$ACTUAL" != "$EXPECTED" ]; then
             echo "::error::signed with $ACTUAL, expected the Stride release key $EXPECTED"
@@ -79,21 +109,60 @@ jobs:
           # scoped to THIS repo only and cannot create a release on the catalog repo.
           GH_TOKEN: ${{ secrets.CATALOG_TOKEN }}
         run: |
+          set -o pipefail
+          APK="$GITHUB_WORKSPACE/apps/spikes/build/app/outputs/flutter-apk/app-release.apk"
+          VC="$(grep -m1 '^version:' apps/spikes/pubspec.yaml | sed 's/.*+//')"
+
           if [ -z "$GH_TOKEN" ]; then
+            {
+              echo "### Not published"
+              echo
+              echo "\`CATALOG_TOKEN\` is not set, so this build never reached the catalog and no"
+              echo "console will be offered it. The APK is attached to this run as an artifact."
+              echo
+              echo "To fix it permanently, create a fine-grained PAT with **contents: write** on"
+              echo "\`Clancey/stride-catalog\` and add it as the \`CATALOG_TOKEN\` secret on this repo."
+              echo
+              echo "To publish this build by hand in the meantime:"
+              echo
+              echo '```bash'
+              echo "gh run download $GITHUB_RUN_ID -n stride-release-apk -D /tmp/stride"
+              echo "cd /path/to/stride-catalog"
+              echo "tools/publish.sh /tmp/stride/app-release.apk --role stride --name Stride"
+              echo "tools/verify.sh && git add -A && git commit -m 'Publish Stride' && git push"
+              echo '```'
+            } >> "$GITHUB_STEP_SUMMARY"
             echo "::error::CATALOG_TOKEN is not set - cannot publish to Clancey/stride-catalog."
+            echo "::error::See this run's summary for how to set it, and how to publish by hand."
             exit 1
           fi
+
           git clone --depth 1 https://x-access-token:"$GH_TOKEN"@github.com/Clancey/stride-catalog.git /tmp/catalog
           cd /tmp/catalog
-          ./tools/publish.sh \
-            "$GITHUB_WORKSPACE/apps/spikes/build/app/outputs/flutter-apk/app-release.apk" \
-            --role stride --name Stride
+
+          # Re-running a tag must not try to republish. publish.sh reuses an existing release tag
+          # and deliberately never overwrites bytes a console may already have read - but it would
+          # then record the sha256 of THIS rebuild against those older published bytes, and a
+          # rebuild is not byte-identical. Its own verification would catch that, but failing a
+          # green build for work that is already done is not useful. A changed build is a new
+          # versionCode; that is the rule, so honour it here.
+          # One line on purpose: python3 -c with an indented block is an IndentationError.
+          PUBLISHED="$(python3 -c "import json,sys; a=[x for x in json.load(open('catalog.json'))['apps'] if x.get('role')=='stride']; print(a[0]['versionCode'] if a else 0)")"
+          if [ "$PUBLISHED" -ge "$VC" ]; then
+            echo "catalog already publishes versionCode $PUBLISHED (this build is $VC) - nothing to do."
+            echo "### Already published" >> "$GITHUB_STEP_SUMMARY"
+            echo "The catalog serves versionCode \`$PUBLISHED\`; this build is \`$VC\`." >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+
+          ./tools/publish.sh "$APK" --role stride --name Stride
           ./tools/verify.sh
           git config user.name "stride-release-bot"
           git config user.email "noreply@github.com"
           git add catalog.json
           git commit -m "Publish Stride from ${GITHUB_SHA:0:7}" || { echo "nothing to commit"; exit 0; }
           git push
+          echo "### Published versionCode $VC to the catalog" >> "$GITHUB_STEP_SUMMARY"
 
       - name: Always re-lock
         if: always()
