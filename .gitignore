@@ -38,6 +38,8 @@ Thumbs.db
 # not the mechanism.
 *.pem
 *.key
+# ...but the throwaway test fixture must be committed; it contains generated certs, no secrets.
+!apps/spikes/test/fixtures/**
 *.p12
 *.pfx
 certs/
