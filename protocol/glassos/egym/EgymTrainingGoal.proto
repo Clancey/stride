@@ -1,0 +1,18 @@
+syntax = "proto3";
+package com.ifit.glassos;
+option java_package = "com.ifit.glassos.egym";
+option java_outer_classname = "EgymTrainingGoalProto";
+option java_multiple_files = true;
+option swift_prefix = "IFit";
+
+enum EgymTrainingGoal {
+  EGYM_TRAINING_GOAL_WEIGHT_LOSS = 0;
+  EGYM_TRAINING_GOAL_MUSCLE_BUILDING = 1;
+  EGYM_TRAINING_GOAL_GENERAL_FITNESS = 2;
+  EGYM_TRAINING_GOAL_BODY_TONING = 3;
+  EGYM_TRAINING_GOAL_REHA_FIT = 4;
+  EGYM_TRAINING_GOAL_IMMUNITY_BOOST = 5;
+  EGYM_TRAINING_GOAL_ATHLETIC = 6;
+  EGYM_TRAINING_GOAL_METABOLIC_FIT = 7;
+  EGYM_TRAINING_GOAL_UNKNOWN = 8;
+}

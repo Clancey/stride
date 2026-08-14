@@ -1,0 +1,30 @@
+syntax = "proto3";
+package com.ifit.glassos;
+option java_package = "com.ifit.glassos.egym";
+option java_outer_classname = "EgymTrainingPlansStateProto";
+option java_multiple_files = true;
+option swift_prefix = "IFit";
+
+import "egym/EgymTrainingPlans.proto";
+
+message EgymTrainingPlansStateNotFetched {}
+
+message EgymTrainingPlansStateLoading {}
+
+message EgymTrainingPlansStateSuccess {
+  EgymTrainingPlans trainingPlans = 1;
+}
+
+message EgymTrainingPlansStateError {
+  string message = 1;
+}
+
+
+message EgymTrainingPlansState {
+  oneof state {
+    EgymTrainingPlansStateNotFetched notFetched = 1;
+    EgymTrainingPlansStateLoading loading = 2;
+    EgymTrainingPlansStateSuccess success = 3;
+    EgymTrainingPlansStateError error = 4;
+  }
+}

@@ -1,0 +1,28 @@
+syntax = "proto3";
+package com.ifit.glassos;
+option java_package = "com.ifit.glassos.egym";
+option java_outer_classname = "EgymCardioMeasurementsStateProto";
+option java_multiple_files = true;
+option swift_prefix = "IFit";
+
+message EgymCardioMeasurementsStateNotFetched {}
+
+message EgymCardioMeasurementsStateLoading {}
+
+message EgymCardioMeasurementsStateSuccess {
+  map<string, string> measurements = 1;
+}
+
+message EgymCardioMeasurementsStateError {
+  string message = 1;
+}
+
+
+message EgymCardioMeasurementsState {
+  oneof state {
+    EgymCardioMeasurementsStateNotFetched notFetched = 1;
+    EgymCardioMeasurementsStateLoading loading = 2;
+    EgymCardioMeasurementsStateSuccess success = 3;
+    EgymCardioMeasurementsStateError error = 4;
+  }
+}

@@ -1,0 +1,16 @@
+syntax = "proto3";
+package com.ifit.glassos;
+option java_package = "com.ifit.glassos.egym";
+option java_outer_classname = "EgymTrainingProgramProto";
+option java_multiple_files = true;
+option swift_prefix = "IFit";
+
+enum EgymTrainingProgram {
+  EGYM_TRAINING_PROGRAM_WEIGHT_LOSS = 0;
+  EGYM_TRAINING_PROGRAM_FITNESS = 1;
+  EGYM_TRAINING_PROGRAM_MUSCLE_GAIN = 2;
+  EGYM_TRAINING_PROGRAM_BBP = 3;
+  EGYM_TRAINING_PROGRAM_BBP_AND_WEIGHT_LOSS = 4;
+  EGYM_TRAINING_PROGRAM_REHA_SPORT = 5;
+  EGYM_TRAINING_PROGRAM_UNKNOWN = 6;
+}

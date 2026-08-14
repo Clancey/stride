@@ -1,0 +1,44 @@
+syntax = "proto3";
+package com.ifit.glassos;
+option java_package = "com.ifit.glassos.egym";
+option java_outer_classname = "EgymUserProto";
+option java_multiple_files = true;
+option swift_prefix = "IFit";
+
+import "settings/SystemUnitsService.proto";
+import "egym/EgymTrainingProgram.proto";
+import "egym/EgymTrainingGoal.proto";
+import "egym/EgymTrainingExperience.proto";
+import "egym/EgymMuscleGroup.proto";
+import "egym/EgymMuscleGroupIntent.proto";
+
+message EgymUser {
+  optional string bmaUserId = 1;
+  optional string dateOfBirth = 2;
+  string firstName = 3;
+  optional string gender = 4;
+  optional double height = 5;
+  optional string lastName = 6;
+  optional string locale = 7;
+  map<string, bool> optIns = 8;
+  optional bool termsAndConditionsAccepted = 9;
+  optional EgymTrainingProgram trainingGoal = 10;
+  optional TrainingPlanPreferences trainingPlanPreferences = 11;
+  optional EgymTrainingProgram trainingProgram = 12;
+  SystemUnits unitSystem = 13;
+  optional string userId = 14;
+  optional double weight = 15;
+}
+
+message TrainingPlanPreferences {
+  int32 daysPerWeek = 1;
+  EgymTrainingExperience trainingExperience = 2;
+  EgymTrainingGoal trainingGoalType = 3;
+  repeated TrainingMuscleGroupPreference trainingMuscleGroupPreferences = 4;
+  int32 workoutDurationInMinutes = 5;
+}
+
+message TrainingMuscleGroupPreference {
+  EgymMuscleGroup muscleGroup = 1;
+  EgymMuscleGroupIntent muscleGroupIntent = 2;
+}

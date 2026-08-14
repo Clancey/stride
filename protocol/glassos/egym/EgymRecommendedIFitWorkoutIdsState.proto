@@ -1,0 +1,28 @@
+syntax = "proto3";
+package com.ifit.glassos;
+option java_package = "com.ifit.glassos.egym";
+option java_outer_classname = "EgymRecommendedIFitWorkoutIdsStateProto";
+option java_multiple_files = true;
+option swift_prefix = "IFit";
+
+message EgymRecommendedIFitWorkoutIdsStateNotFetched {}
+
+message EgymRecommendedIFitWorkoutIdsStateLoading {}
+
+message EgymRecommendedIFitWorkoutIdsStateSuccess {
+  repeated string workoutIds = 1;
+}
+
+message EgymRecommendedIFitWorkoutIdsStateError {
+  string message = 1;
+}
+
+
+message EgymRecommendedIFitWorkoutIdsState {
+  oneof state {
+    EgymRecommendedIFitWorkoutIdsStateNotFetched notFetched = 1;
+    EgymRecommendedIFitWorkoutIdsStateLoading loading = 2;
+    EgymRecommendedIFitWorkoutIdsStateSuccess success = 3;
+    EgymRecommendedIFitWorkoutIdsStateError error = 4;
+  }
+}

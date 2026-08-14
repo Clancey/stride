@@ -1,0 +1,56 @@
+syntax = "proto3";
+package com.ifit.glassos;
+option java_package = "com.ifit.glassos.egym";
+option java_outer_classname = "EgymTrainingPlansProto";
+option java_multiple_files = true;
+option swift_prefix = "IFit";
+
+import "egym/EgymCardioWorkoutInterval.proto";
+
+message EgymTrainingPlans {
+  repeated EgymTrainingPlanGenius genius = 1;
+  repeated EgymTrainingPlanSmart smart = 2;
+  repeated EgymTrainingPlanTrainer trainer = 3;
+}
+
+message EgymTrainingPlanGenius {
+  int64 endTimestamp = 1;
+  string exerciseName = 2;
+  int32 frequency = 3;
+  repeated EgymCardioWorkoutInterval intervals = 4;
+  int32 orderNumber = 5;
+  string sessionName = 6;
+  int64 startTimestamp = 7;
+  string timezone = 8;
+  int64 trainingPlanExerciseId = 9;
+  int64 trainingPlanId = 10;
+}
+
+message EgymTrainingPlanSmart {
+  int64 endTimestamp = 1;
+  int32 frequency = 2;
+  string intensity = 3;
+  repeated EgymCardioWorkoutInterval intervals = 4;
+  string smartExerciseName = 5;
+  string smartTrainingMethod = 6;
+  int64 startTimestamp = 7;
+  string timezone = 8;
+  string trainingGoal = 9;
+  int64 trainingPlanExerciseId = 10;
+  int64 trainingPlanId = 11;
+  string trainingProgram = 12;
+}
+
+message EgymTrainingPlanTrainer {
+  int64 endTimestamp = 1;
+  string exerciseName = 2;
+  int32 frequency = 3;
+  repeated EgymCardioWorkoutInterval intervals = 4;
+  int32 orderNumber = 5;
+  string sessionName = 6;
+  int64 startTimestamp = 7;
+  string timezone = 8;
+  int64 trainingPlanExerciseId = 9;
+  int64 trainingPlanId = 10;
+}
+

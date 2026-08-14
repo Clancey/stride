@@ -1,0 +1,26 @@
+syntax = "proto3";
+package com.ifit.glassos;
+option java_package = "com.ifit.glassos.egym";
+option java_outer_classname = "EgymAuthStateProto";
+option java_multiple_files = true;
+option swift_prefix = "IFit";
+
+message EgymAuthStateUnauthenticated {}
+
+message EgymAuthStateAuthenticating {}
+
+message EgymAuthStateAuthenticated {}
+
+message EgymAuthStateError {
+  string message = 1;
+}
+
+
+message EgymAuthState {
+  oneof state {
+    EgymAuthStateUnauthenticated unauthenticated = 1;
+    EgymAuthStateAuthenticating authenticating = 2;
+    EgymAuthStateAuthenticated authenticated = 3;
+    EgymAuthStateError error = 4;
+  }
+}

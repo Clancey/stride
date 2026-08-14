@@ -1,0 +1,12 @@
+syntax = "proto3";
+package com.ifit.glassos;
+option java_package = "com.ifit.glassos.egym";
+option java_outer_classname = "EgymMuscleGroupIntentProto";
+option java_multiple_files = true;
+option swift_prefix = "IFit";
+
+enum EgymMuscleGroupIntent {
+  EGYM_MUSCLE_GROUP_INTENT_FOCUS = 0;
+  EGYM_MUSCLE_GROUP_INTENT_EXCLUDE = 1;
+  EGYM_MUSCLE_GROUP_INTENT_UNKNOWN = 2;
+}

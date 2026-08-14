@@ -44,6 +44,21 @@ Thumbs.db
 *.pfx
 certs/
 glassos/
+# ...but the extracted GlassOS *protocol definitions* are API surface, not secrets, and are the
+# whole point of protocol/glassos. Certificates and keys there stay ignored by the *.pem/*.key
+# rules above, which is the protection that actually matters.
+!protocol/glassos/
+!protocol/glassos/**
+# Re-assert the credential ban *after* the negation above, because `!protocol/glassos/**` would
+# otherwise re-include the very .pem/.key files the rules at the top of this section exist to keep
+# out. Verified with `git check-ignore`: protos are committable, credentials are not.
+protocol/glassos/**/*.pem
+protocol/glassos/**/*.key
+protocol/glassos/**/*.p12
+protocol/glassos/**/*.pfx
+protocol/glassos/**/*.jks
+protocol/glassos/**/*.bks
+protocol/glassos/**/*.apk
 
 # Captured protocol traces may contain serial numbers and account identifiers. Scrub before
 # committing anything under tools/ (docs/PLAN.md section 7).

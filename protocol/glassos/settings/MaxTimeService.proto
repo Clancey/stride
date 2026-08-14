@@ -1,0 +1,25 @@
+syntax = "proto3";
+package com.ifit.glassos;
+import "util/Util.proto";
+option java_package = "com.ifit.glassos.settings";
+option java_outer_classname = "MaxTimeServiceProto";
+option java_multiple_files = true;
+option swift_prefix = "IFit";
+
+message MaxTimeMessage {
+  double maxTime = 1;
+}
+
+service MaxTimeService {
+  rpc SetMaxDurationTime(MaxTimeMessage) returns (Empty) {}
+
+  rpc SetMaxPauseTime(MaxTimeMessage) returns (Empty) {}
+
+  rpc MaxDurationTimeSubscription(Empty) returns (stream MaxTimeMessage) {}
+
+  rpc MaxPauseTimeSubscription(Empty) returns (stream MaxTimeMessage) {}
+
+  rpc MaxDurationTimeReachedSubscription(Empty) returns (stream BooleanResponse) {}
+
+  rpc MaxPauseTimeReachedSubscription(Empty) returns (stream BooleanResponse) {}
+}

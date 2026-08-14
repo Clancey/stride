@@ -1,0 +1,24 @@
+syntax = "proto3";
+package com.ifit.glassos;
+option java_package = "com.ifit.glassos.egym";
+option java_outer_classname = "EgymCardioWorkoutIntervalProto";
+option java_multiple_files = true;
+option swift_prefix = "IFit";
+
+message EgymCardioWorkoutInterval {
+  double distance = 1;
+  int64 duration = 2;
+  int32 floors = 3;
+  int32 heartRate = 4;
+  double incline = 5;
+  double kiloCalories = 6;
+  int32 rampAngle = 7;
+  double resistance = 8;
+  int32 rotations = 9;
+  double speed = 10;
+  int32 stepHeight = 11;
+  int32 steps = 12;
+  int32 stepsPerMinute = 13;
+  int32 strideLengthZone = 14;
+  double watts = 15;
+}

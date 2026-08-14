@@ -1,0 +1,21 @@
+syntax = "proto3";
+package com.ifit.glassos;
+option java_package = "com.ifit.glassos.egym";
+option java_outer_classname = "EgymMuscleGroupProto";
+option java_multiple_files = true;
+option swift_prefix = "IFit";
+
+enum EgymMuscleGroup {
+  EGYM_MUSCLE_GROUP_NECK_AND_SHOULDERS = 0;
+  EGYM_MUSCLE_GROUP_ARMS = 1;
+  EGYM_MUSCLE_GROUP_CHEST = 2;
+  EGYM_MUSCLE_GROUP_UPPER_BACK = 3;
+  EGYM_MUSCLE_GROUP_ABDOMINAL = 4;
+  EGYM_MUSCLE_GROUP_LOWER_BACK = 5;
+  EGYM_MUSCLE_GROUP_HIP = 6;
+  EGYM_MUSCLE_GROUP_BUTTOCK = 7;
+  EGYM_MUSCLE_GROUP_THIGHS = 8;
+  EGYM_MUSCLE_GROUP_CALVES = 9;
+  EGYM_MUSCLE_GROUP_UNKNOWN = 10;
+}
+

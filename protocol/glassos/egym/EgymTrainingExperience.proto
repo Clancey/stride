@@ -1,0 +1,16 @@
+syntax = "proto3";
+package com.ifit.glassos;
+option java_package = "com.ifit.glassos.egym";
+option java_outer_classname = "EgymTrainingExperienceProto";
+option java_multiple_files = true;
+option swift_prefix = "IFit";
+
+enum EgymTrainingExperience {
+  EGYM_TRAINING_EXPERIENCE_BEGINNER = 0;
+  EGYM_TRAINING_EXPERIENCE_BEGINNER_INTERMEDIATE = 1;
+  EGYM_TRAINING_EXPERIENCE_INTERMEDIATE = 2;
+  EGYM_TRAINING_EXPERIENCE_INTERMEDIATE_ADVANCED = 3;
+  EGYM_TRAINING_EXPERIENCE_ADVANCED = 4;
+  EGYM_TRAINING_EXPERIENCE_VERY_ADVANCED = 5;
+  EGYM_TRAINING_EXPERIENCE_UNKNOWN = 6;
+}

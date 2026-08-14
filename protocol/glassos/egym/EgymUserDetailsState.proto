@@ -1,0 +1,30 @@
+syntax = "proto3";
+package com.ifit.glassos;
+option java_package = "com.ifit.glassos.egym";
+option java_outer_classname = "EgymUserDetailsStateProto";
+option java_multiple_files = true;
+option swift_prefix = "IFit";
+
+import "egym/EgymUser.proto";
+
+message EgymUserDetailsStateNotFetched {}
+
+message EgymUserDetailsStateLoading {}
+
+message EgymUserDetailsStateSuccess {
+  EgymUser user = 1;
+}
+
+message EgymUserDetailsStateError {
+  string message = 1;
+}
+
+
+message EgymUserDetailsState {
+  oneof state {
+    EgymUserDetailsStateNotFetched notFetched = 1;
+    EgymUserDetailsStateLoading loading = 2;
+    EgymUserDetailsStateSuccess success = 3;
+    EgymUserDetailsStateError error = 4;
+  }
+}

@@ -1,0 +1,50 @@
+syntax = "proto3";
+
+package com.ifit.glassos.egym;
+
+option java_package = "com.ifit.glassos.egym";
+option java_outer_classname = "EgymServiceProto";
+option java_multiple_files = true;
+option swift_prefix = "IFit";
+
+import "activitylog/ActivityLog.proto";
+import "egym/EgymAuthState.proto";
+import "egym/EgymUserDetailsState.proto";
+import "egym/EgymCardioMeasurementsState.proto";
+import "egym/EgymTrainingPlansState.proto";
+import "egym/EgymRecommendedIFitWorkoutIdsState.proto";
+import "util/Util.proto";
+
+
+message EgymLoginRequest {
+  string rfid = 1;
+  string rfidFormat = 2;
+}
+
+message EgymCacheRecommendedWorkoutIdAndStartTimeRequest {
+  string workoutId = 1;
+  int64 startTime = 2;
+}
+
+// Service definition for IFitEgynService
+service EgymService {
+  rpc EgymAuthStateFlowSubscription(Empty) returns (stream EgymAuthState) {}
+  rpc EgymUserDetailsStateFlowSubscription(Empty) returns (stream EgymUserDetailsState) {}
+  rpc EgymCardioMeasurementsStateFlowSubscription(Empty) returns (stream EgymCardioMeasurementsState) {}
+  rpc EgymTrainingPlansStateFlowSubscription(Empty) returns (stream EgymTrainingPlansState) {}
+  rpc EgymRecommendedIFitWorkoutIdsStateFlowSubscription(Empty) returns (stream EgymRecommendedIFitWorkoutIdsState) {}
+
+  rpc Login(EgymLoginRequest) returns (Empty) {}
+  rpc Logout(Empty) returns (Empty) {}
+  rpc GetCardioMeasurements(Empty) returns (Empty) {}
+  rpc GetTrainingPlans(Empty) returns (Empty) {}
+  rpc SaveWorkout(ActivityLog) returns (BooleanResponse) {}
+  rpc IsAuthenticated(Empty) returns (BooleanResponse) {}
+  rpc SetLegalAcceptanceAccepted(BooleanRequest) returns (Empty) {}
+  rpc HasAcceptedLegalAcceptance(Empty) returns (BooleanResponse) {}
+  rpc CacheRecommendedWorkoutIdAndStartTime(EgymCacheRecommendedWorkoutIdAndStartTimeRequest) returns (Empty) {}
+  rpc GetCachedWorkoutId(Empty) returns (OptionalStringResponse) {}
+  rpc GetCachedWorkoutStartTime(Empty) returns (OptionalLongResponse) {}
+  rpc GetRecommendedIFitWorkoutIds(Empty) returns (Empty) {}
+  rpc ClearWorkoutData(Empty) returns (Empty) {}
+}
