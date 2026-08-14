@@ -193,30 +193,25 @@ class _AllAppsScreenState extends State<AllAppsScreen>
           return const _NoSearchResults();
         }
 
-        return LayoutBuilder(
-          builder: (context, constraints) {
-            final columns = (constraints.maxWidth / 210).floor().clamp(3, 6);
-            return GridView.builder(
-              itemCount: apps.length,
-              gridDelegate: SliverGridDelegateWithFixedCrossAxisCount(
-                crossAxisCount: columns,
-                mainAxisSpacing: StrideSpace.md,
-                crossAxisSpacing: StrideSpace.md,
-                childAspectRatio: 1.45,
-              ),
-              itemBuilder: (context, index) {
-                final app = apps[index];
-                final pinned = widget.profiles.isPinned(app.package);
-                return AppTile(
+        // Wrap, not a fixed-aspect grid: the tile sizes itself from its icon and
+        // label, and pinning it to a ratio clips the label on the browse metrics.
+        return SingleChildScrollView(
+          child: Wrap(
+            spacing: AppTileMetrics.gutter,
+            runSpacing: AppTileMetrics.gutter,
+            children: [
+              for (final app in apps)
+                AppTile(
                   app: app,
                   iconCache: widget.iconCache,
-                  pinned: pinned,
+                  metrics: AppTileMetrics.browse,
+                  pinned: widget.profiles.isPinned(app.package),
                   onLaunch: () => widget.onLaunch(app),
-                  onPinToggle: () => _togglePin(app, pinned),
-                );
-              },
-            );
-          },
+                  onPinToggle: () =>
+                      _togglePin(app, widget.profiles.isPinned(app.package)),
+                ),
+            ],
+          ),
         );
       },
     );
@@ -266,9 +261,9 @@ class _AllAppsScreenState extends State<AllAppsScreen>
             padding: const EdgeInsets.only(bottom: StrideSpace.xs),
             child: Text(
               'Not available for this console',
-              style: Theme.of(context).textTheme.titleSmall?.copyWith(
-                color: StrideColors.textMuted,
-              ),
+              style: Theme.of(
+                context,
+              ).textTheme.titleSmall?.copyWith(color: StrideColors.textMuted),
             ),
           ),
           for (final item in blocked)
@@ -383,7 +378,9 @@ class _StoreRow extends StatelessWidget {
                 Text(
                   item.subtitle,
                   style: theme.textTheme.bodyMedium?.copyWith(
-                    color: failed ? StrideColors.danger : StrideColors.textMuted,
+                    color: failed
+                        ? StrideColors.danger
+                        : StrideColors.textMuted,
                   ),
                 ),
                 if (progress != null) ...[
@@ -405,7 +402,13 @@ class _StoreRow extends StatelessWidget {
                 minimumSize: const Size(0, StrideSpace.minTouch),
               ),
               onPressed: canInstall ? onInstall : null,
-              child: Text(failed ? 'Retry' : 'Install'),
+              child: Text(
+                item.stage.needsConfirm
+                    ? 'Confirm'
+                    : failed
+                    ? 'Retry'
+                    : 'Install',
+              ),
             ),
         ],
       ),

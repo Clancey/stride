@@ -118,7 +118,8 @@ class LauncherHomeState extends State<LauncherHome> {
     }
   }
 
-  Future<void> _launch(LaunchableApp app) async {    try {
+  Future<void> _launch(LaunchableApp app) async {
+    try {
       final launched = await SpikeBridge.launchApp(app.package);
       if (!mounted || launched) return;
       _showMessage('Could not launch ${app.label}');
@@ -362,7 +363,8 @@ class LauncherHomeState extends State<LauncherHome> {
       running = status['running'] == true;
       if (!running) running = await SpikeBridge.startOverlay();
       if (!running) {
-        message = "Stride's controls can't appear over other apps yet. "
+        message =
+            "Stride's controls can't appear over other apps yet. "
             'Grant "Draw over other apps" above.';
       }
     } catch (_) {

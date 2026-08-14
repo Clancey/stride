@@ -55,28 +55,31 @@ class _NavigationScreenState extends State<NavigationScreen> with SpikeLog {
   }
 
   Future<void> _refresh() => guard('accessibility status', () async {
-        await _refreshQuiet();
-        logLine('service connected: $_connected');
-        logLine('listed in secure settings: $_enabledInSettings');
-        logLine('foreground package: ${_foreground ?? "(unknown)"}');
-        if (!_connected) {
-          logLine(
-            'FAIL Not connected. Enable with:\n'
-            '  adb shell settings put secure enabled_accessibility_services '
-            'io.stride.spikes/io.stride.spikes.StrideAccessibilityService\n'
-            '  adb shell settings put secure accessibility_enabled 1',
-          );
-        } else {
-          logLine('PASS Service connected. Now reboot and re-check - persistence is the '
-              'real question, and it has no workaround.');
-        }
-      });
+    await _refreshQuiet();
+    logLine('service connected: $_connected');
+    logLine('listed in secure settings: $_enabledInSettings');
+    logLine('foreground package: ${_foreground ?? "(unknown)"}');
+    if (!_connected) {
+      logLine(
+        'FAIL Not connected. Enable with:\n'
+        '  adb shell settings put secure enabled_accessibility_services '
+        'io.stride.spikes/io.stride.spikes.StrideAccessibilityService\n'
+        '  adb shell settings put secure accessibility_enabled 1',
+      );
+    } else {
+      logLine(
+        'PASS Service connected. Now reboot and re-check - persistence is the '
+        'real question, and it has no workaround.',
+      );
+    }
+  });
 
   @override
   Widget build(BuildContext context) {
     return SpikeScaffold(
       title: 'S10 — Navigation',
-      question: 'Can we send Back to third-party apps, and does the service survive reboot?',
+      question:
+          'Can we send Back to third-party apps, and does the service survive reboot?',
       log: log,
       actions: [
         FilledButton.icon(
@@ -98,7 +101,9 @@ class _NavigationScreenState extends State<NavigationScreen> with SpikeLog {
         FilledButton.icon(
           onPressed: () => guard('GLOBAL_ACTION_RECENTS', () async {
             final ok = await SpikeBridge.goRecents();
-            logLine(ok ? 'PASS Recents dispatched.' : 'FAIL Service unavailable.');
+            logLine(
+              ok ? 'PASS Recents dispatched.' : 'FAIL Service unavailable.',
+            );
           }),
           icon: const Icon(Icons.layers),
           label: const Text('Recents'),
@@ -129,9 +134,11 @@ class _NavigationScreenState extends State<NavigationScreen> with SpikeLog {
                     ),
                     const SizedBox(width: 8),
                     Expanded(
-                      child: Text(_connected
-                          ? 'Accessibility service connected'
-                          : 'Accessibility service NOT connected'),
+                      child: Text(
+                        _connected
+                            ? 'Accessibility service connected'
+                            : 'Accessibility service NOT connected',
+                      ),
                     ),
                   ],
                 ),

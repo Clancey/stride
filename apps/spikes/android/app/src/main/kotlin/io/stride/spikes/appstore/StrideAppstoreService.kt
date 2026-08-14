@@ -89,7 +89,14 @@ class StrideAppstoreService : Service() {
 
             ACTION_INSTALL -> {
                 val packageName = intent.getStringExtra(EXTRA_PACKAGE)
-                if (packageName != null) worker.execute { installNow(packageName) }
+                if (packageName != null) {
+                    // A prompt this package already raised, that the user missed or dismissed, is
+                    // re-raised rather than restarted: the session is still open, so downloading
+                    // and staging it all over again would be work with no visible difference.
+                    if (!Confirmations.reshow(this, packageName)) {
+                        worker.execute { installNow(packageName) }
+                    }
+                }
             }
 
             else -> worker.execute { check() }

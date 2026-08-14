@@ -48,12 +48,18 @@ void main() {
     test('distance progress is the ratio, clamped to 0..1', () {
       final goal = WorkoutGoal.distance(5);
       expect(
-        goal.progressFrom(distanceMiles: 1, elapsed: const Duration(minutes: 5)),
+        goal.progressFrom(
+          distanceMiles: 1,
+          elapsed: const Duration(minutes: 5),
+        ),
         closeTo(0.2, 1e-9),
       );
       // Exceeded goal clamps at 1.0 rather than reporting 1.2.
       expect(
-        goal.progressFrom(distanceMiles: 6, elapsed: const Duration(minutes: 5)),
+        goal.progressFrom(
+          distanceMiles: 6,
+          elapsed: const Duration(minutes: 5),
+        ),
         1.0,
       );
     });
@@ -61,7 +67,10 @@ void main() {
     test('time progress reads the elapsed clock, clamped at 1.0', () {
       final goal = WorkoutGoal.time(const Duration(minutes: 30));
       expect(
-        goal.progressFrom(distanceMiles: 0, elapsed: const Duration(minutes: 10)),
+        goal.progressFrom(
+          distanceMiles: 0,
+          elapsed: const Duration(minutes: 10),
+        ),
         closeTo(1 / 3, 1e-9),
       );
       expect(
@@ -137,7 +146,9 @@ void main() {
 
     test('zero elapsed yields null for both kinds', () {
       expect(
-        WorkoutGoal.distance(5).etaFrom(distanceMiles: 1, elapsed: Duration.zero),
+        WorkoutGoal.distance(
+          5,
+        ).etaFrom(distanceMiles: 1, elapsed: Duration.zero),
         isNull,
       );
       expect(
@@ -182,10 +193,7 @@ void main() {
         goal.remainingTime(const Duration(minutes: 20)),
         const Duration(minutes: 10),
       );
-      expect(
-        goal.remainingTime(const Duration(minutes: 40)),
-        Duration.zero,
-      );
+      expect(goal.remainingTime(const Duration(minutes: 40)), Duration.zero);
       expect(
         goal.remainingLabel(
           distanceMiles: 0,

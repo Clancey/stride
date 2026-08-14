@@ -153,21 +153,12 @@ class InstallResultReceiver : BroadcastReceiver() {
                     )
                     return
                 }
-                AppstoreState.update(packageName, AppstoreState.Stage.AWAITING_USER)
-                try {
-                    context.startActivity(confirm.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK))
-                } catch (e: Exception) {
-                    Log.w(TAG, "could not show install confirmation for $packageName", e)
-                    AppstoreState.update(
-                        packageName,
-                        AppstoreState.Stage.FAILED,
-                        message = "could not show the install confirmation: ${e.message}",
-                    )
-                }
+                Confirmations.offer(context, packageName, confirm)
             }
 
             PackageInstaller.STATUS_SUCCESS -> {
                 AppstoreState.update(packageName, AppstoreState.Stage.INSTALLED)
+                Confirmations.settled(context, packageName)
                 StrideAppstoreService.onInstallSettled(context, packageName)
             }
 
@@ -177,6 +168,7 @@ class InstallResultReceiver : BroadcastReceiver() {
                     AppstoreState.Stage.FAILED,
                     message = describe(status, message),
                 )
+                Confirmations.settled(context, packageName)
                 StrideAppstoreService.onInstallSettled(context, packageName)
             }
         }
@@ -211,5 +203,82 @@ class InstallResultReceiver : BroadcastReceiver() {
 
     private companion object {
         const val TAG = "StrideAppstore"
+    }
+}
+
+/**
+ * One install confirmation on screen at a time, and never a dead end.
+ *
+ * The platform hands back an Intent that raises its own confirmation dialog. Starting a second one
+ * while the first is up destroys the first activity *without* delivering any result: no success, no
+ * `STATUS_FAILURE_ABORTED`, nothing. The package sits in [AppstoreState.Stage.AWAITING_USER] forever
+ * and its Install button stays disabled, so the one app the rider actually asked for is the one they
+ * can no longer install. Two consoles, two taps, and it happens on the first try.
+ *
+ * So: hold the queue. Only the holder gets to show a dialog; everyone else waits and is promoted
+ * when the holder settles. The Intent is kept either way, because a dismissed dialog leaves the
+ * session open and re-raising it costs nothing - that is what makes a missed prompt recoverable
+ * rather than terminal.
+ */
+object Confirmations {
+    private val queue = ConfirmQueue()
+    private val intents = mutableMapOf<String, Intent>()
+
+    /** Show this confirmation now, or queue it behind the one already on screen. */
+    @Synchronized
+    fun offer(context: Context, packageName: String, confirm: Intent) {
+        intents[packageName] = confirm
+        if (queue.offer(packageName)) {
+            show(context, packageName)
+        } else {
+            AppstoreState.update(
+                packageName,
+                AppstoreState.Stage.AWAITING_USER,
+                message = "waiting for the ${queue.holder()} prompt to finish",
+            )
+        }
+    }
+
+    /**
+     * Re-raise a prompt the user missed or dismissed. Returns false when there is nothing pending,
+     * which is the caller's cue to run a normal install instead.
+     */
+    @Synchronized
+    fun reshow(context: Context, packageName: String): Boolean {
+        if (!queue.reshow(packageName)) return false
+        show(context, packageName)
+        return true
+    }
+
+    /** The session reached a terminal state. Drop it and promote whoever is next. */
+    @Synchronized
+    fun settled(context: Context, packageName: String) {
+        intents.remove(packageName)
+        val next = queue.settled(packageName) ?: return
+        show(context, next)
+    }
+
+    @Synchronized
+    fun reset() {
+        queue.reset()
+        intents.clear()
+    }
+
+    private fun show(context: Context, packageName: String) {
+        val confirm = intents[packageName] ?: return
+        AppstoreState.update(packageName, AppstoreState.Stage.AWAITING_USER)
+        try {
+            context.startActivity(Intent(confirm).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK))
+        } catch (e: Exception) {
+            Log.w("StrideAppstore", "could not show install confirmation for $packageName", e)
+            intents.remove(packageName)
+            val next = queue.abandon(packageName)
+            AppstoreState.update(
+                packageName,
+                AppstoreState.Stage.FAILED,
+                message = "could not show the install confirmation: ${e.message}",
+            )
+            if (next != null) show(context, next)
+        }
     }
 }

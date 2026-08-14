@@ -595,9 +595,7 @@ class _ConfirmBar extends StatelessWidget {
                       ),
                     )
                   : Icon(
-                      underway
-                          ? Icons.flag_rounded
-                          : Icons.play_arrow_rounded,
+                      underway ? Icons.flag_rounded : Icons.play_arrow_rounded,
                       size: 38,
                     ),
               label: FittedBox(

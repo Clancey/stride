@@ -34,7 +34,12 @@ class AppTileMetrics {
   double get labelHeight => _labelSize * _labelLeading * labelLines;
 
   /// Icon, gap, and label — so a [Wrap] can reserve identical rows.
-  double get height => icon + StrideSpace.sm + labelHeight + StrideSpace.md * 2;
+  ///
+  /// The icon block is [StrideSpace.xs] taller than the icon itself when the tile
+  /// can be pinned: the pin badge rides above the icon's top edge. Leaving that
+  /// out overflows every pinnable tile by exactly that much.
+  double get height =>
+      icon + StrideSpace.xs + StrideSpace.sm + labelHeight + StrideSpace.md * 2;
 }
 
 class AppTile extends StatelessWidget {

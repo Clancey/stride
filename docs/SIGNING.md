@@ -60,6 +60,19 @@ apksigner verify --print-certs build/app/outputs/flutter-apk/app-release.apk
 `tools/publish.sh` records whatever signer it finds into the catalog, so it will happily publish a
 debug-signed build. Check the fingerprint, not the file's timestamp.
 
+## Builds you hand to someone else
+
+**Every APK that leaves your machine must be signed with the release key — no exceptions.** This is
+not a tidiness rule. Stride self-updates, and Android refuses an update signed by a different key
+than the installed copy. A tester running a debug-signed build cannot ever be updated: they have to
+uninstall first, which wipes their profiles, pins, and goal history. There is no recovery that keeps
+their data, and you will not find out until the day you ship a fix.
+
+So: `tools/keystore.sh unlock` before you build anything for anyone, or take the build straight from
+the release workflow, which asserts the fingerprint and fails the run if it does not match. Local
+debug builds are fine for your own console as long as you accept the same uninstall when you switch
+it back.
+
 ## Recovering the passphrase
 
 ```bash

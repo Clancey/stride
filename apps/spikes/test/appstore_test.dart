@@ -61,7 +61,9 @@ void main() {
     });
 
     test('a missing items list does not throw', () {
-      final decoded = AppstoreStatus.fromMap(<String, dynamic>{'checking': true});
+      final decoded = AppstoreStatus.fromMap(<String, dynamic>{
+        'checking': true,
+      });
       expect(decoded.checking, isTrue);
       expect(decoded.items, isEmpty);
     });
@@ -127,7 +129,7 @@ void main() {
     });
 
     test('an in-flight item reports itself busy', () {
-      for (final stage in ['downloading', 'installing', 'awaiting_user']) {
+      for (final stage in ['downloading', 'installing']) {
         expect(
           AppstoreItem.fromMap(item(stage: stage)).stage.isBusy,
           isTrue,
@@ -137,8 +139,20 @@ void main() {
       expect(AppstoreItem.fromMap(item(stage: 'ready')).stage.isBusy, isFalse);
     });
 
+    test('a prompt waiting on the user is not busy, so it stays pressable', () {
+      // Raising a second install confirmation destroys the first one and the platform reports
+      // nothing back, so a package can sit in awaiting_user indefinitely. Treating that as busy
+      // disabled its button forever; it has to stay pressable so the prompt can be re-raised.
+      final stage = AppstoreItem.fromMap(item(stage: 'awaiting_user')).stage;
+      expect(stage.isBusy, isFalse);
+      expect(stage.needsConfirm, isTrue);
+    });
+
     test('an up-to-date or ineligible row is not actionable', () {
-      expect(AppstoreItem.fromMap(item(kind: 'upToDate')).isActionable, isFalse);
+      expect(
+        AppstoreItem.fromMap(item(kind: 'upToDate')).isActionable,
+        isFalse,
+      );
       expect(
         AppstoreItem.fromMap(item(kind: 'ineligible')).isActionable,
         isFalse,
@@ -203,7 +217,8 @@ void main() {
         'title': 'Draw over other apps',
         'detail': 'The stop control is an overlay window.',
         'done': false,
-        'adb': 'adb shell appops set io.stride.spikes SYSTEM_ALERT_WINDOW allow',
+        'adb':
+            'adb shell appops set io.stride.spikes SYSTEM_ALERT_WINDOW allow',
         'action': null,
       });
       expect(step.done, isFalse);
@@ -211,10 +226,13 @@ void main() {
       expect(step.action, isNull);
     });
 
-    test('a malformed step decodes to an incomplete one rather than throwing', () {
-      final step = AppstoreSetupStep.fromMap(const <String, dynamic>{});
-      expect(step.done, isFalse);
-      expect(step.title, isEmpty);
-    });
+    test(
+      'a malformed step decodes to an incomplete one rather than throwing',
+      () {
+        final step = AppstoreSetupStep.fromMap(const <String, dynamic>{});
+        expect(step.done, isFalse);
+        expect(step.title, isEmpty);
+      },
+    );
   });
 }

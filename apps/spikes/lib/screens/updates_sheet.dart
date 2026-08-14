@@ -204,7 +204,9 @@ class _UpdatesSheetState extends State<_UpdatesSheet> {
               _SectionLabel('Everything else'),
               for (final item in _status.rest)
                 Padding(
-                  padding: const EdgeInsets.symmetric(vertical: StrideSpace.xxs),
+                  padding: const EdgeInsets.symmetric(
+                    vertical: StrideSpace.xxs,
+                  ),
                   child: Text(
                     '${item.name} - ${item.subtitle}',
                     style: theme.textTheme.bodyMedium?.copyWith(
@@ -221,7 +223,9 @@ class _UpdatesSheetState extends State<_UpdatesSheet> {
 
   String _headline() {
     if (_status.lastError != null) return _status.lastError!;
-    if (_status.lastCheckWallMs <= 0) return 'No catalog check has completed yet.';
+    if (_status.lastCheckWallMs <= 0) {
+      return 'No catalog check has completed yet.';
+    }
     final pending = _status.pendingCount;
     if (pending == 0) return 'Everything is up to date.';
     return pending == 1 ? '1 update pending.' : '$pending updates pending.';
@@ -337,7 +341,13 @@ class _UpdateRow extends StatelessWidget {
               minimumSize: const Size(0, StrideSpace.minTouch),
             ),
             onPressed: canInstall ? onInstall : null,
-            child: Text(item.isSelf ? 'Update Stride' : 'Install'),
+            child: Text(
+              item.stage.needsConfirm
+                  ? 'Confirm'
+                  : item.isSelf
+                  ? 'Update Stride'
+                  : 'Install',
+            ),
           ),
         ],
       ),

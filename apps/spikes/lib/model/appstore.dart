@@ -36,10 +36,17 @@ enum AppstoreStage {
     };
   }
 
+  /// Work is in flight and pressing anything would be pointless.
+  ///
+  /// Deliberately excludes [awaitingUser]: the system dialog can be dismissed, or buried by a
+  /// second one, without the platform ever telling us. Treating that as busy leaves the row
+  /// disabled forever, so the one app the rider asked for becomes the one they cannot install.
+  /// It stays pressable, and pressing it raises the prompt again.
   bool get isBusy =>
-      this == AppstoreStage.downloading ||
-      this == AppstoreStage.installing ||
-      this == AppstoreStage.awaitingUser;
+      this == AppstoreStage.downloading || this == AppstoreStage.installing;
+
+  /// A prompt is up, or was raised and never answered. Pressing re-raises it.
+  bool get needsConfirm => this == AppstoreStage.awaitingUser;
 }
 
 /// How a catalog entry relates to what is installed. Mirrors `PlanItem`.
@@ -141,7 +148,8 @@ class AppstoreItem {
         AppstoreKind.ineligible => switch (ineligibleReason) {
           'sdk_too_old' => 'Needs a newer Android than this console runs',
           'abi_mismatch' => 'Not built for this console',
-          'needs_gms' => 'Needs Google Play Services, which this console cannot run',
+          'needs_gms' =>
+            'Needs Google Play Services, which this console cannot run',
           _ => 'Not available for this console',
         },
       },
@@ -202,7 +210,10 @@ class AppstoreStatus {
     final rawItems = map['items'];
     final items = rawItems is List
         ? rawItems
-              .map((e) => AppstoreItem.fromMap(Map<String, dynamic>.from(e as Map)))
+              .map(
+                (e) =>
+                    AppstoreItem.fromMap(Map<String, dynamic>.from(e as Map)),
+              )
               .toList()
         : <AppstoreItem>[];
     return AppstoreStatus(

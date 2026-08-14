@@ -38,7 +38,9 @@ class _MediaScreenState extends State<MediaScreen> with SpikeLog {
   Future<void> _refreshQuiet() async {
     try {
       final enabled = await SpikeBridge.notificationListenerEnabled();
-      final sessions = enabled ? await SpikeBridge.mediaSessions() : const <Map<String, dynamic>>[];
+      final sessions = enabled
+          ? await SpikeBridge.mediaSessions()
+          : const <Map<String, dynamic>>[];
       if (mounted) {
         setState(() {
           _listenerEnabled = enabled;
@@ -51,40 +53,45 @@ class _MediaScreenState extends State<MediaScreen> with SpikeLog {
   }
 
   Future<void> _refresh() => guard('media sessions', () async {
-        final enabled = await SpikeBridge.notificationListenerEnabled();
-        setState(() => _listenerEnabled = enabled);
-        if (!enabled) {
-          logLine(
-            'FAIL NotificationListenerService not connected. Grant it with:\n'
-            '  adb shell cmd notification allow_listener '
-            'io.stride.spikes/io.stride.spikes.StrideNotificationListener\n'
-            'Without it, MediaSessionManager.getActiveSessions() throws SecurityException.',
-          );
-          return;
-        }
-        final sessions = await SpikeBridge.mediaSessions();
-        setState(() => _sessions = sessions);
-        logLine('PASS Listener connected. ${sessions.length} active session(s):');
-        for (final s in sessions) {
-          logLine('  ${s['package']}  state=${s['state']} playing=${s['isPlaying']} '
-              '"${s['title'] ?? ''}"');
-        }
-      });
+    final enabled = await SpikeBridge.notificationListenerEnabled();
+    setState(() => _listenerEnabled = enabled);
+    if (!enabled) {
+      logLine(
+        'FAIL NotificationListenerService not connected. Grant it with:\n'
+        '  adb shell cmd notification allow_listener '
+        'io.stride.spikes/io.stride.spikes.StrideNotificationListener\n'
+        'Without it, MediaSessionManager.getActiveSessions() throws SecurityException.',
+      );
+      return;
+    }
+    final sessions = await SpikeBridge.mediaSessions();
+    setState(() => _sessions = sessions);
+    logLine('PASS Listener connected. ${sessions.length} active session(s):');
+    for (final s in sessions) {
+      logLine(
+        '  ${s['package']}  state=${s['state']} playing=${s['isPlaying']} '
+        '"${s['title'] ?? ''}"',
+      );
+    }
+  });
 
   @override
   Widget build(BuildContext context) {
     return SpikeScaffold(
       title: 'S5 — Media',
-      question: 'Can we observe and control sessions for the apps that survived S4, '
+      question:
+          'Can we observe and control sessions for the apps that survived S4, '
           'with correct pause/resume ownership?',
       log: log,
       actions: [
         FilledButton.icon(
           onPressed: () => guard('pause all playing', () async {
             final paused = await SpikeBridge.pauseAllPlaying();
-            logLine(paused.isEmpty
-                ? 'Nothing was playing; nothing paused.'
-                : 'Paused (and now owned by Stride): ${paused.join(', ')}');
+            logLine(
+              paused.isEmpty
+                  ? 'Nothing was playing; nothing paused.'
+                  : 'Paused (and now owned by Stride): ${paused.join(', ')}',
+            );
             await _refreshQuiet();
           }),
           icon: const Icon(Icons.pause),
@@ -93,9 +100,11 @@ class _MediaScreenState extends State<MediaScreen> with SpikeLog {
         FilledButton.icon(
           onPressed: () => guard('resume paused by us', () async {
             final resumed = await SpikeBridge.resumePausedByUs();
-            logLine(resumed.isEmpty
-                ? 'Nothing to resume - either we paused nothing, or the user already pressed play.'
-                : 'Resumed: ${resumed.join(', ')}');
+            logLine(
+              resumed.isEmpty
+                  ? 'Nothing to resume - either we paused nothing, or the user already pressed play.'
+                  : 'Resumed: ${resumed.join(', ')}',
+            );
             await _refreshQuiet();
           }),
           icon: const Icon(Icons.play_arrow),
@@ -105,7 +114,9 @@ class _MediaScreenState extends State<MediaScreen> with SpikeLog {
           // KEYCODE_MEDIA_PLAY_PAUSE. Nondeterministic - last resort only.
           onPressed: () => guard('dispatch media key', () async {
             await SpikeBridge.dispatchMediaKey(85);
-            logLine('Dispatched KEYCODE_MEDIA_PLAY_PAUSE (fallback path, nondeterministic).');
+            logLine(
+              'Dispatched KEYCODE_MEDIA_PLAY_PAUSE (fallback path, nondeterministic).',
+            );
           }),
           icon: const Icon(Icons.keyboard),
           label: const Text('Media key'),
@@ -135,13 +146,18 @@ class _MediaScreenState extends State<MediaScreen> with SpikeLog {
                   return ListTile(
                     dense: true,
                     leading: Icon(
-                      s['isPlaying'] == true ? Icons.play_circle : Icons.pause_circle,
+                      s['isPlaying'] == true
+                          ? Icons.play_circle
+                          : Icons.pause_circle,
                       color: s['isPlaying'] == true
                           ? Theme.of(context).colorScheme.primary
                           : null,
                     ),
-                    title: Text(s['title']?.toString() ?? s['package'].toString(),
-                        maxLines: 1, overflow: TextOverflow.ellipsis),
+                    title: Text(
+                      s['title']?.toString() ?? s['package'].toString(),
+                      maxLines: 1,
+                      overflow: TextOverflow.ellipsis,
+                    ),
                     subtitle: Text(
                       '${s['package']}'
                       '${s['pausedByStride'] == true ? '  · paused by Stride' : ''}',

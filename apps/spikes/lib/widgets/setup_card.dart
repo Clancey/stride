@@ -193,7 +193,10 @@ class _SetupRow extends StatelessWidget {
             child: Column(
               crossAxisAlignment: CrossAxisAlignment.start,
               children: [
-                Text(step.label, style: Theme.of(context).textTheme.titleMedium),
+                Text(
+                  step.label,
+                  style: Theme.of(context).textTheme.titleMedium,
+                ),
                 const SizedBox(height: StrideSpace.xxs),
                 Text(
                   step.where == null

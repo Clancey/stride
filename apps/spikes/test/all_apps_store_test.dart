@@ -64,11 +64,7 @@ void main() {
       {'package': 'com.example.one', 'label': 'One'},
     ];
     status = statusWith([
-      item(
-        package: 'com.spotify.music',
-        name: 'Spotify',
-        kind: 'notInstalled',
-      ),
+      item(package: 'com.spotify.music', name: 'Spotify', kind: 'notInstalled'),
       item(
         package: 'com.needs.gms',
         name: 'Needs GMS',
@@ -216,37 +212,66 @@ void main() {
     expect(find.widgetWithText(AppTile, 'Spotify'), findsOneWidget);
   });
 
-  testWidgets('a completed install reloads the inventory once, not every poll', (
-    tester,
+  testWidgets(
+    'a completed install reloads the inventory once, not every poll',
+    (tester) async {
+      await pumpScreen(tester);
+      await tester.tap(tab('Store'));
+      await tester.pumpAndSettle();
+
+      status = statusWith([
+        item(
+          package: 'com.spotify.music',
+          name: 'Spotify',
+          kind: 'notInstalled',
+          stage: 'installed',
+        ),
+      ]);
+
+      await tester.pump(const Duration(seconds: 3));
+      await tester.pumpAndSettle();
+      final afterFirst = listAppsCalls;
+
+      // Several more polls with the same 'installed' snapshot.
+      await tester.pump(const Duration(seconds: 3));
+      await tester.pump(const Duration(seconds: 3));
+      await tester.pumpAndSettle();
+
+      expect(
+        listAppsCalls,
+        afterFirst,
+        reason:
+            'the same completed install must not re-read the inventory forever',
+      );
+    },
+  );
+
+  testWidgets('a prompt the user missed can be raised again', (
+    WidgetTester tester,
   ) async {
+    // The platform destroys a confirmation dialog when a second one opens, and reports
+    // nothing back. If that leaves the row disabled, the app the rider asked for is the
+    // one they can never install - so the button has to stay live and say what it does.
+    status = statusWith([
+      item(
+        package: 'com.netflix.mediaclient',
+        name: 'Netflix',
+        kind: 'notInstalled',
+        stage: 'awaiting_user',
+      ),
+    ]);
+
     await pumpScreen(tester);
     await tester.tap(tab('Store'));
     await tester.pumpAndSettle();
 
-    status = statusWith([
-      item(
-        package: 'com.spotify.music',
-        name: 'Spotify',
-        kind: 'notInstalled',
-        stage: 'installed',
-      ),
-    ]);
+    final button = find.widgetWithText(FilledButton, 'Confirm');
+    expect(button, findsOneWidget);
+    expect(tester.widget<FilledButton>(button).onPressed, isNotNull);
 
-    await tester.pump(const Duration(seconds: 3));
+    await tester.tap(button);
     await tester.pumpAndSettle();
-    final afterFirst = listAppsCalls;
-
-    // Several more polls with the same 'installed' snapshot.
-    await tester.pump(const Duration(seconds: 3));
-    await tester.pump(const Duration(seconds: 3));
-    await tester.pumpAndSettle();
-
-    expect(
-      listAppsCalls,
-      afterFirst,
-      reason:
-          'the same completed install must not re-read the inventory forever',
-    );
+    expect(installRequests, contains('com.netflix.mediaclient'));
   });
 }
 

@@ -24,7 +24,11 @@ void _host({required bool isHome, required Set<String> granted}) {
             return isHome;
           case 'grantsGet':
             return <Object?>[
-              _grant('overlay', 'Draw over other apps', granted.contains('overlay')),
+              _grant(
+                'overlay',
+                'Draw over other apps',
+                granted.contains('overlay'),
+              ),
               _grant(
                 'accessibility',
                 'Accessibility service',
@@ -43,7 +47,9 @@ void _host({required bool isHome, required Set<String> granted}) {
 
 Future<void> _pump(WidgetTester tester, SetupStatus status) async {
   await tester.pumpWidget(
-    MaterialApp(home: Scaffold(body: SetupCard(status: status))),
+    MaterialApp(
+      home: Scaffold(body: SetupCard(status: status)),
+    ),
   );
   await tester.pumpAndSettle();
 }

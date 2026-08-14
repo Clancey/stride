@@ -136,7 +136,9 @@ class _SettingsScreenState extends State<SettingsScreen>
     final ok = await SpikeBridge.openSystemSettings();
     if (!mounted || ok) return;
     ScaffoldMessenger.of(context).showSnackBar(
-      const SnackBar(content: Text("Android settings wouldn't open on this console.")),
+      const SnackBar(
+        content: Text("Android settings wouldn't open on this console."),
+      ),
     );
   }
 
@@ -235,11 +237,7 @@ class _AndroidSettingsRow extends StatelessWidget {
       child: Row(
         crossAxisAlignment: CrossAxisAlignment.start,
         children: [
-          const Icon(
-            Icons.info_outline,
-            color: StrideColors.warning,
-            size: 26,
-          ),
+          const Icon(Icons.info_outline, color: StrideColors.warning, size: 26),
           const SizedBox(width: StrideSpace.sm),
           // The rider needs this before they tap, not after: Android blanks non-system overlays
           // over its own settings pages, so Stride's Back and Home disappear in there and this
