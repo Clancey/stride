@@ -281,6 +281,12 @@ class LauncherHomeState extends State<LauncherHome> {
           profiles: _profiles,
           iconCache: _iconCache,
           onLaunch: _launch,
+          // Installing from the store changes what the launcher itself shows:
+          // the pinned row, and the update badge that just lost an entry.
+          onAppsChanged: () async {
+            await _loadApps();
+            await _refreshAppstore();
+          },
         ),
       ),
     );

@@ -1,13 +1,35 @@
+import java.util.Properties
+
 plugins {
     id("com.android.application")
     // The Flutter Gradle Plugin must be applied after the Android and Kotlin Gradle plugins.
     id("dev.flutter.flutter-gradle-plugin")
 }
 
+// Release signing material, written by `tools/keystore.sh unlock`. Absent on a fresh clone and in
+// CI, and that is deliberate: the build must still work without the secret. See docs/SIGNING.md.
+val keystoreProperties = Properties().apply {
+    val f = rootProject.file("key.properties")
+    if (f.exists()) f.inputStream().use { load(it) }
+}
+
 android {
     namespace = "io.stride.spikes"
     compileSdk = flutter.compileSdkVersion
     ndkVersion = flutter.ndkVersion
+
+    signingConfigs {
+        // Only declared when the keystore has been unlocked; `findByName("release")` in the
+        // release buildType is what falls back to debug when it has not.
+        if (keystoreProperties.getProperty("storeFile") != null) {
+            create("release") {
+                storeFile = file(keystoreProperties.getProperty("storeFile"))
+                storePassword = keystoreProperties.getProperty("storePassword")
+                keyAlias = keystoreProperties.getProperty("keyAlias")
+                keyPassword = keystoreProperties.getProperty("keyPassword")
+            }
+        }
+    }
 
     compileOptions {
         sourceCompatibility = JavaVersion.VERSION_17
@@ -49,9 +71,17 @@ android {
 
     buildTypes {
         release {
-            // TODO: Add your own signing config for the release build.
-            // Signing with the debug keys for now, so `flutter run --release` works.
-            signingConfig = signingConfigs.getByName("debug")
+            // Signed with the real Stride release key when it has been unlocked
+            // (`tools/keystore.sh unlock`), and with the debug key otherwise so that a fresh
+            // clone, CI, and `flutter run --release` all still work without the secret.
+            //
+            // This matters more than a normal app: Stride updates itself over the air, and
+            // Android refuses an update signed by a different key than the installed copy. An
+            // APK that is *published* must therefore be a release-key build - see
+            // docs/SIGNING.md. The guard below is what stops an accidentally debug-signed
+            // build from being published as if it were genuine.
+            signingConfig = signingConfigs.findByName("release")
+                ?: signingConfigs.getByName("debug")
         }
     }
 

@@ -155,6 +155,7 @@ data class CatalogManifest(
                 sha256 = sha256,
                 signerSha256 = signerSha256,
                 releaseNotesUrl = obj.optString("releaseNotesUrl").takeIf { it.isNotEmpty() },
+                requiresGms = obj.optBoolean("requiresGms", false),
             )
         }
 
@@ -202,6 +203,18 @@ data class CatalogEntry(
     val sha256: String,
     val signerSha256: String,
     val releaseNotesUrl: String?,
+    /**
+     * True when this app is useless without Google Play Services.
+     *
+     * This console ships without GMS, and it cannot be given GMS: Play Services and the Play Store
+     * are privileged apps that must live in `/system/priv-app` with a `privapp-permissions`
+     * allowlist entry, which needs root or a custom recovery this hardware does not have. An
+     * unprivileged sideload of them installs and then does nothing.
+     *
+     * So the catalog says so up front and the client marks the entry ineligible with a reason,
+     * rather than installing something that will greet the rider with a sign-in loop.
+     */
+    val requiresGms: Boolean = false,
 )
 
 /** A manifest this client will not act on. Always fatal for the whole document. */

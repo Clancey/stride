@@ -183,6 +183,17 @@ void main() {
         'Not built for this console',
       );
     });
+
+    test('a Play Services dependency is named as the reason', () {
+      // Otherwise this reads as an unexplained missing app, and the obvious next
+      // move is to go sideload Play Store, which cannot work here.
+      expect(
+        AppstoreItem.fromMap(
+          item(kind: 'ineligible', ineligibleReason: 'needs_gms'),
+        ).subtitle,
+        'Needs Google Play Services, which this console cannot run',
+      );
+    });
   });
 
   group('AppstoreSetupStep', () {

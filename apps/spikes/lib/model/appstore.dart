@@ -141,6 +141,7 @@ class AppstoreItem {
         AppstoreKind.ineligible => switch (ineligibleReason) {
           'sdk_too_old' => 'Needs a newer Android than this console runs',
           'abi_mismatch' => 'Not built for this console',
+          'needs_gms' => 'Needs Google Play Services, which this console cannot run',
           _ => 'Not available for this console',
         },
       },

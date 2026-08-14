@@ -26,6 +26,7 @@ class UpdatePlanTest {
         minSdk: Int = 26,
         abis: List<String> = listOf("arm64-v8a"),
         name: String = pkg,
+        requiresGms: Boolean = false,
     ) = CatalogEntry(
         packageName = pkg,
         role = role,
@@ -39,6 +40,7 @@ class UpdatePlanTest {
         sha256 = "a".repeat(64),
         signerSha256 = "b".repeat(64),
         releaseNotesUrl = null,
+        requiresGms = requiresGms,
     )
 
     private fun catalog(vararg entries: CatalogEntry) =
@@ -194,5 +196,69 @@ class UpdatePlanTest {
     @Test
     fun `installs are allowed when idle and permitted`() {
         assertTrue(UpdatePlan.mayInstallNow(workoutIdle = true, canRequestInstalls = true))
+    }
+
+    // ------------------------------------------------------------------ Google Play Services
+
+    @Test
+    fun `an app needing Play Services is ineligible on a console without it`() {
+        val plan = UpdatePlan.compute(
+            catalog(entry(pkg = "com.needs.gms", requiresGms = true)),
+            installed = emptyList(),
+            device = device.copy(hasGms = false),
+        )
+
+        val item = plan.single()
+        assertTrue(item is Ineligible)
+        assertEquals(IneligibleReason.NEEDS_GMS, (item as Ineligible).reason)
+    }
+
+    @Test
+    fun `the same app is offered on a device that does have Play Services`() {
+        val plan = UpdatePlan.compute(
+            catalog(entry(pkg = "com.needs.gms", requiresGms = true)),
+            installed = emptyList(),
+            device = device.copy(hasGms = true),
+        )
+
+        assertTrue(plan.single() is NotInstalled)
+    }
+
+    @Test
+    fun `apps not marked as needing Play Services are unaffected`() {
+        val plan = UpdatePlan.compute(
+            catalog(entry(pkg = "com.plain.app")),
+            installed = emptyList(),
+            device = device.copy(hasGms = false),
+        )
+
+        assertTrue(plan.single() is NotInstalled)
+    }
+
+    @Test
+    fun `a GMS app that also targets the wrong abi reports the abi problem`() {
+        // Ordering matters for the message the rider reads. "Not built for this console" is the
+        // truer answer for something that would not have run here even with Play Services.
+        val plan = UpdatePlan.compute(
+            catalog(entry(pkg = "com.both", requiresGms = true, abis = listOf("x86_64"))),
+            installed = emptyList(),
+            device = device.copy(hasGms = false),
+        )
+
+        assertEquals(IneligibleReason.ABI_MISMATCH, (plan.single() as Ineligible).reason)
+    }
+
+    @Test
+    fun `an ineligible GMS app is never background installable`() {
+        // The load-bearing consequence: marking it ineligible must also keep it out of the set the
+        // service installs unattended, not merely change what the row says.
+        val plan = UpdatePlan.compute(
+            catalog(entry(pkg = "com.needs.gms", requiresGms = true)),
+            installed = listOf(InstalledApp("com.needs.gms", 1, "1")),
+            device = device.copy(hasGms = false),
+        )
+
+        assertTrue(UpdatePlan.backgroundInstallable(plan).isEmpty())
+        assertEquals(0, UpdatePlan.pendingCount(plan))
     }
 }

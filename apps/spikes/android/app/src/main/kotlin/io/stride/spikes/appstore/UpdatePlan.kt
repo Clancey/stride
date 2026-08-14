@@ -17,6 +17,19 @@ data class DeviceProfile(
     val supportedAbis: List<String>,
     /** Stride's own package name, so the self-update can be recognised without a hardcoded string. */
     val selfPackage: String,
+    /**
+     * Whether Google Play Services is present *and* privileged enough to be useful.
+     *
+     * False on an iFit console, and not something this app store can change: Play Services and the
+     * Play Store must be installed to `/system/priv-app` with a `privapp-permissions` allowlist
+     * entry to function at all. That needs root or a custom recovery, so `PackageInstaller` cannot
+     * get there from here — sideloading `com.android.vending` produces an icon that cannot sign in
+     * and cannot install anything, because `INSTALL_PACKAGES` is `signature|privileged`.
+     *
+     * Recorded as a device fact so entries that depend on it can be marked ineligible with an
+     * honest reason instead of being installed and quietly not working.
+     */
+    val hasGms: Boolean = false,
 )
 
 /** Why an available artifact is not offered. Shown to the user rather than silently dropped. */
@@ -26,6 +39,13 @@ enum class IneligibleReason {
 
     /** No ABI in common with this device. */
     ABI_MISMATCH,
+
+    /**
+     * The app needs Google Play Services, which this console does not have and cannot be given
+     * without root. See [DeviceProfile.hasGms]. Aurora Store is the supported way to obtain
+     * Play-hosted apps here; it runs unprivileged and talks to Google's servers directly.
+     */
+    NEEDS_GMS,
 }
 
 /** One row of a computed plan. */
@@ -159,6 +179,10 @@ object UpdatePlan {
         if (entry.abis.isNotEmpty() && entry.abis.none { it in device.supportedAbis }) {
             return IneligibleReason.ABI_MISMATCH
         }
+        // Checked last: "needs Google Play Services" is the most useful thing to tell someone about
+        // an app that is otherwise perfectly installable here, and the least useful thing to say
+        // about one that would not have run on this console anyway.
+        if (entry.requiresGms && !device.hasGms) return IneligibleReason.NEEDS_GMS
         return null
     }
 }

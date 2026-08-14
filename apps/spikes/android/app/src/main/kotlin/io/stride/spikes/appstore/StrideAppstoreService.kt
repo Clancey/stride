@@ -6,6 +6,7 @@ import android.app.NotificationManager
 import android.app.Service
 import android.content.Context
 import android.content.Intent
+import android.content.pm.ApplicationInfo
 import android.content.pm.PackageManager
 import android.os.Build
 import android.os.IBinder
@@ -262,7 +263,24 @@ class StrideAppstoreService : Service() {
         sdkInt = Build.VERSION.SDK_INT,
         supportedAbis = Build.SUPPORTED_ABIS?.toList() ?: emptyList(),
         selfPackage = packageName,
+        hasGms = hasUsableGms(),
     )
+
+    /**
+     * Whether Google Play Services is present *and privileged*, which is the only form of it worth
+     * reporting true for.
+     *
+     * The flag check is the point. A user-space sideload of `com.google.android.gms` installs
+     * fine and is then inert — it cannot hold the signature-level permissions it needs — so
+     * presence alone would be a lie to every caller. `FLAG_SYSTEM` is what distinguishes a GMS that
+     * came with the ROM from one somebody pushed with adb after reading a forum post.
+     */
+    private fun hasUsableGms(): Boolean = try {
+        val info = packageManager.getApplicationInfo(GMS_PACKAGE, 0)
+        info.enabled && (info.flags and ApplicationInfo.FLAG_SYSTEM) != 0
+    } catch (e: PackageManager.NameNotFoundException) {
+        false
+    }
 
     // ----------------------------------------------------------- foreground
 
@@ -308,6 +326,12 @@ class StrideAppstoreService : Service() {
         private const val CHANNEL_ID = "stride_spikes_appstore"
         private const val NOTIFICATION_ID = 4322
         private const val TAG = "StrideAppstore"
+
+        /**
+         * Google Play Services. Referenced only to detect its absence — nothing here installs it,
+         * because nothing unprivileged can. See [DeviceProfile.hasGms].
+         */
+        private const val GMS_PACKAGE = "com.google.android.gms"
 
         @Volatile
         private var active: StrideAppstoreService? = null

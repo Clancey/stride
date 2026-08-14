@@ -1,0 +1,102 @@
+name: Release
+
+# Builds a signed Stride APK and, optionally, publishes it to the public catalog so consoles can
+# pick it up as an update.
+#
+# The keystore lives in this repo as ciphertext (keystore/stride-release.jks.enc). CI decrypts it
+# with the STRIDE_KEYSTORE_PASS secret. See docs/SIGNING.md.
+
+on:
+  workflow_dispatch:
+    inputs:
+      publish:
+        description: "Publish to the public catalog (otherwise build + verify only)"
+        type: boolean
+        default: false
+  push:
+    tags: ["v*"]
+
+concurrency:
+  # Two releases publishing at once would race on catalog.json and on the release tag.
+  group: release
+  cancel-in-progress: false
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+
+      - name: Unlock the release keystore
+        env:
+          STRIDE_KEYSTORE_PASS: ${{ secrets.STRIDE_KEYSTORE_PASS }}
+        run: |
+          if [ -z "$STRIDE_KEYSTORE_PASS" ]; then
+            echo "::error::STRIDE_KEYSTORE_PASS is not set. Without it the build would silently"
+            echo "::error::fall back to the debug key, producing an APK no console will accept."
+            exit 1
+          fi
+          tools/keystore.sh unlock
+
+      - name: Build release APK
+        working-directory: apps/spikes
+        run: flutter build apk --release
+
+      - name: Verify it was signed with the release key
+        # The single most dangerous failure here is a debug-signed APK: it installs fine, looks
+        # normal, and is silently un-updatable on every console that has the real key. Assert the
+        # fingerprint rather than trusting that the unlock step worked.
+        run: |
+          EXPECTED=92534d3c0cf814e027b8338ea4cfda0f54adc5d5eff34d33463526f572887e59
+          APKSIGNER="$(find "$ANDROID_HOME/build-tools" -name apksigner | sort -V | tail -1)"
+          ACTUAL="$("$APKSIGNER" verify --print-certs \
+            apps/spikes/build/app/outputs/flutter-apk/app-release.apk \
+            | grep -i 'Signer #1 certificate SHA-256 digest' | awk '{print $NF}')"
+          echo "signer: $ACTUAL"
+          if [ "$ACTUAL" != "$EXPECTED" ]; then
+            echo "::error::signed with $ACTUAL, expected the Stride release key $EXPECTED"
+            exit 1
+          fi
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: stride-release-apk
+          path: apps/spikes/build/app/outputs/flutter-apk/app-release.apk
+
+      - name: Publish to the catalog
+        if: github.event_name == 'push' || inputs.publish
+        env:
+          # A PAT with `contents: write` on Clancey/stride-catalog. The default GITHUB_TOKEN is
+          # scoped to THIS repo only and cannot create a release on the catalog repo.
+          GH_TOKEN: ${{ secrets.CATALOG_TOKEN }}
+        run: |
+          if [ -z "$GH_TOKEN" ]; then
+            echo "::error::CATALOG_TOKEN is not set - cannot publish to Clancey/stride-catalog."
+            exit 1
+          fi
+          git clone --depth 1 https://x-access-token:"$GH_TOKEN"@github.com/Clancey/stride-catalog.git /tmp/catalog
+          cd /tmp/catalog
+          ./tools/publish.sh \
+            "$GITHUB_WORKSPACE/apps/spikes/build/app/outputs/flutter-apk/app-release.apk" \
+            --role stride --name Stride
+          ./tools/verify.sh
+          git config user.name "stride-release-bot"
+          git config user.email "noreply@github.com"
+          git add catalog.json
+          git commit -m "Publish Stride from ${GITHUB_SHA:0:7}" || { echo "nothing to commit"; exit 0; }
+          git push
+
+      - name: Always re-lock
+        if: always()
+        # The runner is ephemeral, but a workspace that is cached, uploaded, or inspected mid-run
+        # should never contain the decrypted key.
+        run: rm -f keystore/stride-release.jks apps/spikes/android/key.properties
