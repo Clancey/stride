@@ -109,7 +109,7 @@ on hardware nobody has yet.
 | **S1** | Launcher replaceable **and revertible**? | ⬜ | | Blocking |
 | **S2-A** | Certs extract + mTLS + read-only RPC works? | ⬜ | | Blocking — gates Phase 1 |
 | **S2-B** | Command acked; dead-client behaviour known? | ⬜ | | Blocking — gates any control shipping |
-| S2b | Certs per-device or shared? | ⬜ | | Not blocking; affects onboarding |
+| S2b | Certs per-device or shared? | ✅ | **Shared** | `CN=testca` / `CN=com.ifit.eriador`, nothing machine-specific. Credentials are now bundled |
 | S3 | Overlay survives real apps? | ⬜ | | Incl. edge-strip interference |
 | S4 | Media apps install and play? | ⬜ | | Netflix expected to fail |
 | S5 | MediaSession observe + control? | ⬜ | | |
@@ -217,7 +217,16 @@ and stop-preemption already enforced — not to a throwaway harness.
 
 ---
 
-## S2b — Certs per-device or shared?
+## S2b — Certs per-device or shared? — **ANSWERED: shared**
+
+**Result.** The CA is `CN=testca`, carrying OpenSSL's untouched defaults (`C=AU, ST=Some-State,
+O=Internet Widgits Pty Ltd`), and the client certificate is `CN=com.ifit.eriador`, valid to 2034.
+No serial number, no machine identifier, nothing per-device. One fixed keypair opens every console
+of this generation, so tHUD's per-device claim does not hold for this firmware line.
+
+Settled by direct inspection, as the method below prescribes — not by the discredited connect test.
+Consequence: the credentials ship inside Stride's APK and onboarding friction is zero. See
+`GlassOsCredentials` and plan section 2.2.
 
 **The obvious test does not work.** The original design here was: install `mikepugh/NordicFTMS`
 (which bakes its author's certs in at build time) and see whether it connects. Connecting is decent

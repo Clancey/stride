@@ -90,11 +90,10 @@ general-purpose app distributed to thousands of users validates this specific co
 documentation claiming per-treadmill certs is not true for this firmware line; NordicFTMS's
 prebuilt-APK distribution, which only works if certs are shared, was the correct read.
 
-**Stride's decision does not change.** Self-extraction on device is still the design, for reasons
-that survive S2b being answered: we still refuse to bake anyone's key material into a distributed
-binary, and an extractor stays correct if iFit ever does move to per-device credentials. What
-changes is that the extraction target is now known to be reachable and the credential shape is
-confirmed, so telemetry work is no longer blocked on solving access.
+**Stride's decision did change, eventually.** This finding is what eventually retired on-device
+extraction altogether: a keypair that is identical on every machine is a constant, and extracting a
+constant at runtime buys nothing. The credentials are now bundled, with a `filesDir` override kept
+for the day iFit does move to per-device material. See section 2.2.
 
 One implementation detail that will otherwise cost an afternoon: the server certificate uses a
 legacy Common Name with **no SAN**, which modern TLS stacks reject outright. Stride's Android
@@ -156,34 +155,56 @@ non-system app *can* own the machine while iFit's UI is gone.
 
 #### Stride's decision
 
-**Ship zero certificates; adopt the tHUD runtime-load pattern, plus on-device self-extraction.**
+**Bundle the credentials, and let a console override them.**
 
-1. A `CredentialProvider` reads certs at runtime and imports them into **app-private** storage
-   (`getFilesDir()`, Keystore-wrapped where the key format allows) — *not* `/sdcard`, which tHUD uses
-   and which is world-readable to other apps. Never logged, never exported.
-2. **Never bundle a cert in the APK.** NordicFTMS's approach only works if certs are shared, and it
-   puts the maintainer's own key material into every distributed binary. Not doing that.
+`GlassOsCredentials` reads `ca_cert.pem` / `client_cert.pem` / `client_key.pem` from two places, in
+order:
 
-**Open question (S2b): are the certs per-device or shared across a model/firmware line?** tHUD says
-per-device; NordicFTMS's prebuilt-APK distribution implies shared. Nobody has published a comparison
-across physical machines. Runtime loading is correct under *either* answer, which is exactly why
-it's the chosen design.
+1. **`filesDir/glassos/`** — app-private, never `/sdcard` (which is what tHUD uses and is
+   world-readable to other apps). If all three are present they win outright.
+2. **`assets/glassos/`** — shipped in the APK. The path every ordinary install takes.
 
-#### The in-app extractor was removed
+The two are never mixed: a source must supply all three or it is skipped whole, because pairing a
+console's own CA with the bundled client key fails the handshake in a way that looks like broken
+hardware.
 
-Revision 3 planned on-device extraction as a first-run wizard: `pm path com.ifit.rivendell` → read
-the APK → scan for DER-encoded ASN.1 in fake-JPEG resources → import. It was built as diagnostic
-spike S2 and has since been **deleted** — it wrote `ca.pem` / `client.pem` / `client.key`, whereas
-the production loader (`GlassOsCredentials`) reads `ca_cert.pem` / `client_cert.pem` /
-`client_key.pem`. The two halves never met, so the extractor only ever fed a probe screen.
+#### S2b is answered: the certificates are shared, not per-device
 
-**Credentials are provisioned out-of-band today**, into
-`filesDir/glassos/{ca_cert,client_cert,client_key}.pem`. Note the constraint this creates: release
-builds are not debuggable, so `adb shell run-as io.stride.spikes` cannot reach app-private storage
-on a shipping build. **A supported provisioning path is an open item** — either a debug-build step,
-a settings-screen import, or a rebuilt extractor that writes the filenames the loader actually
-reads. Until then, a fresh console has no credentials and MachineLink stays disconnected, which the
-UI reports honestly as "Not measured" rather than pretending to read the machine.
+This was the open question that shaped the original design, and inspecting the material settles it.
+The CA is `CN=testca` carrying OpenSSL's untouched defaults (`C=AU, ST=Some-State, O=Internet
+Widgits Pty Ltd`); the client is `CN=com.ifit.eriador`. That is one fixed keypair, generated once
+and shipped to every console of this generation — not a per-machine identity. tHUD's "per-device"
+claim does not hold for this hardware.
+
+That collapses the case for on-device extraction. Extracting a keypair that is identical on every
+machine is elaborate ceremony to arrive at a constant.
+
+#### Why the earlier "never bundle" rule was dropped
+
+Revisions 1-3 held that we would not bake anyone's key material into a distributed binary. Two
+things changed:
+
+- **The extractor never worked anyway.** Built as spike S2, it wrote `ca.pem` / `client.pem` /
+  `client.key` while the production loader read `ca_cert.pem` / `client_cert.pem` /
+  `client_key.pem`. The two halves never met; it only ever fed a probe screen. It has been deleted.
+- **The rule blocked the point of the project.** Release builds are not debuggable, so `run-as`
+  cannot reach app-private storage on a shipping build. With no in-app writer and no adb route, a
+  tester had no way to get credentials onto their own console. "Ship a launcher nobody can connect"
+  is not a defensible position to hold on principle.
+
+What the material actually is: a fixed keypair that unlocks a loopback service on a treadmill the
+owner already bought. It guards nothing belonging to the user and grants no access to any remote
+account. It is already carried inside several distributed apps, so bundling discloses nothing new.
+Treat it as public knowledge, not as a secret.
+
+The keypair is iFit's own, generated for the console and read back out of its firmware. Other
+projects redistribute it but did not author it, so no upstream licence attaches and Stride's
+licensing is unaffected. Only the three PEM files are reused; no third-party source is vendored.
+
+**Verified end-to-end on a wiped install** (14 Aug): app data deleted, fresh APK installed, no
+provisioned credentials. Log reads `credentials loaded from BUNDLED`, the workout started, telemetry
+streamed live, an incline command moved the machine to 2.0%, the belt ran at 1.0 mph, and pause
+stopped it.
 
 **This still does not make the legal question go away** (see §9). It reduces exposure and keeps our
 distribution clean; it does not transfer risk cleanly to the user.
@@ -709,14 +730,11 @@ gate Phase 0 — it gates shipping any control code, and it belongs behind the C
   Coordinator (§3.1) with clamps and stop-preemption already enforced — not in a throwaway spike
   harness. Note also that step 2 must verify the server genuinely *demands* the client certificate;
   a handshake that would also succeed without one has not proven mTLS.
-- **S2b — Are certs per-device or shared?** tHUD's docs say per-device; NordicFTMS's prebuilt-APK
-  distribution implies shared. **Do not test this by seeing whether NordicFTMS's release APK
-  connects.** Success there is real evidence of sharing, but *failure is inconclusive* — it is
-  equally explained by firmware version, GlassOS API drift, a rejected `client_id`, an ABI mismatch,
-  or an ordinary bug. Test it directly instead: inspect the extracted client certificate's subject,
-  SAN, validity window and SHA-256 fingerprint. A subject carrying the console's serial number
-  settles it from a single machine. Doesn't block anything — on-device self-extraction is correct
-  either way — but it determines how much onboarding friction real users will face.
+- ~~**S2b — Are certs per-device or shared?**~~ **Answered: shared.** Settled exactly as planned,
+  by inspecting the certificate rather than by seeing whether another project's APK connects. The
+  CA is `CN=testca` with OpenSSL's default fields and the client is `CN=com.ifit.eriador` — no
+  serial number, nothing machine-specific. One keypair opens every console of this generation, so
+  onboarding friction for real users is zero: the credentials ship in the APK.
 - **S10 — AccessibilityService for Back/Home/Recents.** Can it be enabled via
   `settings put secure enabled_accessibility_services`, does it **survive reboot** on this firmware,
   and does `GLOBAL_ACTION_BACK` actually work over third-party apps here? **Back has no alternative

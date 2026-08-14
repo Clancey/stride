@@ -89,7 +89,7 @@ Sort the spikes by what they can cost you:
 | Order | Spikes | Risk | Why it is safe |
 |---|---|---|---|
 | 1 | **ENV**, **S4** (app inventory), **S5** (MediaSession) | None | Read-only. They enumerate and observe. Nothing is set, nothing is replaced. |
-| 2 | **S2-A** (credential provisioning) | None to the console | Places PEM files and talks to a mock. It does not command the machine. The in-app extractor that once did this was removed — see plan §2.2. |
+| 2 | **S2-A** (GlassOS transport) | None to the console | Read-only RPC. It does not command the machine. Credentials now ship in the APK, so there is nothing to provision — see plan §2.2. |
 | 3 | **S3** (overlay + edge gestures) | Recoverable | Adds a window over the running console UI. The worst case is stolen touches, and stopping the service removes it. iFit is still HOME throughout. |
 | 4 | **S10** (Back / Home / Recents) | Recoverable | Enabling the accessibility service is a settings change with a documented restore (§3). |
 | 5 | **S1** (become HOME) | **Can lock you out** | Only after §0's persistence gate has passed *and* the revert command has been run successfully against the current iFit HOME. |

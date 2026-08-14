@@ -60,9 +60,12 @@ class GlassOsClient(private val context: Context) {
         http?.let { return it }
         val material = GlassOsCredentials.load(context)
         if (material == null) {
-            note("no credentials in files/glassos — staying disconnected")
+            note("no usable credentials, bundled or provisioned — staying disconnected")
             return null
         }
+        // Worth a line: a tester reporting "it won't connect" is answered largely by whether their
+        // console fell back to the bundle or picked up an override they forgot they had pushed.
+        note("credentials loaded from ${material.source}")
         val built = OkHttpClient.Builder()
             .sslSocketFactory(material.socketFactory, material.trustManager)
             // The server certificate is CN-only with no SAN; the chain is still verified against

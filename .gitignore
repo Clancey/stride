@@ -33,9 +33,9 @@ captures/
 Thumbs.db
 
 # --- Credentials -------------------------------------------------------------
-# GlassOS client credentials are extracted on-device into app-private storage and must never be
-# committed or bundled into a build (see docs/PLAN.md section 2.2). These patterns are a backstop,
-# not the mechanism.
+# Credentials are not committed. The one deliberate exception is the bundled GlassOS interop
+# material, negated explicitly at the end of this section (see docs/PLAN.md section 2.2). These
+# patterns are a backstop, not the mechanism.
 *.pem
 *.key
 # ...but the throwaway test fixture must be committed; it contains generated certs, no secrets.
@@ -59,6 +59,20 @@ protocol/glassos/**/*.pfx
 protocol/glassos/**/*.jks
 protocol/glassos/**/*.bks
 protocol/glassos/**/*.apk
+
+# The one deliberate exception to everything above: the bundled GlassOS interop credentials.
+# They are a fixed, shared, already-public keypair (CA `CN=testca`, client `CN=com.ifit.eriador`).
+# The material is iFit's own, generated for the console and read back out of its firmware; it is
+# already carried inside several distributed apps. Only these three PEM files are reused, never any
+# third-party source, so no upstream licence attaches. They unlock a service on hardware the user
+# already owns; they guard nothing of the user's and grant no access to any remote account. Committing them is the point, because a tester who has to source their own
+# certificates cannot test. Anything a *user* extracts from their own console still lands in
+# app-private storage and is still covered by the blanket rules above.
+#
+# The directory negation must come first: git cannot re-include a file whose parent directory is
+# excluded by `glassos/`.
+!apps/spikes/android/app/src/main/assets/glassos/
+!apps/spikes/android/app/src/main/assets/glassos/*.pem
 
 # Captured protocol traces may contain serial numbers and account identifiers. Scrub before
 # committing anything under tools/ (docs/PLAN.md section 7).

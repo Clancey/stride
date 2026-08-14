@@ -26,7 +26,17 @@ echo "==> building release apk"
 (cd "$ROOT/apps/spikes" && flutter build apk --release)
 
 echo "==> installing to $DEVICE"
-adb install -r "$ROOT/apps/spikes/build/app/outputs/flutter-apk/app-release.apk"
+if ! adb install -r "$ROOT/apps/spikes/build/app/outputs/flutter-apk/app-release.apk"; then
+  # Almost always a debug build already on the console: debug and release are signed with
+  # different keys, and Android refuses to update across them. Worth catching explicitly, because
+  # `set -e` would otherwise abort here having installed nothing and restored no grants, leaving a
+  # console with stale permissions and no obvious reason why.
+  echo
+  echo "    install failed. If it mentions signatures, a differently-signed build is installed:"
+  echo "      adb -s $DEVICE uninstall $PKG"
+  echo "    That wipes app data, which is fine — credentials ship in the APK."
+  exit 1
+fi
 
 echo "==> restoring grants"
 # Development-tier, so it survives reinstalls and lets the app self-heal from here on.
