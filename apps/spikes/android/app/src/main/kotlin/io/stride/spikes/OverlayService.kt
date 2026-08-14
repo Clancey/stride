@@ -142,6 +142,25 @@ class OverlayService : Service() {
          */
         private const val RAIL_MARK_TOLERANCE = 0.25
 
+        /**
+         * How close the machine must get before a requested value counts as reached.
+         *
+         * Per control, because the units are not comparable: half a mile an hour is a stride
+         * change, half a percent of incline is not perceptible and the console reports incline in
+         * whole steps anyway.
+         */
+        private const val SPEED_ARRIVED_TOLERANCE = 0.3
+        private const val INCLINE_ARRIVED_TOLERANCE = 0.5
+
+        /**
+         * How long a requested value stays marked with no progress toward it.
+         *
+         * Refreshed every time the machine moves closer, so this is the timeout for a request that
+         * is going *nowhere* — refused, lost, or overridden — not a budget for the whole ramp. A
+         * long climb outlasts it comfortably; an ignored tap clears in a few seconds.
+         */
+        private const val PENDING_GRACE_MS = 5_000L
+
         /** Wide enough for the five fan segments, which are the sheet's widest row. */
         private const val MENU_WIDTH_DP = 700f
         private val DESTRUCTIVE_INK = Color.rgb(255, 138, 128)
@@ -749,8 +768,13 @@ class OverlayService : Service() {
     }
 
     private fun showMachineControlUnavailable() {
-        lastGesture = "machine command blocked: disconnected"
-        Toast.makeText(this, MachineLink.CONTROL_LOCKED_NOTICE, Toast.LENGTH_SHORT).show()
+        val reason = MachineLink.unavailableReason()
+        lastGesture = if (MachineLink.canCommand()) {
+            "machine command blocked: console refusing writes"
+        } else {
+            "machine command blocked: disconnected"
+        }
+        Toast.makeText(this, reason, Toast.LENGTH_SHORT).show()
     }
 
     /**
@@ -1477,6 +1501,9 @@ class OverlayService : Service() {
             entrySuffix = "%",
             currentEntry = MachineLink.inclinePercent?.roundToInt()?.toString(),
             gravity = Gravity.START or Gravity.TOP,
+            usable = { MachineLink.canCommandIncline() },
+            measured = { MachineLink.inclinePercent },
+            pending = PendingSetpoint(tolerance = INCLINE_ARRIVED_TOLERANCE, graceMs = PENDING_GRACE_MS),
             onPick = { percent ->
                 MachineCoordinator.setInclinePercent(percent)
                 lastGesture = "incline -> $percent%"
@@ -1496,6 +1523,9 @@ class OverlayService : Service() {
             entrySuffix = "",
             currentEntry = MachineLink.speedMph?.roundToInt()?.toString(),
             gravity = Gravity.END or Gravity.TOP,
+            usable = { MachineLink.canCommandSpeed() },
+            measured = { MachineLink.speedMph },
+            pending = PendingSetpoint(tolerance = SPEED_ARRIVED_TOLERANCE, graceMs = PENDING_GRACE_MS),
             onPick = { mph ->
                 MachineCoordinator.setSpeedMph(mph)
                 lastGesture = "speed -> $mph mph"
@@ -1567,6 +1597,9 @@ class OverlayService : Service() {
         entrySuffix: String,
         currentEntry: String?,
         gravity: Int,
+        usable: () -> Boolean,
+        measured: () -> Double?,
+        pending: PendingSetpoint,
         onPick: (Double) -> Unit,
     ): RailBinding? {
         val (railTop, railHeight) = railBounds()
@@ -1575,6 +1608,14 @@ class OverlayService : Service() {
         val clearSettling = Runnable { railSettling = false }
         var activeView: View? = null
         val buttons = LinkedHashMap<String, TextView>()
+        val binding = RailBinding(
+            accent = accent,
+            buttons = buttons,
+            scroll = ScrollView(this),
+            usable = usable,
+            measured = measured,
+            pending = pending,
+        )
 
         val content = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
@@ -1586,18 +1627,29 @@ class OverlayService : Service() {
             val button = railEntryButton(
                 label = "$entry$entrySuffix",
                 accent = accent,
-                active = active,
+                mark = if (active) RailMark.MEASURED else RailMark.NONE,
+                enabled = binding.enabled,
             ) {
                 if (railSettling || SystemClock.uptimeMillis() < ignoreClicksUntilMs) return@railEntryButton
                 // The pill's own label is the source of the value, so what the rider sees is
                 // exactly what gets sent. Parsing can only fail if a preset is not a number, in
                 // which case sending nothing is the right answer.
                 val value = entry.toDoubleOrNull()
-                if (value == null || !MachineLink.canCommand()) {
+                if (value == null || !usable()) {
                     showMachineControlUnavailable()
                     return@railEntryButton
                 }
                 onPick(value)
+                // Mark the tap immediately. The belt will take seconds to get here and telemetry
+                // will keep reporting the old figure throughout; without this the rider's own
+                // choice is the one thing on screen that does not acknowledge them.
+                binding.pending.request(
+                    value = value,
+                    label = entry,
+                    nowMs = SystemClock.uptimeMillis(),
+                    measured = measured(),
+                )
+                syncRailHighlights()
             }
             if (active) activeView = button
             buttons[entry] = button
@@ -1608,7 +1660,7 @@ class OverlayService : Service() {
             FrameLayout.LayoutParams.MATCH_PARENT,
             FrameLayout.LayoutParams.WRAP_CONTENT,
         )
-        val rail = ScrollView(this).apply {
+        val rail = binding.scroll.apply {
             // Faded rather than guillotined: a pill sliced flat at the boundary reads as clipped
             // by the bar above or below it, instead of as a list with more in it.
             isVerticalFadingEdgeEnabled = true
@@ -1636,7 +1688,6 @@ class OverlayService : Service() {
         val params = baseParams(dp(RAIL_WIDTH_DP), railHeight, gravity)
         params.x = dp(30f)
         params.y = railTop
-        val binding = RailBinding(accent = accent, buttons = buttons, scroll = rail)
         binding.applied = currentEntry
         binding.isSettling = { railSettling }
         try {
@@ -1658,6 +1709,17 @@ class OverlayService : Service() {
         }
     }
 
+    /** How a rail pill is currently marked. The three states are deliberately not two. */
+    private enum class RailMark {
+        NONE,
+
+        /** What the rider asked for, not yet reached. Outlined, never filled. */
+        REQUESTED,
+
+        /** What the machine reports. The only state drawn as a solid, confirmed value. */
+        MEASURED,
+    }
+
     /**
      * A live handle on one rail, so the highlight can follow the machine instead of freezing at the
      * value that happened to be true when the window was built.
@@ -1671,8 +1733,15 @@ class OverlayService : Service() {
         val accent: Int,
         val buttons: Map<String, TextView>,
         val scroll: ScrollView,
+        /** Whether the machine will take a write for this control at this instant. */
+        val usable: () -> Boolean,
+        val measured: () -> Double?,
+        val pending: PendingSetpoint,
     ) {
         var applied: String? = null
+        var appliedRequest: String? = null
+        var enabled: Boolean = usable()
+        var appliedEnabled: Boolean? = null
         var isSettling: () -> Boolean = { false }
     }
 
@@ -1681,20 +1750,39 @@ class OverlayService : Service() {
      * removed — so this is safe from the one-second tick, unlike a rebuild.
      */
     private fun syncRailHighlights() {
-        applyRailHighlight(inclineRail, MachineLink.inclinePercent)
-        applyRailHighlight(speedRail, MachineLink.speedMph)
+        val now = SystemClock.uptimeMillis()
+        applyRailHighlight(inclineRail, now)
+        applyRailHighlight(speedRail, now)
     }
 
     /**
-     * Mark the pill nearest the machine's actual value.
+     * Mark the pill nearest the machine's actual value, and separately the one the rider asked for.
      *
      * Nearest rather than exact-match: the console's own buttons move in half steps, so an exact
      * string comparison against integer presets leaves the whole column unmarked at 2.5 mph — the
      * rider gets a scale with no position on it precisely when they are looking for one. The top
      * strip stays the authoritative number; the rail is a picker showing which rung they are on.
+     *
+     * Both marks can be on screen at once, and that is the point: mid-ramp the column shows the
+     * belt at 3 *and* the 5 the rider chose, in two visibly different styles. Collapsing them into
+     * one mark would force a choice between ignoring the tap and claiming a speed the belt has not
+     * reached.
      */
-    private fun applyRailHighlight(rail: RailBinding?, current: Double?) {
+    private fun applyRailHighlight(rail: RailBinding?, nowMs: Long) {
         val binding = rail ?: return
+        val current = binding.measured()
+
+        val enabled = binding.usable()
+        val enabledChanged = enabled != binding.appliedEnabled
+        if (enabled != binding.enabled) {
+            binding.enabled = enabled
+            // A control that has just gone dead cannot still be promising a value.
+            if (!enabled) binding.pending.clear()
+        }
+
+        binding.pending.observe(current, nowMs)
+        val requested = binding.pending.label?.takeIf { binding.enabled && binding.buttons.containsKey(it) }
+
         val target = current?.let { value ->
             val rungs = binding.buttons.keys.mapNotNull { key -> key.toDoubleOrNull()?.let { key to it } }
             val lowest = rungs.minOfOrNull { it.second }
@@ -1706,19 +1794,42 @@ class OverlayService : Service() {
                 value < lowest - RAIL_MARK_TOLERANCE || value > highest + RAIL_MARK_TOLERANCE
             if (offScale) null else rungs.minByOrNull { abs(it.second - value) }?.first
         }
-        if (binding.applied == target) return
-        binding.applied?.let { previous ->
-            binding.buttons[previous]?.let { styleRailEntry(it, binding.accent, active = false) }
-        }
-        val active = target?.let { binding.buttons[it] }
-        active?.let { styleRailEntry(it, binding.accent, active = true) }
+        // The measured mark wins when both land on the same rung: it is the stronger claim, and
+        // outlining a value the machine has already reached would understate it.
+        val request = requested?.takeIf { it != target }
+
+        val changed = binding.applied != target || binding.appliedRequest != request
+        val previousMarks = setOfNotNull(binding.applied, binding.appliedRequest)
         binding.applied = target
+        binding.appliedRequest = request
+        // An enable/disable flip repaints the whole column; a mark move repaints only the pills
+        // whose state actually changed.
+        val repaint = when {
+            enabledChanged -> binding.buttons.keys
+            changed -> previousMarks + setOfNotNull(target, request)
+            else -> emptySet()
+        }
+        binding.appliedEnabled = enabled
+        repaint.forEach { key ->
+            val view = binding.buttons[key] ?: return@forEach
+            val mark = when (key) {
+                target -> RailMark.MEASURED
+                request -> RailMark.REQUESTED
+                else -> RailMark.NONE
+            }
+            styleRailEntry(view, binding.accent, mark, binding.enabled)
+        }
+
+        if (!changed) return
+        // Follow the rider's own choice first: mid-ramp they are watching the value they picked,
+        // not the one the belt has crawled to.
+        val focus = (request ?: target)?.let { binding.buttons[it] }
         // Never yank the column out from under a rider mid-scroll; they are reaching for a value and
         // moving the list would make them miss it.
-        if (active != null && !binding.isSettling()) {
+        if (focus != null && !binding.isSettling()) {
             binding.scroll.post {
-                val target = (active.top - (binding.scroll.height - active.height) / 2).coerceAtLeast(0)
-                binding.scroll.smoothScrollTo(0, target)
+                val to = (focus.top - (binding.scroll.height - focus.height) / 2).coerceAtLeast(0)
+                binding.scroll.smoothScrollTo(0, to)
             }
         }
     }
@@ -1728,12 +1839,17 @@ class OverlayService : Service() {
      * currently reports, so the column reads as a scale with the rider's position marked on it
      * rather than as sixteen competing buttons.
      */
-    private fun railEntryButton(label: String, accent: Int, active: Boolean, onClick: () -> Unit): TextView =
+    private fun railEntryButton(
+        label: String,
+        accent: Int,
+        mark: RailMark,
+        enabled: Boolean,
+        onClick: () -> Unit,
+    ): TextView =
         textView(label, 30f, Color.rgb(206, 214, 232), bold = true, gravity = Gravity.CENTER).apply {
-            isClickable = true
             isFocusable = true
             contentDescription = label
-            styleRailEntry(this, accent, active)
+            styleRailEntry(this, accent, mark, enabled)
             setOnClickListener { onClick() }
             val lp = LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, dp(66f))
             lp.topMargin = dp(11f)
@@ -1741,13 +1857,43 @@ class OverlayService : Service() {
             minimumHeight = dp(66f)
         }
 
-    /** The one place a rail pill's marked/unmarked look is defined, so build and refresh cannot drift. */
-    private fun styleRailEntry(view: TextView, accent: Int, active: Boolean) {
-        view.setTextColor(if (active) Color.rgb(5, 10, 18) else Color.rgb(206, 214, 232))
+    /**
+     * The one place a rail pill's look is defined, so build and refresh cannot drift.
+     *
+     * A disabled pill is drawn flat and unlit and cannot be pressed into a command. It keeps its
+     * click listener on purpose: the machine refusing writes is exactly the moment a rider needs
+     * telling *why* the column stopped working, and a control that dies silently is the anti-pattern
+     * this overlay is built to avoid. The tap explains, it does not actuate.
+     */
+    private fun styleRailEntry(view: TextView, accent: Int, mark: RailMark, enabled: Boolean) {
+        view.isEnabled = enabled
+        view.isClickable = true
+        view.alpha = if (enabled) 1f else 0.42f
+        if (!enabled) {
+            view.setTextColor(Color.rgb(150, 161, 178))
+            view.background = roundedRect(Color.argb(180, 16, 21, 34), 34f, Color.argb(90, 62, 76, 116))
+            return
+        }
+        view.setTextColor(
+            when (mark) {
+                RailMark.MEASURED -> Color.rgb(5, 10, 18)
+                RailMark.REQUESTED -> accent
+                RailMark.NONE -> Color.rgb(206, 214, 232)
+            },
+        )
         view.background = rippleRounded(
-            color = if (active) accent else Color.argb(224, 18, 25, 46),
+            color = when (mark) {
+                RailMark.MEASURED -> accent
+                // Outlined, not filled: a requested value must never be styled as a measured one.
+                RailMark.REQUESTED -> Color.argb(232, 18, 25, 46)
+                RailMark.NONE -> Color.argb(224, 18, 25, 46)
+            },
             radius = 34f,
-            strokeColor = if (active) Color.WHITE else Color.argb(150, 62, 76, 116),
+            strokeColor = when (mark) {
+                RailMark.MEASURED -> Color.WHITE
+                RailMark.REQUESTED -> accent
+                RailMark.NONE -> Color.argb(150, 62, 76, 116)
+            },
         )
     }
 
@@ -1899,6 +2045,7 @@ class OverlayService : Service() {
             LinearLayout.LayoutParams.WRAP_CONTENT,
         )
         val current = MachineCoordinator.lastFanState ?: StrideSettings.fanState
+        val usable = MachineLink.canCommandFan()
         val states = listOf(
             GlassOsCommands.FAN_OFF,
             GlassOsCommands.FAN_LOW,
@@ -1918,17 +2065,13 @@ class OverlayService : Service() {
                 isClickable = true
                 isFocusable = true
                 contentDescription = "Fan ${GlassOsCommands.fanStateName(state)}"
-                background = rippleRounded(
-                    color = if (active) amber else Color.argb(224, 18, 25, 46),
-                    radius = 26f,
-                    strokeColor = if (active) Color.WHITE else Color.argb(140, 62, 76, 116),
-                )
+                styleFanSegment(this, active, usable)
                 val lp = LinearLayout.LayoutParams(dp(108f), dp(72f))
                 if (index > 0) lp.marginStart = dp(8f)
                 layoutParams = lp
                 minimumHeight = dp(72f)
                 setOnClickListener {
-                    if (!MachineLink.canCommand()) {
+                    if (!MachineLink.canCommandFan()) {
                         showMachineControlUnavailable()
                         return@setOnClickListener
                     }
@@ -1944,15 +2087,30 @@ class OverlayService : Service() {
     }
 
     private fun refreshFanSegments(selected: Int) {
+        val usable = MachineLink.canCommandFan()
         fanSegmentViews.forEach { (state, view) ->
-            val active = state == selected
-            view.setTextColor(if (active) Color.rgb(28, 18, 4) else Color.rgb(206, 214, 232))
-            view.background = rippleRounded(
-                color = if (active) amber else Color.argb(224, 18, 25, 46),
-                radius = 26f,
-                strokeColor = if (active) Color.WHITE else Color.argb(140, 62, 76, 116),
-            )
+            styleFanSegment(view, active = state == selected, usable = usable)
         }
+    }
+
+    /**
+     * The one place a fan segment's look is defined. Dimmed and inert when the console will not
+     * take a fan write, for the same reason the rails are: an unusable control must look unusable.
+     */
+    private fun styleFanSegment(view: TextView, active: Boolean, usable: Boolean) {
+        view.isEnabled = usable
+        view.alpha = if (usable) 1f else 0.42f
+        if (!usable) {
+            view.setTextColor(Color.rgb(150, 161, 178))
+            view.background = roundedRect(Color.argb(180, 16, 21, 34), 26f, Color.argb(90, 62, 76, 116))
+            return
+        }
+        view.setTextColor(if (active) Color.rgb(28, 18, 4) else Color.rgb(206, 214, 232))
+        view.background = rippleRounded(
+            color = if (active) amber else Color.argb(224, 18, 25, 46),
+            radius = 26f,
+            strokeColor = if (active) Color.WHITE else Color.argb(140, 62, 76, 116),
+        )
     }
 
     private fun menuToggle(label: String, on: Boolean, onClick: () -> Unit): TextView =
