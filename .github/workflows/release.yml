@@ -83,13 +83,24 @@ jobs:
           echo "apksigner: $APKSIGNER"
 
           CERTS="$("$APKSIGNER" verify --print-certs "$APK")"
-          ACTUAL="$(printf '%s\n' "$CERTS" \
-            | awk '/Signer #1 certificate SHA-256 digest/ {print $NF}')"
-          if [ -z "$ACTUAL" ]; then
+          # Two output formats in the wild: build-tools <=36 prints "Signer #1 certificate SHA-256
+          # digest: x", 37 prints "V2 Signer: certificate SHA-256 digest: x" (and one line per
+          # signature scheme). Match the part both share, then collapse to distinct values - if an
+          # APK ever carried two different certs, that is exactly the thing worth stopping for.
+          DIGESTS="$(printf '%s\n' "$CERTS" \
+            | awk '/certificate SHA-256 digest/ {print $NF}' | sort -u)"
+          COUNT="$(printf '%s\n' "$DIGESTS" | grep -c . || true)"
+          if [ "$COUNT" -eq 0 ]; then
             echo "::error::could not read a signer digest out of apksigner. Full output:"
             printf '%s\n' "$CERTS"
             exit 1
           fi
+          if [ "$COUNT" -ne 1 ]; then
+            echo "::error::apksigner reports $COUNT different signer certificates. Full output:"
+            printf '%s\n' "$CERTS"
+            exit 1
+          fi
+          ACTUAL="$DIGESTS"
 
           echo "signer: $ACTUAL"
           if [ "$ACTUAL" != "$EXPECTED" ]; then
