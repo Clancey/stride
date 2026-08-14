@@ -188,6 +188,7 @@ data class CatalogManifest(
                 sha256 = sha256,
                 signerSha256 = signerSha256,
                 releaseNotesUrl = obj.optString("releaseNotesUrl").takeIf { it.isNotEmpty() },
+                iconUrl = obj.optString("iconUrl").takeIf { it.isNotEmpty() },
                 requiresGms = obj.optBoolean("requiresGms", false),
                 splits = splits,
             )
@@ -237,6 +238,14 @@ data class CatalogEntry(
     val sha256: String,
     val signerSha256: String,
     val releaseNotesUrl: String?,
+    /**
+     * A small PNG of the app icon, for apps that are not installed yet.
+     *
+     * Optional, and deliberately not verified against a digest: it is decoration. An icon that
+     * fails to load costs a letter tile, whereas an APK that fails to verify costs trust, so the
+     * two are held to different standards. Nothing is installed from this URL.
+     */
+    val iconUrl: String? = null,
     /**
      * True when this app is useless without Google Play Services.
      *

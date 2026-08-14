@@ -273,6 +273,37 @@ void main() {
     await tester.pumpAndSettle();
     expect(installRequests, contains('com.netflix.mediaclient'));
   });
+
+  testWidgets('an update to an installed app stays out of the Store tab', (
+    tester,
+  ) async {
+    // The Store offers what the console does not have. An update belongs to the updates sheet, and
+    // showing it in both places gives two buttons for one install and two places to disagree about
+    // what happened.
+    status = statusWith([
+      item(package: 'com.example.one', name: 'One', kind: 'update'),
+      item(package: 'com.spotify.music', name: 'Spotify', kind: 'notInstalled'),
+    ]);
+
+    await pumpScreen(tester);
+    await tester.tap(tab('Store'));
+    await tester.pumpAndSettle();
+
+    expect(find.text('Spotify'), findsOneWidget);
+    expect(find.text('One'), findsNothing);
+  });
+
+  testWidgets('a store row shows a letter when no icon can be loaded', (
+    tester,
+  ) async {
+    // appIcon is unanswered by the fake platform, which is exactly what happens for an app the
+    // console has never installed. The row still needs a mark, not a hole.
+    await pumpScreen(tester);
+    await tester.tap(tab('Store'));
+    await tester.pumpAndSettle();
+
+    expect(find.text('S'), findsOneWidget);
+  });
 }
 
 /// ProfileStore reads SharedPreferences; give it an empty in-memory store.

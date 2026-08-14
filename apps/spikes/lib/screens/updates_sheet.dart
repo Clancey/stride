@@ -5,6 +5,8 @@ import 'package:flutter/material.dart';
 import '../bridge.dart';
 import '../model/appstore.dart';
 import '../theme/stride_tokens.dart';
+import '../widgets/app_models.dart';
+import '../widgets/store_icon.dart';
 import '../widgets/stride_sheet.dart';
 
 /// The app store's entire user interface.
@@ -27,6 +29,7 @@ class _UpdatesSheet extends StatefulWidget {
 }
 
 class _UpdatesSheetState extends State<_UpdatesSheet> {
+  final AppIconCache _icons = AppIconCache();
   AppstoreStatus _status = AppstoreStatus.empty;
   List<AppstoreSetupStep> _setup = const <AppstoreSetupStep>[];
   Timer? _poll;
@@ -156,6 +159,7 @@ class _UpdatesSheetState extends State<_UpdatesSheet> {
               _SectionLabel('Stride'),
               _UpdateRow(
                 item: selfUpdate,
+                iconCache: _icons,
                 enabled: _status.mayInstallNow,
                 onInstall: () => _install(selfUpdate),
                 emphasised: true,
@@ -168,20 +172,20 @@ class _UpdatesSheetState extends State<_UpdatesSheet> {
               for (final item in _status.updates)
                 _UpdateRow(
                   item: item,
+                  iconCache: _icons,
                   enabled: _status.mayInstallNow,
                   onInstall: () => _install(item),
                 ),
               const SizedBox(height: StrideSpace.lg),
             ],
 
+            // Apps the catalog offers but the console has never had are not updates, and putting
+            // them here made a full store look like a pile of pending work: the sheet said
+            // "everything is up to date" directly above a list of Install buttons. They live in
+            // All apps > Store, which is also the only place that can show what is already
+            // installed alongside them. This is a pointer, not a second copy of that list.
             if (_status.available.isNotEmpty) ...[
-              _SectionLabel('Available to install'),
-              for (final item in _status.available)
-                _UpdateRow(
-                  item: item,
-                  enabled: _status.mayInstallNow,
-                  onInstall: () => _install(item),
-                ),
+              _StorePointer(count: _status.available.length),
               const SizedBox(height: StrideSpace.lg),
             ],
 
@@ -230,6 +234,31 @@ class _UpdatesSheetState extends State<_UpdatesSheet> {
     if (pending == 0) return 'Everything is up to date.';
     return pending == 1 ? '1 update pending.' : '$pending updates pending.';
   }
+}
+
+/// Says where the rest of the catalog lives, without becoming a second copy of it.
+class _StorePointer extends StatelessWidget {
+  const _StorePointer({required this.count});
+
+  final int count;
+
+  @override
+  Widget build(BuildContext context) => Row(
+    children: [
+      const Icon(Icons.storefront_outlined, color: StrideColors.textMuted),
+      const SizedBox(width: StrideSpace.sm),
+      Expanded(
+        child: Text(
+          count == 1
+              ? '1 more app is available in All apps, under Store.'
+              : '$count more apps are available in All apps, under Store.',
+          style: Theme.of(
+            context,
+          ).textTheme.bodyMedium?.copyWith(color: StrideColors.textMuted),
+        ),
+      ),
+    ],
+  );
 }
 
 class _SectionLabel extends StatelessWidget {
@@ -283,12 +312,14 @@ class _Notice extends StatelessWidget {
 class _UpdateRow extends StatelessWidget {
   const _UpdateRow({
     required this.item,
+    required this.iconCache,
     required this.enabled,
     required this.onInstall,
     this.emphasised = false,
   });
 
   final AppstoreItem item;
+  final AppIconCache iconCache;
   final bool enabled;
   final VoidCallback onInstall;
   final bool emphasised;
@@ -314,6 +345,8 @@ class _UpdateRow extends StatelessWidget {
       ),
       child: Row(
         children: [
+          StoreIcon(item: item, iconCache: iconCache),
+          const SizedBox(width: StrideSpace.sm),
           Expanded(
             child: Column(
               crossAxisAlignment: CrossAxisAlignment.start,

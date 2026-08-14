@@ -226,6 +226,20 @@ class CatalogManifestTest {
     }
 
     @Test
+    fun `an optional icon url is carried through`() {
+        val extra = ",\"iconUrl\":\"https://example.test/icon.png\""
+        val entry = CatalogManifest.parse(catalog(entryJson(extra = extra))).apps.single()
+        assertEquals("https://example.test/icon.png", entry.iconUrl)
+    }
+
+    @Test
+    fun `an entry without an icon url is still valid`() {
+        // Icons are decoration. A catalog that predates them, or an app nobody has drawn one for,
+        // must still install; the client falls back to a letter tile.
+        assertNull(CatalogManifest.parse(catalog(entryJson())).apps.single().iconUrl)
+    }
+
+    @Test
     fun `an ordinary entry has no splits and totals its own size`() {
         val entry = CatalogManifest.parse(catalog(entryJson())).apps.single()
         assertTrue(entry.splits.isEmpty())

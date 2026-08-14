@@ -37,6 +37,7 @@ class AppstoreBridge(private val context: Context) {
                 "installedVersionName" to item.installedVersionName(),
                 "sizeBytes" to item.entry.sizeBytes,
                 "releaseNotesUrl" to item.entry.releaseNotesUrl,
+                "iconUrl" to item.entry.iconUrl,
                 "ineligibleReason" to (item as? Ineligible)?.reason?.name?.lowercase(),
                 "stage" to (status?.stage ?: AppstoreState.Stage.IDLE).name.lowercase(),
                 "bytes" to (status?.bytes ?: 0L),

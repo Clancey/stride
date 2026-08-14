@@ -6,6 +6,7 @@ import '../bridge.dart';
 import '../theme/stride_tokens.dart';
 import '../widgets/stride_sheet.dart';
 import '../widgets/app_models.dart';
+import '../widgets/store_icon.dart';
 import '../widgets/app_tile.dart';
 import '../model/appstore.dart';
 import '../model/profile_store.dart';
@@ -252,6 +253,7 @@ class _AllAppsScreenState extends State<AllAppsScreen>
         for (final item in offered)
           _StoreRow(
             item: item,
+            iconCache: widget.iconCache,
             enabled: _store.mayInstallNow,
             onInstall: () => _install(item),
           ),
@@ -267,7 +269,12 @@ class _AllAppsScreenState extends State<AllAppsScreen>
             ),
           ),
           for (final item in blocked)
-            _StoreRow(item: item, enabled: false, onInstall: () {}),
+            _StoreRow(
+              item: item,
+              iconCache: widget.iconCache,
+              enabled: false,
+              onInstall: () {},
+            ),
         ],
       ],
     );
@@ -278,11 +285,7 @@ class _AllAppsScreenState extends State<AllAppsScreen>
       await widget.profiles.pin(app.package);
       if (!mounted) return;
       ScaffoldMessenger.of(context).showSnackBar(
-        SnackBar(
-          content: Text(
-            '${app.label} pinned to your launcher',
-          ),
-        ),
+        SnackBar(content: Text('${app.label} pinned to your launcher')),
       );
       return;
     }
@@ -335,11 +338,13 @@ class _AllAppsScreenState extends State<AllAppsScreen>
 class _StoreRow extends StatelessWidget {
   const _StoreRow({
     required this.item,
+    required this.iconCache,
     required this.enabled,
     required this.onInstall,
   });
 
   final AppstoreItem item;
+  final AppIconCache iconCache;
   final bool enabled;
   final VoidCallback onInstall;
 
@@ -362,6 +367,8 @@ class _StoreRow extends StatelessWidget {
       ),
       child: Row(
         children: [
+          StoreIcon(item: item, iconCache: iconCache),
+          const SizedBox(width: StrideSpace.sm),
           Expanded(
             child: Column(
               crossAxisAlignment: CrossAxisAlignment.start,

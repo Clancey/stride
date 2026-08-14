@@ -80,6 +80,7 @@ class AppstoreItem {
     this.message,
     this.releaseNotesUrl,
     this.ineligibleReason,
+    this.iconUrl,
   });
 
   factory AppstoreItem.fromMap(Map<String, dynamic> map) {
@@ -98,6 +99,7 @@ class AppstoreItem {
       message: map['message'] as String?,
       releaseNotesUrl: map['releaseNotesUrl'] as String?,
       ineligibleReason: map['ineligibleReason'] as String?,
+      iconUrl: map['iconUrl'] as String?,
     );
   }
 
@@ -118,6 +120,14 @@ class AppstoreItem {
   final String? message;
   final String? releaseNotesUrl;
   final String? ineligibleReason;
+
+  /// Where to fetch an icon for an app that is not on the device yet. Null is ordinary and just
+  /// means a letter tile; see [isInstalled] for the case where the device has the real one.
+  final String? iconUrl;
+
+  /// True when the device already has this app, so its real launcher icon can be read locally
+  /// instead of fetched. Everything except [AppstoreKind.notInstalled] is by definition installed.
+  bool get isInstalled => kind != AppstoreKind.notInstalled;
 
   bool get isActionable =>
       kind == AppstoreKind.update || kind == AppstoreKind.notInstalled;
