@@ -65,3 +65,6 @@ protocol/glassos/**/*.apk
 *.trace
 *.pcap
 incident-*.log
+
+# Live telemetry captures may contain workout IDs and machine serials.
+.telemetry/

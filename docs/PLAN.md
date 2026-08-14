@@ -43,7 +43,71 @@ userspace has **no direct access**. Three known paths:
 
 ### 2.2 The mTLS certificate problem — how everyone else handles it
 
-**You asked how qdomyos-zwift handles the certs. The answer: it doesn't — it avoids gRPC entirely.**
+**CORRECTED 2026-08-13, by direct measurement on the user's console. The original claim below was
+wrong, and it was wrong in the direction that mattered.**
+
+This section previously read: *"You asked how qdomyos-zwift handles the certs. The answer: it
+doesn't — it avoids gRPC entirely."* That conclusion came from searching the qz **repository** and
+finding no `.pem` files and no `QSslCertificate` usage. The search was accurate; the inference was
+not.
+
+The installed `org.cagnulen.qdomyoszwift` APK on the console ships, uncompiled, at its asset root:
+
+```
+assets/ca_cert.pem
+assets/client_cert.pem
+assets/client_key.pem
+```
+
+and its dex references `glassos` throughout. qz speaks GlassOS gRPC directly. It does not defeat
+the mutual TLS — **it ships the credentials.**
+
+The `input swipe` / log-scraping / OCR path described below is real, but it is qz's *phone-side
+remote control* path for driving a console it cannot run on. It is not how the on-console build
+reads telemetry. Conflating the two produced a confidently wrong conclusion, and the lesson is
+worth keeping: absence of evidence in a source repository is not evidence of absence in a shipped
+binary. Check the artifact that actually runs.
+
+#### What was verified live, not inferred
+
+- The client certificate's subject is **`CN=com.ifit.eriador`** — it authenticates as one of iFit's
+  own applications. The working metadata header is `client_id: com.ifit.eriador`, not
+  `com.ifit.dev_app` as recorded below.
+- **`openssl verify -CAfile ca_cert.pem <console server cert>` → OK.** qz's bundled CA validates
+  *this* console's server certificate, and the two were minted three minutes apart on 2023-10-25,
+  expiring 2033-10-22.
+- Full mTLS handshake succeeds: TLS 1.2, `ECDHE-RSA-AES128-GCM-SHA256`, ALPN `h2`,
+  `Verify return code: 0 (ok)`. Live calls return real data —
+  `ConsoleService/GetConsoleState → IDLE`, `DistanceService/CanRead → isAvailable: true`.
+- Without a client certificate the handshake fails with TLS alert 40; with a *wrong* one
+  (gRPC's public test client cert) it fails with alert 46, `certificate_unknown`. The server really
+  does verify clients.
+
+#### This answers open question S2b
+
+**The certificates are shared factory credentials, not per-device.** A CA extracted from a
+general-purpose app distributed to thousands of users validates this specific console. tHUD's
+documentation claiming per-treadmill certs is not true for this firmware line; NordicFTMS's
+prebuilt-APK distribution, which only works if certs are shared, was the correct read.
+
+**Stride's decision does not change.** Self-extraction on device is still the design, for reasons
+that survive S2b being answered: we still refuse to bake anyone's key material into a distributed
+binary, and an extractor stays correct if iFit ever does move to per-device credentials. What
+changes is that the extraction target is now known to be reachable and the credential shape is
+confirmed, so telemetry work is no longer blocked on solving access.
+
+One implementation detail that will otherwise cost an afternoon: the server certificate uses a
+legacy Common Name with **no SAN**, which modern TLS stacks reject outright. Stride's Android
+client needs a trust manager pinned to this CA that verifies the chain *without* hostname matching
+— not blanket trust.
+
+Full detail, including the proto3 parsing trap that would otherwise make Stride render fabricated
+zeros, is in `protocol/glassos/README.md`.
+
+---
+
+*Original text, retained because the mechanism it describes is still how qz's phone-side remote
+works:*
 
 A search of `cagnulein/qdomyos-zwift` and its companion app `QZCompanionNordictrackTreadmill` for
 gRPC, protobuf, `QSslCertificate`/`QSslKey`/`QSslConfiguration`, `.pem`/`.p12`/`.jks`, GlassOS, or
@@ -52,9 +116,7 @@ any client-cert handling returns **zero results**. There are no certificate file
 qz gets telemetry by **scraping a log file** iFit writes to `/sdcard/` for lines like
 `Changed KPH`, `Changed Grade`, `Changed Watts`, `Changed RPM`, `HeartRateDataUpdate` — with an
 **OCR screenshot fallback** when log access fails — then UDP-broadcasts it on port 8002. It sends
-control back as `input swipe` touch simulation. No authentication is needed because it never speaks
-to GlassOS at all. That is precisely *why* it needs the iFit UI on screen, and why it's a dead end
-for us.
+control back as `input swipe` touch simulation.
 
 **The projects that do use GlassOS gRPC split two ways:**
 
