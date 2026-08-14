@@ -57,6 +57,17 @@ object MachineLink {
         "Stride can't reach the console right now. Use the console's own controls."
 
     /**
+     * What a control says when the link is fine but the machine is declining setpoints.
+     *
+     * Almost always because there is no workout: the console accepts speed and incline while a
+     * workout is live and refuses them from idle or from the results screen. Saying so is the
+     * difference between a broken-looking app and one telling the rider the single thing that
+     * would make the button work.
+     */
+    const val CONTROL_NEEDS_WORKOUT_NOTICE: String =
+        "The treadmill won't change speed or incline until a workout is running. Start one first."
+
+    /**
      * The safety sentence to print beside a metric readout, chosen by what is actually true.
      *
      * Printing [CANNOT_READ_NOTICE] next to live numbers would be a visible contradiction, and the
@@ -155,6 +166,16 @@ object MachineLink {
 
     /** The console's own state, e.g. IDLE, WARM_UP, WORKOUT, SAFETY_KEY_REMOVED. */
     val consoleState: String? get() = fresh()?.consoleState
+
+    /**
+     * Whether the machine says it will accept a speed / incline / fan write right now.
+     *
+     * Null means it has not answered, which is *not* "no" — see [GlassOsClient] — and is why the
+     * `canCommand*` helpers below only refuse on an explicit false.
+     */
+    val speedWritable: Boolean? get() = fresh()?.speedWritable
+    val inclineWritable: Boolean? get() = fresh()?.inclineWritable
+    val fanWritable: Boolean? get() = fresh()?.fanWritable
 
     /**
      * The console's incline quick-pick presets, in **percent**, highest first. Null until they have
@@ -314,4 +335,27 @@ object MachineLink {
      * keep describing the physical safety key as the only true stop.
      */
     fun canCommand(): Boolean = MachineCoordinator.available
+
+    /**
+     * Whether one particular control is usable at this moment.
+     *
+     * Two conditions, and both are needed. [canCommand] answers "could a command travel", which is
+     * about Stride's link; the writability flag answers "would the machine accept it", which is
+     * about the console's state and is the reason an incline pill does nothing from an idle
+     * console. A control that fails either must be drawn as unavailable rather than left live to
+     * fail on tap — a button that looks pressable and moves nothing teaches the rider that Stride's
+     * controls are unreliable, on a machine where that doubt matters.
+     *
+     * Only an *explicit* refusal disables. An unanswered `CanWrite` leaves the control live, so a
+     * single dropped poll cannot lock a rider out of their own belt mid-run.
+     */
+    fun canCommandSpeed(): Boolean = canCommand() && speedWritable != false
+
+    fun canCommandIncline(): Boolean = canCommand() && inclineWritable != false
+
+    fun canCommandFan(): Boolean = canCommand() && fanWritable != false
+
+    /** Why a control is unavailable, in the words to show the rider who just tapped it. */
+    fun unavailableReason(): String =
+        if (canCommand()) CONTROL_NEEDS_WORKOUT_NOTICE else CONTROL_LOCKED_NOTICE
 }

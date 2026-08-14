@@ -245,6 +245,23 @@ class GlassOsClient(private val context: Context) {
         GlassOsTelemetry.availability(call(service, "CanRead")?.bool(1))
 
     /**
+     * Ask a service whether it will accept a write *right now*.
+     *
+     * A read, despite the name: `CanWrite` reports the machine's own opinion and actuates nothing.
+     * It is asked because the answer changes with console state — an idle console, one showing
+     * results, or one under another client's control refuses setpoints — and the alternative to
+     * asking is finding out from a failed `SetIncline`, i.e. by having already tried to move the
+     * machine.
+     *
+     * Null and false are deliberately different. Null is "the machine never answered", which is a
+     * transport problem and says nothing about permission; false is the machine explicitly
+     * declining. Callers must not collapse them: disabling controls on a dropped reply would lock
+     * the rider out of the belt over one missed poll.
+     */
+    private fun canWrite(service: String): Boolean? =
+        call(service, "CanWrite")?.let { GlassOsTelemetry.availability(it.bool(1)) }
+
+    /**
      * One consistent view of the machine. Null values mean "no reading" and must render as
      * [MachineLink.NO_READING] — never as a number.
      */
@@ -257,6 +274,13 @@ class GlassOsClient(private val context: Context) {
         val paceMinPerMile: Double?,
         val elapsedSeconds: Long?,
         val calories: Double?,
+        /**
+         * What the machine says it will accept a write for at this moment. Null means it did not
+         * answer; see [canWrite] for why that is not the same as "no".
+         */
+        val speedWritable: Boolean?,
+        val inclineWritable: Boolean?,
+        val fanWritable: Boolean?,
     )
 
     /**
@@ -305,6 +329,11 @@ class GlassOsClient(private val context: Context) {
             calories = GlassOsTelemetry.reading(
                 calories?.double(3), workoutId, canRead("CaloriesBurnedService")
             ),
+            // Read every poll rather than once per link: this is precisely the thing that changes
+            // when a workout starts or ends, which is the case the UI needs it for.
+            speedWritable = canWrite("SpeedService"),
+            inclineWritable = canWrite("InclineService"),
+            fanWritable = canWrite("FanStateService"),
         )
     }
 
