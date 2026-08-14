@@ -76,9 +76,21 @@ object MachineLink {
     /** How long a reading stays believable after the last successful poll. */
     private const val FRESHNESS_MS = 4_000L
 
+    /**
+     * Metres per second to miles per hour. GlassOS reports speed presets as MPS
+     * ([GlassOsClient.ControlType.MPS]); this is the exact factor (1 / 0.44704), not a rounded
+     * 2.24, so a 12.0 mph preset reads back as 12.0 and not 12.01.
+     */
+    const val MPS_TO_MPH = 2.2369362920544
+
     @Volatile private var snapshot: GlassOsClient.Snapshot? = null
     @Volatile private var snapshotAt: Long = 0L
     @Volatile private var client: GlassOsClient? = null
+
+    @Volatile private var inclinePresetsCache: List<Double>? = null
+    @Volatile private var speedPresetsCache: List<Double>? = null
+    // Distinct from the caches being null: null there means "no presets", this means "not asked".
+    @Volatile private var presetsFetched: Boolean = false
 
     private var thread: HandlerThread? = null
     private var handler: Handler? = null
@@ -134,6 +146,19 @@ object MachineLink {
     val consoleState: String? get() = fresh()?.consoleState
 
     /**
+     * The console's incline quick-pick presets, in **percent**, highest first. Null until they have
+     * been fetched, or when the machine reports none — never a fabricated fallback list, because a
+     * button offering an incline the machine did not is worse than no button at all.
+     */
+    val inclinePresets: List<Double>? get() = inclinePresetsCache
+
+    /**
+     * The console's speed quick-pick presets, in **miles per hour**, highest first. Null until
+     * fetched, or when the machine reports none. GlassOS reports these as MPS; see [MPS_TO_MPH].
+     */
+    val speedPresets: List<Double>? get() = speedPresetsCache
+
+    /**
      * Whether the machine says the belt may be under power. Null means we do not know, which is
      * *not* the same as "no", and callers must not collapse it to one.
      */
@@ -179,6 +204,9 @@ object MachineLink {
         client = null
         snapshot = null
         snapshotAt = 0L
+        inclinePresetsCache = null
+        speedPresetsCache = null
+        presetsFetched = false
     }
 
     private val poll = object : Runnable {
@@ -192,12 +220,37 @@ object MachineLink {
             if (read != null) {
                 snapshot = read
                 snapshotAt = System.currentTimeMillis()
+                // Presets are static for the machine, so fetch them once on the same background
+                // thread as the poll rather than inventing a second worker. A read having just
+                // succeeded means the link is up, so this is the cheapest moment to try.
+                fetchPresetsOnce()
             }
             // Poll faster while the machine says it may be moving. There is no reason to hammer a
             // console sitting idle, and no excuse for a laggy readout while someone is running.
             val moving = read?.let { GlassOsClient.ConsoleState.beltMayBeMoving(it.consoleState) }
             handler?.postDelayed(this, if (moving == true) 500L else 2_000L)
         }
+    }
+
+    /**
+     * Fetch the quick-pick presets exactly once per link.
+     *
+     * On transport failure [GlassOsClient.controls] returns null and this leaves [presetsFetched]
+     * false so a later poll retries; only a decoded `ControlList` (even an empty one) counts as
+     * fetched. An empty shaped list is stored as null rather than as `emptyList()`, so callers see
+     * the same "no presets" signal whether the machine listed none or matched none of the type.
+     */
+    private fun fetchPresetsOnce() {
+        if (presetsFetched) return
+        val c = client ?: return
+        val incline = c.controls("InclineService") ?: return
+        val speed = c.controls("SpeedService") ?: return
+        inclinePresetsCache =
+            shapePresets(incline, GlassOsClient.ControlType.INCLINE) { it }.takeIf { it.isNotEmpty() }
+        speedPresetsCache =
+            shapePresets(speed, GlassOsClient.ControlType.MPS) { it * MPS_TO_MPH }
+                .takeIf { it.isNotEmpty() }
+        presetsFetched = true
     }
 
     /**

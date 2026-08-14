@@ -78,8 +78,12 @@ class GlassOsClient(private val context: Context) {
         return built
     }
 
-    /** Perform a unary call with an empty request. Returns null on any failure. */
-    private fun call(service: String, method: String): GlassOsWire.Fields? {
+    /**
+     * Perform a unary call with an empty request, returning the raw (unframed) response message,
+     * or null on any failure. Everything reachable from here is read-only: the request body is
+     * always [GlassOsWire.EMPTY_FRAME], so no value can be carried to the machine.
+     */
+    private fun callRaw(service: String, method: String): ByteArray? {
         val client = ensureClient() ?: return null
         return try {
             val request = Request.Builder()
@@ -102,12 +106,90 @@ class GlassOsClient(private val context: Context) {
                     note("$service/$method grpc-status $status ${response.trailers()["grpc-message"]}")
                     return null
                 }
-                GlassOsWire.unframe(body)?.let { GlassOsWire.parse(it) }
+                GlassOsWire.unframe(body)
             }
         } catch (t: Throwable) {
             note("$service/$method ${t.javaClass.simpleName}: ${t.message}")
             null
         }
+    }
+
+    /** Perform a unary call with an empty request. Returns null on any failure. */
+    private fun call(service: String, method: String): GlassOsWire.Fields? =
+        callRaw(service, method)?.let { GlassOsWire.parse(it) }
+
+    /**
+     * Read a service's quick-pick presets read-only via `GetControls`, which returns a
+     * `ControlList` (`repeated Control controls = 1`). `GetControls` is a pure reader — it is what
+     * the stock console calls to *draw* the speed/incline buttons, not to press them — so nothing
+     * here can actuate the machine.
+     *
+     * Returns null on transport failure, and an empty list when the machine decoded a `ControlList`
+     * that carried no controls. The two are kept distinct so a caller can tell "we never got an
+     * answer" from "the machine says there are none".
+     *
+     * [GlassOsWire.parse] deliberately collapses repeated fields to their last occurrence, so the
+     * repeated `Control` entries are pulled out of the raw message here before each is parsed as a
+     * single message.
+     */
+    fun controls(service: String): List<MachineControl>? {
+        val raw = callRaw(service, "GetControls") ?: return null
+        return repeatedLengthDelimited(field = 1, message = raw).map { entry ->
+            val f = GlassOsWire.parse(entry)
+            MachineControl(
+                // Control.type = 1 (ControlType), .at = 2, .value = 3; proto3 omits any that are
+                // zero, so an absent value is a genuine 0.0, not a missing preset.
+                type = f.enum(1) ?: ControlType.UNKNOWN,
+                at = f.double(2) ?: 0.0,
+                value = f.double(3) ?: 0.0,
+            )
+        }
+    }
+
+    /**
+     * Collect every length-delimited (wire type 2) entry for [field] from a protobuf [message].
+     *
+     * [GlassOsWire.parse] keeps only the last occurrence of a field, which is right for the scalar
+     * metric messages it was written for but loses the elements of a `repeated` message. This walks
+     * the message just enough to recover them, skipping other fields and other wire types rather
+     * than treating them as errors.
+     */
+    private fun repeatedLengthDelimited(field: Int, message: ByteArray): List<ByteArray> {
+        val out = ArrayList<ByteArray>()
+        var i = 0
+        while (i < message.size) {
+            val (tag, afterTag) = readVarint(message, i) ?: break
+            i = afterTag
+            val f = (tag ushr 3).toInt()
+            when ((tag and 0x7L).toInt()) {
+                0 -> { val (_, next) = readVarint(message, i) ?: return out; i = next } // varint
+                1 -> { if (i + 8 > message.size) return out; i += 8 }                   // fixed64
+                2 -> {                                                                  // length
+                    val (len, afterLen) = readVarint(message, i) ?: return out
+                    val end = afterLen + len.toInt()
+                    if (len < 0 || end > message.size) return out
+                    if (f == field) out.add(message.copyOfRange(afterLen, end))
+                    i = end
+                }
+                5 -> { if (i + 4 > message.size) return out; i += 4 }                   // fixed32
+                else -> return out // group or corrupt; stop rather than guess
+            }
+        }
+        return out
+    }
+
+    private fun readVarint(input: ByteArray, from: Int): Pair<Long, Int>? {
+        var result = 0L
+        var shift = 0
+        var i = from
+        while (i < input.size && shift <= 63) {
+            val b = input[i].toInt()
+            result = result or ((b.toLong() and 0x7F) shl shift)
+            i++
+            if (b and 0x80 == 0) return result to i
+            shift += 7
+        }
+        return null
     }
 
     /**
@@ -236,4 +318,46 @@ class GlassOsClient(private val context: Context) {
         fun beltMayBeMoving(name: String?): Boolean =
             name == "WORKOUT" || name == "WARM_UP" || name == "COOL_DOWN" || name == "RESUME"
     }
+
+    /**
+     * The `ControlType` enum from `protocol/glassos/workout/data/ControlType.proto`, limited to the
+     * two values Stride reads. A quick-pick button is one `Control` carrying a preset `value`;
+     * INCLINE values are a percent and MPS values are a speed in **metres per second**. The other
+     * eleven types (resistance, gear, watts, …) belong to bikes and rowers and are ignored rather
+     * than coerced — a resistance level is not a treadmill speed, and forcing it into one would
+     * invent buttons the machine never offered.
+     */
+    object ControlType {
+        const val UNKNOWN = 0
+        const val INCLINE = 1
+        const val MPS = 2
+    }
 }
+
+/** One decoded `Control`: its [type] (a [GlassOsClient.ControlType]), position [at], and [value]. */
+data class MachineControl(val type: Int, val at: Double, val value: Double)
+
+/**
+ * Shape a raw `ControlList` into the display presets for one control column.
+ *
+ * Pure and side-effect free so it can be tested without a live machine. Keeps only [keepType]
+ * (ignoring every other [GlassOsClient.ControlType] rather than coercing it), maps each value
+ * through [toDisplay] into the unit shown on screen, sorts **descending** so the highest preset
+ * sits at the top of the column as it does on the stock console, and removes values that collide
+ * once rounded for display. Empty input yields an empty list; the caller is responsible for
+ * mapping that to a null property rather than a fabricated list.
+ */
+internal fun shapePresets(
+    controls: List<MachineControl>,
+    keepType: Int,
+    toDisplay: (Double) -> Double,
+): List<Double> =
+    controls.asSequence()
+        .filter { it.type == keepType }
+        .map { roundForDisplay(toDisplay(it.value)) }
+        .distinct()
+        .sortedDescending()
+        .toList()
+
+/** Presets are shown to one decimal place; rounding here is what de-duplication collapses on. */
+private fun roundForDisplay(value: Double): Double = kotlin.math.round(value * 10.0) / 10.0

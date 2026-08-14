@@ -8,6 +8,19 @@ import io.flutter.embedding.engine.FlutterEngine
 import io.flutter.plugin.common.MethodChannel
 
 class MainActivity : FlutterActivity() {
+    companion object {
+        /**
+         * True while Stride's own launcher is the thing on screen.
+         *
+         * The overlay uses this to stand down its decorative surfaces. The accessibility service
+         * cannot answer this question — it deliberately ignores our own package — and the
+         * Activity itself is the only component that reliably knows.
+         */
+        @Volatile
+        var launcherForeground: Boolean = false
+            private set
+    }
+
     private val mainHandler = Handler(Looper.getMainLooper())
     private var channel: MethodChannel? = null
     private var workoutStateListener: ((WorkoutSession.State) -> Unit)? = null
@@ -28,6 +41,18 @@ class MainActivity : FlutterActivity() {
         channel?.setMethodCallHandler(null)
         channel = null
         super.cleanUpFlutterEngine(flutterEngine)
+    }
+
+    override fun onResume() {
+        super.onResume()
+        launcherForeground = true
+        OverlayService.refreshChrome()
+    }
+
+    override fun onPause() {
+        launcherForeground = false
+        OverlayService.refreshChrome()
+        super.onPause()
     }
 
     override fun onNewIntent(intent: Intent) {

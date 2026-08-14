@@ -448,6 +448,63 @@ Rev 1's seven-package melos monorepo (`stride_core`, `stride_devices`, `stride_b
 platforms was premature for a solo project with zero code. **Packages get extracted when real reuse
 appears**, not before.
 
+### 3.9 The workout surface — what the overlay actually draws
+
+Built against the stock iFit console screenshot, which is the visual authority for this surface.
+The console is 1920x1080 at density 160, so 1 dp is 1 px and every number below is both.
+
+| Surface | Where | Lives while |
+|---|---|---|
+| Metric strip | top, full width, 186 px | chrome visible; toggleable ("Metrics") |
+| Speed / incline rails | left and right, 132 dp, scrollable presets | chrome visible; toggleable per side |
+| Bottom bar | bottom, 132 px — Back / Home / Recents, timer transport, volume, fan, toggles | always, while chrome visible |
+| Track floor | bottom centre, 1020 x 300 dp, perspective oval | a workout exists, no video playing, not over Stride's own launcher; toggleable ("Track") |
+| Goal ring | bottom right, 260 dp | a goal exists **and** a session exists to measure it against |
+| Now-playing card | bottom left | music (not video) has an active `MediaSession` |
+
+Rules this surface has already had to learn the hard way:
+
+- **A window is structural.** Anything that adds or removes an overlay window must go through a
+  full chrome rebuild; only text may be updated in place. The track floor silently never appeared
+  on workout start because a state change was treated as textual.
+- **Decorative surfaces set `FLAG_NOT_TOUCHABLE`; interactive ones must not.** The now-playing card
+  is therefore *added and removed*, never merely hidden, so a stale touchable window cannot eat
+  taps meant for the app underneath.
+- **Anything drawn over a third-party app needs its own scrim.** White text over an album grid or a
+  poster wall is unreadable. Both the goal ring and the track floor's infield label carry a soft
+  radial scrim rather than trusting the content beneath them.
+- **Stride's own launcher is a client of the overlay, not an exception to it.** The launcher insets
+  for every edge the HUD occupies, and also for the now-playing card, which floats inside the
+  content area. Third-party apps get no inset and are not expected to cooperate.
+- **The goal belongs to the session.** Ending a workout clears it. A ring reading "0%" over an idle
+  console is not a stale number, it is a number about a workout that no longer exists.
+- **Every bottom sheet in the launcher goes through `showStrideSheet()`.** A stock
+  `showModalBottomSheet` sizes against the full window, ignores the ~318 px the HUD occupies, and
+  clipped a safety warning mid-sentence.
+
+#### Goals
+
+A goal is chosen on a dedicated **Start workout** screen (distance or time, preset chips plus a
+custom value) reachable from the launcher header — deliberately in the header, because the
+launcher hides its workout panel whenever the overlay is up, which is the normal configuration.
+Opening it mid-workout changes the goal without restarting the session or discarding elapsed time.
+
+Progress is computed against the machine's own distance register, never integrated from speed x
+time. When the reading is stale or absent the ring shows `Not measured` and no arc. A confident
+wrong number about how far someone has run is worse than no number.
+
+### 3.10 Direct-machine protocol — a documented codec, deliberately unwired
+
+`docs/DIRECT_MACHINE_PROTOCOL.md` and `FitProCodec.kt` describe the FitPro2 register protocol the
+console itself speaks to the motor controller, below GlassOS. It settles a question that had been
+open since Revision 1: **distance is a register the machine reports (`CURRENT_DISTANCE`,
+`ACTUAL_DISTANCE`), not something the console integrates.**
+
+It ships as a pure codec with **no transport and no callers**, and stays that way until the
+standing safety work in §3.1 exists to sit in front of it. The in-frame byte order and CRC are
+still unverified, and the endianness is genuinely mixed — speed big-endian, incline and distance
+little-endian — so this is documentation with tests, not a driver.
+
 ## 4. Phasing — vertical slice first
 
 Rev 1 built profiles and generic device abstractions before proving the primary hardware path, so a

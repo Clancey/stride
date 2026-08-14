@@ -66,6 +66,18 @@ class SpikeBridge {
   static Future<Map<String, dynamic>> machineSnapshot() =>
       _map('machineSnapshot');
 
+  /// Persist the rider's chosen goal. [kind] is `'none'`, `'distance'`, or
+  /// `'time'`; [target] is miles or seconds respectively.
+  ///
+  /// Degrades to `false` when the platform side is missing so the goal picker
+  /// can still hand off to Stride's timer in environments without the bridge.
+  static Future<bool> goalSet({required String kind, required double target}) =>
+      _boolSafe('goalSet', {'kind': kind, 'target': target});
+
+  /// Current goal plus its live progress, or an empty-but-valid map when the
+  /// platform side is unavailable. Callers must tolerate missing keys.
+  static Future<Map<String, dynamic>> goalGet() => _mapSafe('goalGet');
+
   /// Height in **physical pixels** of the always-on HUD strip along the top edge.
   ///
   /// The HUD is a separate system window drawn over everything, so Flutter has no idea it is there
@@ -82,7 +94,12 @@ class SpikeBridge {
     final raw = await _channel.invokeMapMethod<String, num>('hudInsetsPx');
     if (raw == null) return EdgeInsets.zero;
     double at(String key) => math.max(0, (raw[key] ?? 0).toDouble());
-    return EdgeInsets.fromLTRB(at('left'), at('top'), at('right'), at('bottom'));
+    return EdgeInsets.fromLTRB(
+      at('left'),
+      at('top'),
+      at('right'),
+      at('bottom'),
+    );
   }
 
   // S4 - app inventory
@@ -131,12 +148,43 @@ class SpikeBridge {
     Map<String, dynamic>? args,
   ]) async => await _channel.invokeMethod<bool>(method, args) ?? false;
 
+  /// Like [_bool] but never lets a missing or throwing platform method reach the
+  /// UI — an unset goal channel simply reads as `false`.
+  static Future<bool> _boolSafe(
+    String method, [
+    Map<String, dynamic>? args,
+  ]) async {
+    try {
+      return await _bool(method, args);
+    } on MissingPluginException {
+      return false;
+    } on PlatformException {
+      return false;
+    } on Object {
+      return false;
+    }
+  }
+
   static Future<int> _int(String method) async =>
       (await _channel.invokeMethod<num>(method))?.round() ?? 0;
 
   static Future<Map<String, dynamic>> _map(String method) async {
     final result = await _channel.invokeMapMethod<String, dynamic>(method);
     return result ?? <String, dynamic>{};
+  }
+
+  /// Like [_map] but degrades to an empty map when the platform side is missing
+  /// or throws, so goal readback can never crash the launcher.
+  static Future<Map<String, dynamic>> _mapSafe(String method) async {
+    try {
+      return await _map(method);
+    } on MissingPluginException {
+      return <String, dynamic>{};
+    } on PlatformException {
+      return <String, dynamic>{};
+    } on Object {
+      return <String, dynamic>{};
+    }
   }
 
   static Future<List<Map<String, dynamic>>> _list(String method) async {

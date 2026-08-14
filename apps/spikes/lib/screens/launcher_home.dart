@@ -3,12 +3,15 @@ import 'package:flutter/material.dart';
 import '../bridge.dart';
 import '../model/overlay_prefs.dart';
 import '../theme/stride_tokens.dart';
+import '../widgets/stride_sheet.dart';
 import '../widgets/app_models.dart';
 import '../widgets/app_tile.dart';
 import '../model/profile_store.dart';
 import '../model/workout_controller.dart';
+import '../model/workout_goal.dart';
 import 'all_apps.dart';
 import 'diagnostics_home.dart';
+import 'start_workout.dart';
 
 class LauncherHome extends StatefulWidget {
   const LauncherHome({super.key});
@@ -30,17 +33,28 @@ class LauncherHomeState extends State<LauncherHome> {
   bool _overlayRunning = false;
   String? _error;
   String? _overlayStatus;
+  WorkoutGoal _goal = const WorkoutGoal.none();
 
   @override
   void initState() {
     super.initState();
     _loadApps();
     _workout.load();
+    _loadGoal();
     _loadOverlayPreference();
+    _workout.addListener(_syncGoalWithSession);
+  }
+
+  /// Ending a workout clears its goal on the platform side, because the goal
+  /// belongs to the session. Re-read it here so the header stops advertising a
+  /// target that no longer exists.
+  void _syncGoalWithSession() {
+    if (_workout.isIdle && _goal.isTrackable) _loadGoal();
   }
 
   @override
   void dispose() {
+    _workout.removeListener(_syncGoalWithSession);
     _profiles.dispose();
     _workout.dispose();
     _pinnedScroll.dispose();
@@ -147,6 +161,8 @@ class LauncherHomeState extends State<LauncherHome> {
                     _LauncherHeader(
                       onAllApps: _openAllApps,
                       onDiagnostics: _openDiagnostics,
+                      onGoal: _startWorkoutFlow,
+                      goal: _goal,
                       overlayRunning: _overlayRunning,
                       overlayLoading: _overlayLoading,
                       onEnableOverlay: _enableOverlay,
@@ -185,6 +201,8 @@ class LauncherHomeState extends State<LauncherHome> {
                               flex: 5,
                               child: _WorkoutPanel(
                                 controller: _workout,
+                                goal: _goal,
+                                onStart: _startWorkoutFlow,
                                 overlayStatus: _overlayStatus,
                               ),
                             ),
@@ -241,6 +259,43 @@ class LauncherHomeState extends State<LauncherHome> {
   void _openDiagnostics() {
     Navigator.of(context).push(
       MaterialPageRoute<void>(builder: (context) => const DiagnosticsHome()),
+    );
+  }
+
+  Future<void> _loadGoal() async {
+    final map = await SpikeBridge.goalGet();
+    if (!mounted) return;
+    final kind = WorkoutGoalKind.fromChannel(map['kind'] as String?);
+    final target = (map['target'] as num?)?.toDouble() ?? 0;
+    setState(() => _goal = WorkoutGoal(kind: kind, target: target));
+  }
+
+  // The launcher's "start workout" affordance now routes through the goal
+  // picker instead of starting the timer blind. The goal set there is the
+  // authoritative one we surface, so it is not re-read from the bridge on
+  // return — an environment without the platform side would answer that read
+  // with "no goal" and wipe what the rider just chose.
+  Future<void> _startWorkoutFlow() async {
+    await Navigator.of(context).push<bool>(
+      MaterialPageRoute<bool>(
+        builder: (context) => StartWorkoutScreen(
+          initialGoal: _goal,
+          workoutUnderway: !_workout.isIdle,
+          onConfirm: (goal) async {
+            await SpikeBridge.goalSet(
+              kind: goal.kind.channelValue,
+              target: goal.target,
+            );
+            // Reachable mid-workout now that the header carries the entry, so
+            // only start a session when there isn't one. Restarting a running
+            // workout to change its goal would silently discard the elapsed
+            // time the rider has already put in.
+            final ok = _workout.isIdle ? await _workout.startWorkout() : true;
+            if (ok && mounted) setState(() => _goal = goal);
+            return ok;
+          },
+        ),
+      ),
     );
   }
 
@@ -304,47 +359,43 @@ class LauncherHomeState extends State<LauncherHome> {
   }
 
   Future<void> _confirmDisableOverlay() async {
-    final confirmed = await showModalBottomSheet<bool>(
+    final confirmed = await showStrideSheet<bool>(
       context: context,
-      backgroundColor: StrideColors.panelRaised,
-      showDragHandle: true,
       builder: (context) {
-        return SafeArea(
-          child: Padding(
-            padding: const EdgeInsets.all(StrideSpace.lg),
-            child: Column(
-              mainAxisSize: MainAxisSize.min,
-              crossAxisAlignment: CrossAxisAlignment.stretch,
-              children: [
-                Text(
-                  'Turn off overlay navigation?',
-                  style: Theme.of(context).textTheme.headlineMedium,
+        return Padding(
+          padding: const EdgeInsets.all(StrideSpace.lg),
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            crossAxisAlignment: CrossAxisAlignment.stretch,
+            children: [
+              Text(
+                'Turn off overlay navigation?',
+                style: Theme.of(context).textTheme.headlineMedium,
+              ),
+              const SizedBox(height: StrideSpace.md),
+              Text(
+                'Turning off the overlay removes Stride’s on-screen Back and Home controls. '
+                'While you are inside Netflix or another app, you lose the way back to the '
+                'launcher from the treadmill console. The physical safety key remains the '
+                'only true emergency stop.',
+                style: Theme.of(context).textTheme.bodyLarge,
+              ),
+              const SizedBox(height: StrideSpace.lg),
+              FilledButton.icon(
+                style: FilledButton.styleFrom(
+                  backgroundColor: StrideColors.warning,
+                  foregroundColor: StrideColors.ink,
                 ),
-                const SizedBox(height: StrideSpace.md),
-                Text(
-                  'Turning off the overlay removes Stride’s on-screen Back and Home controls. '
-                  'While you are inside Netflix or another app, you lose the way back to the '
-                  'launcher from the treadmill console. The physical safety key remains the '
-                  'only true emergency stop.',
-                  style: Theme.of(context).textTheme.bodyLarge,
-                ),
-                const SizedBox(height: StrideSpace.lg),
-                FilledButton.icon(
-                  style: FilledButton.styleFrom(
-                    backgroundColor: StrideColors.warning,
-                    foregroundColor: StrideColors.ink,
-                  ),
-                  onPressed: () => Navigator.of(context).pop(true),
-                  icon: const Icon(Icons.visibility_off_outlined),
-                  label: const Text('Turn overlay off'),
-                ),
-                const SizedBox(height: StrideSpace.sm),
-                OutlinedButton(
-                  onPressed: () => Navigator.of(context).pop(false),
-                  child: const Text('Keep overlay on'),
-                ),
-              ],
-            ),
+                onPressed: () => Navigator.of(context).pop(true),
+                icon: const Icon(Icons.visibility_off_outlined),
+                label: const Text('Turn overlay off'),
+              ),
+              const SizedBox(height: StrideSpace.sm),
+              OutlinedButton(
+                onPressed: () => Navigator.of(context).pop(false),
+                child: const Text('Keep overlay on'),
+              ),
+            ],
           ),
         );
       },
@@ -382,56 +433,52 @@ class LauncherHomeState extends State<LauncherHome> {
 
   void _showRenameProfileSheet(String id, String currentName) {
     final controller = TextEditingController(text: currentName);
-    showModalBottomSheet<void>(
+    showStrideSheet<void>(
       context: context,
-      backgroundColor: StrideColors.panelRaised,
-      showDragHandle: true,
       builder: (context) {
-        return SafeArea(
-          child: Padding(
-            padding: EdgeInsets.only(
-              left: StrideSpace.lg,
-              right: StrideSpace.lg,
-              bottom: MediaQuery.of(context).viewInsets.bottom + StrideSpace.lg,
-              top: StrideSpace.sm,
-            ),
-            child: Column(
-              mainAxisSize: MainAxisSize.min,
-              crossAxisAlignment: CrossAxisAlignment.stretch,
-              children: [
-                Text(
-                  'Rename profile',
-                  style: Theme.of(context).textTheme.titleLarge,
-                ),
-                const SizedBox(height: StrideSpace.md),
-                SizedBox(
-                  height: StrideSpace.minTouch,
-                  child: TextField(
-                    controller: controller,
-                    autofocus: true,
-                    style: Theme.of(context).textTheme.bodyLarge,
-                    decoration: const InputDecoration(hintText: 'Profile name'),
-                    textInputAction: TextInputAction.done,
-                    onSubmitted: (_) {
-                      final name = controller.text.trim();
-                      if (name.isEmpty) return;
-                      Navigator.of(context).pop();
-                      _renameProfile(id, name);
-                    },
-                  ),
-                ),
-                const SizedBox(height: StrideSpace.lg),
-                FilledButton(
-                  onPressed: () {
+        return Padding(
+          padding: EdgeInsets.only(
+            left: StrideSpace.lg,
+            right: StrideSpace.lg,
+            bottom: MediaQuery.of(context).viewInsets.bottom + StrideSpace.lg,
+            top: StrideSpace.sm,
+          ),
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            crossAxisAlignment: CrossAxisAlignment.stretch,
+            children: [
+              Text(
+                'Rename profile',
+                style: Theme.of(context).textTheme.titleLarge,
+              ),
+              const SizedBox(height: StrideSpace.md),
+              SizedBox(
+                height: StrideSpace.minTouch,
+                child: TextField(
+                  controller: controller,
+                  autofocus: true,
+                  style: Theme.of(context).textTheme.bodyLarge,
+                  decoration: const InputDecoration(hintText: 'Profile name'),
+                  textInputAction: TextInputAction.done,
+                  onSubmitted: (_) {
                     final name = controller.text.trim();
                     if (name.isEmpty) return;
                     Navigator.of(context).pop();
                     _renameProfile(id, name);
                   },
-                  child: const Text('Save name'),
                 ),
-              ],
-            ),
+              ),
+              const SizedBox(height: StrideSpace.lg),
+              FilledButton(
+                onPressed: () {
+                  final name = controller.text.trim();
+                  if (name.isEmpty) return;
+                  Navigator.of(context).pop();
+                  _renameProfile(id, name);
+                },
+                child: const Text('Save name'),
+              ),
+            ],
           ),
         );
       },
@@ -439,38 +486,34 @@ class LauncherHomeState extends State<LauncherHome> {
   }
 
   void _confirmUnpin(LaunchableApp app) {
-    showModalBottomSheet<void>(
+    showStrideSheet<void>(
       context: context,
-      backgroundColor: StrideColors.panelRaised,
-      showDragHandle: true,
       builder: (context) {
-        return SafeArea(
-          child: Padding(
-            padding: const EdgeInsets.all(StrideSpace.lg),
-            child: Column(
-              mainAxisSize: MainAxisSize.min,
-              crossAxisAlignment: CrossAxisAlignment.stretch,
-              children: [
-                Text(
-                  'Remove ${app.label} from ${_profiles.active.name}?',
-                  style: Theme.of(context).textTheme.titleLarge,
-                ),
-                const SizedBox(height: StrideSpace.lg),
-                FilledButton.icon(
-                  onPressed: () {
-                    Navigator.of(context).pop();
-                    _profiles.unpin(app.package);
-                  },
-                  icon: const Icon(Icons.remove_circle_outline),
-                  label: const Text('Unpin app'),
-                ),
-                const SizedBox(height: StrideSpace.sm),
-                OutlinedButton(
-                  onPressed: () => Navigator.of(context).pop(),
-                  child: const Text('Keep pinned'),
-                ),
-              ],
-            ),
+        return Padding(
+          padding: const EdgeInsets.all(StrideSpace.lg),
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            crossAxisAlignment: CrossAxisAlignment.stretch,
+            children: [
+              Text(
+                'Remove ${app.label} from ${_profiles.active.name}?',
+                style: Theme.of(context).textTheme.titleLarge,
+              ),
+              const SizedBox(height: StrideSpace.lg),
+              FilledButton.icon(
+                onPressed: () {
+                  Navigator.of(context).pop();
+                  _profiles.unpin(app.package);
+                },
+                icon: const Icon(Icons.remove_circle_outline),
+                label: const Text('Unpin app'),
+              ),
+              const SizedBox(height: StrideSpace.sm),
+              OutlinedButton(
+                onPressed: () => Navigator.of(context).pop(),
+                child: const Text('Keep pinned'),
+              ),
+            ],
           ),
         );
       },
@@ -482,6 +525,8 @@ class _LauncherHeader extends StatelessWidget {
   const _LauncherHeader({
     required this.onAllApps,
     required this.onDiagnostics,
+    required this.onGoal,
+    required this.goal,
     required this.overlayRunning,
     required this.overlayLoading,
     required this.onEnableOverlay,
@@ -490,6 +535,8 @@ class _LauncherHeader extends StatelessWidget {
 
   final VoidCallback onAllApps;
   final VoidCallback onDiagnostics;
+  final VoidCallback onGoal;
+  final WorkoutGoal goal;
   final bool overlayRunning;
   final bool overlayLoading;
   final Future<void> Function() onEnableOverlay;
@@ -512,6 +559,22 @@ class _LauncherHeader extends StatelessWidget {
             ],
           ),
         ),
+        // The workout panel — and with it the goal picker — is hidden while the
+        // overlay is up, which is the normal configuration. Without an entry
+        // here a rider running with the overlay on could never set a goal at
+        // all, and the overlay's goal ring had nothing to draw.
+        OutlinedButton.icon(
+          style: OutlinedButton.styleFrom(
+            minimumSize: const Size(0, StrideSpace.minTouch),
+            foregroundColor: goal.isTrackable
+                ? StrideColors.accent
+                : StrideColors.text,
+          ),
+          onPressed: onGoal,
+          icon: const Icon(Icons.flag_rounded),
+          label: Text(goal.isTrackable ? 'Goal ${goal.label}' : 'Set a goal'),
+        ),
+        const SizedBox(width: StrideSpace.sm),
         SizedBox(
           width: 216,
           child: FilledButton.icon(
@@ -836,9 +899,16 @@ class _ProfilePill extends StatelessWidget {
 }
 
 class _WorkoutPanel extends StatelessWidget {
-  const _WorkoutPanel({required this.controller, this.overlayStatus});
+  const _WorkoutPanel({
+    required this.controller,
+    required this.goal,
+    required this.onStart,
+    this.overlayStatus,
+  });
 
   final WorkoutController controller;
+  final WorkoutGoal goal;
+  final VoidCallback onStart;
   final String? overlayStatus;
 
   @override
@@ -846,6 +916,8 @@ class _WorkoutPanel extends StatelessWidget {
     return AnimatedBuilder(
       animation: controller,
       builder: (context, _) {
+        final elapsed = Duration(milliseconds: controller.elapsedMs);
+        final distanceMiles = controller.machine.distanceMiles ?? 0;
         return _SurfacePanel(
           highContrast: true,
           child: SingleChildScrollView(
@@ -860,10 +932,23 @@ class _WorkoutPanel extends StatelessWidget {
                 ),
                 const SizedBox(height: StrideSpace.sm),
                 _ElapsedHero(elapsedMs: controller.elapsedMs),
+                if (goal.isTrackable) ...[
+                  const SizedBox(height: StrideSpace.sm),
+                  _GoalStrip(
+                    goal: goal,
+                    distanceMiles: distanceMiles,
+                    elapsed: elapsed,
+                  ),
+                ],
                 const SizedBox(height: StrideSpace.sm),
                 Row(
                   children: [
-                    Expanded(child: _WorkoutActions(controller: controller)),
+                    Expanded(
+                      child: _WorkoutActions(
+                        controller: controller,
+                        onStart: onStart,
+                      ),
+                    ),
                     const SizedBox(width: StrideSpace.sm),
                     SizedBox(
                       width: 196,
@@ -995,6 +1080,79 @@ class _ElapsedHero extends StatelessWidget {
   }
 }
 
+class _GoalStrip extends StatelessWidget {
+  const _GoalStrip({
+    required this.goal,
+    required this.distanceMiles,
+    required this.elapsed,
+  });
+
+  final WorkoutGoal goal;
+  final double distanceMiles;
+  final Duration elapsed;
+
+  @override
+  Widget build(BuildContext context) {
+    final progress = goal.progressFrom(
+      distanceMiles: distanceMiles,
+      elapsed: elapsed,
+    );
+    final percent = (progress * 100).round();
+    return Container(
+      width: double.infinity,
+      padding: const EdgeInsets.symmetric(
+        horizontal: StrideSpace.sm,
+        vertical: StrideSpace.xs,
+      ),
+      decoration: BoxDecoration(
+        color: StrideColors.panel,
+        borderRadius: BorderRadius.circular(StrideRadius.lg),
+        border: Border.all(color: StrideColors.line),
+      ),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Row(
+            children: [
+              const Icon(
+                Icons.flag_rounded,
+                size: 20,
+                color: StrideColors.accent,
+              ),
+              const SizedBox(width: StrideSpace.xs),
+              Expanded(
+                child: Text(
+                  'Goal ${goal.label}',
+                  style: Theme.of(context).textTheme.titleMedium,
+                ),
+              ),
+              Text(
+                '$percent%',
+                style: Theme.of(context).textTheme.titleMedium?.copyWith(
+                  color: StrideColors.accent,
+                  fontWeight: FontWeight.w900,
+                ),
+              ),
+            ],
+          ),
+          const SizedBox(height: StrideSpace.xs),
+          ClipRRect(
+            borderRadius: BorderRadius.circular(StrideRadius.sm),
+            child: LinearProgressIndicator(
+              value: progress,
+              minHeight: 10,
+              backgroundColor: StrideColors.panelHigh,
+              valueColor: const AlwaysStoppedAnimation<Color>(
+                StrideColors.accent,
+              ),
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+}
+
 class _SafetyNotice extends StatelessWidget {
   const _SafetyNotice({required this.text});
 
@@ -1027,9 +1185,10 @@ class _SafetyNotice extends StatelessWidget {
 }
 
 class _WorkoutActions extends StatelessWidget {
-  const _WorkoutActions({required this.controller});
+  const _WorkoutActions({required this.controller, required this.onStart});
 
   final WorkoutController controller;
+  final VoidCallback onStart;
 
   @override
   Widget build(BuildContext context) {
@@ -1040,13 +1199,9 @@ class _WorkoutActions extends StatelessWidget {
           backgroundColor: StrideColors.accent,
           foregroundColor: StrideColors.ink,
         ),
-        onPressed: () => _runBool(
-          context,
-          controller.startWorkout,
-          'Could not start timer.',
-        ),
+        onPressed: onStart,
         icon: const Icon(Icons.play_arrow_rounded, size: 34),
-        label: const _ButtonLabel('Start timer'),
+        label: const _ButtonLabel('Start workout'),
       );
     }
 
@@ -1303,21 +1458,9 @@ class _LockedMachineControls extends StatelessWidget {
             children: [
               SizedBox(
                 width: 120,
-                child: Column(
-                  crossAxisAlignment: CrossAxisAlignment.start,
-                  children: [
-                    Text(
-                      'Controls locked',
-                      style: Theme.of(context).textTheme.titleMedium,
-                    ),
-                    const SizedBox(height: StrideSpace.xs),
-                    Text(
-                      machine.reason,
-                      maxLines: 2,
-                      overflow: TextOverflow.ellipsis,
-                      style: Theme.of(context).textTheme.bodySmall,
-                    ),
-                  ],
+                child: Text(
+                  'Controls locked',
+                  style: Theme.of(context).textTheme.titleMedium,
                 ),
               ),
               const SizedBox(width: StrideSpace.xs),
@@ -1345,6 +1488,17 @@ class _LockedMachineControls extends StatelessWidget {
                 ),
               ),
             ],
+          ),
+          const SizedBox(height: StrideSpace.xs),
+          // Full width, and never ellipsized. This line explains *why* Stride will not touch the
+          // machine; a safety explanation clipped mid-word is worse than no explanation, because
+          // the rider is left guessing at the half they cannot read.
+          Align(
+            alignment: Alignment.centerLeft,
+            child: Text(
+              machine.reason,
+              style: Theme.of(context).textTheme.bodySmall,
+            ),
           ),
         ],
       ),

@@ -97,6 +97,17 @@ class SpikeBridge(private val context: Context) : MethodChannel.MethodCallHandle
                 "volumeGet" -> result.success(systemAudio.snapshot())
                 "volumeSet" -> result.success(volumeSet(call))
                 "machineSnapshot" -> result.success(machineSnapshot())
+                "goalSet" -> result.success(goalSet(call))
+                "goalGet" -> result.success(goalGet())
+
+                // --- Now playing: read the current session and drive its transport ---
+                "nowPlaying" -> result.success(nowPlaying())
+                "nowPlayingArtwork" -> result.success(nowPlayingArtwork())
+                "mediaPlayPause" -> result.success(MediaNowPlaying.playPause(context))
+                "mediaSkipNext" -> result.success(MediaNowPlaying.skipNext(context))
+                "mediaSkipPrevious" -> result.success(MediaNowPlaying.skipPrevious(context))
+                "trackFloorGet" -> result.success(trackFloorGet())
+                "trackFloorSet" -> result.success(trackFloorSet(call))
 
                 // --- S10: navigation ---
                 "accessibilityConnected" -> result.success(StrideAccessibilityService.isConnected())
@@ -236,7 +247,7 @@ class SpikeBridge(private val context: Context) : MethodChannel.MethodCallHandle
         }
         return mapOf(
             "top" to OverlayService.hudTopPx,
-            "bottom" to OverlayService.hudBottomPx,
+            "bottom" to OverlayService.hudBottomPx + OverlayService.hudBottomExtraPx,
             "left" to OverlayService.hudLeftPx,
             "right" to OverlayService.hudRightPx,
         )
@@ -458,6 +469,82 @@ class SpikeBridge(private val context: Context) : MethodChannel.MethodCallHandle
         "fanLevel" to MachineLink.fanLevel,
         "canCommand" to MachineLink.canCommand(),
     )
+
+    // ------------------------------------------------------------------ goals
+
+    private fun goalSet(call: MethodCall): Boolean {
+        val kind = call.argument<String>("kind")?.lowercase(Locale.US) ?: return false
+        val target = call.argument<Double>("target") ?: 0.0
+        val applied = when (kind) {
+            "none" -> { WorkoutGoal.clear(); true }
+            // Rejecting a non-positive target here rather than storing it keeps the overlay from
+            // ever rendering a goal that is already met the instant it is set.
+            "time" -> if (target > 0) { WorkoutGoal.setTimeGoal((target * 1000).toLong()); true } else false
+            "distance" -> if (target > 0) { WorkoutGoal.setDistanceGoal(target); true } else false
+            else -> false
+        }
+        // The goal ring is a window, not a label, so the overlay has to be rebuilt for it to
+        // appear or disappear at all.
+        if (applied) OverlayService.refreshChrome()
+        return applied
+    }
+
+    private fun goalGet(): Map<String, Any?> = mapOf(
+        "kind" to WorkoutGoal.kind.name.lowercase(Locale.US),
+        "target" to when (WorkoutGoal.kind) {
+            WorkoutGoal.Kind.TIME -> WorkoutGoal.targetMs / 1000.0
+            WorkoutGoal.Kind.DISTANCE -> WorkoutGoal.targetMiles
+            else -> 0.0
+        },
+        // Null, not zero: "we cannot measure this yet" and "you have covered none of it" are
+        // different facts, and the UI must be free to say so.
+        "progress" to WorkoutGoal.progressFraction(),
+        "remainingSeconds" to WorkoutGoal.remainingMs()?.let { it / 1000.0 },
+        "remainingMiles" to WorkoutGoal.remainingMiles(),
+        "etaSeconds" to WorkoutGoal.etaMs()?.let { it / 1000.0 },
+        "label" to WorkoutGoal.targetLabel(),
+    )
+
+    // ------------------------------------------------------------------ now playing
+
+    private fun nowPlaying(): Map<String, Any?>? {
+        val snapshot = MediaNowPlaying.snapshot(context) ?: return null
+        return mapOf(
+            "package" to snapshot.packageName,
+            "title" to snapshot.title,
+            "artist" to snapshot.artist,
+            "album" to snapshot.album,
+            "isPlaying" to snapshot.isPlaying,
+            "isVideo" to snapshot.isVideo,
+            "durationMs" to snapshot.durationMs.toChannelInt(),
+            "positionMs" to snapshot.positionMs.toChannelInt(),
+            "canSkipNext" to snapshot.canSkipNext,
+            "canSkipPrevious" to snapshot.canSkipPrevious,
+        )
+    }
+
+    private fun nowPlayingArtwork(): ByteArray? {
+        val art = MediaNowPlaying.artwork(context) ?: return null
+        return ByteArrayOutputStream().use { out ->
+            art.compress(Bitmap.CompressFormat.PNG, 100, out)
+            out.toByteArray()
+        }
+    }
+
+    // ------------------------------------------------------------------ track floor
+
+    private fun trackFloorGet(): Map<String, Any?> = mapOf(
+        "on" to OverlayService.trackFloorOn(context),
+        // Null means "nobody has chosen" — the UI shows the toggle following playback, not a
+        // setting the rider picked, and that distinction is worth surfacing.
+        "chosen" to OverlayService.trackFloorChosen,
+        "videoPlaying" to MediaNowPlaying.videoIsPlaying(context),
+    )
+
+    private fun trackFloorSet(call: MethodCall): Boolean {
+        OverlayService.setTrackFloor(call.argument<Boolean>("on"))
+        return true
+    }
 
     // ------------------------------------------------------------------ S10 accessibility
 

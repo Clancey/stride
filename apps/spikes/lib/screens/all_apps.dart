@@ -1,6 +1,7 @@
 import 'package:flutter/material.dart';
 
 import '../theme/stride_tokens.dart';
+import '../widgets/stride_sheet.dart';
 import '../widgets/app_models.dart';
 import '../widgets/app_tile.dart';
 import '../model/profile_store.dart';
@@ -125,47 +126,43 @@ class _AllAppsScreenState extends State<AllAppsScreen> {
       return;
     }
 
-    showModalBottomSheet<void>(
+    showStrideSheet<void>(
       context: context,
-      backgroundColor: StrideColors.panelRaised,
-      showDragHandle: true,
       builder: (context) {
-        return SafeArea(
-          child: Padding(
-            padding: const EdgeInsets.all(StrideSpace.lg),
-            child: Column(
-              mainAxisSize: MainAxisSize.min,
-              crossAxisAlignment: CrossAxisAlignment.stretch,
-              children: [
-                Text(
-                  'Unpin ${app.label}?',
-                  style: Theme.of(context).textTheme.titleLarge,
-                ),
-                const SizedBox(height: StrideSpace.sm),
-                Text(
-                  'It will be removed from ${widget.profiles.active.name}. You can pin it again here later.',
-                  style: Theme.of(context).textTheme.bodyMedium,
-                ),
-                const SizedBox(height: StrideSpace.lg),
-                FilledButton.icon(
-                  onPressed: () async {
-                    Navigator.of(context).pop();
-                    await widget.profiles.unpin(app.package);
-                    if (!mounted) return;
-                    ScaffoldMessenger.of(this.context).showSnackBar(
-                      SnackBar(content: Text('${app.label} unpinned')),
-                    );
-                  },
-                  icon: const Icon(Icons.remove_circle_outline),
-                  label: const Text('Unpin app'),
-                ),
-                const SizedBox(height: StrideSpace.sm),
-                OutlinedButton(
-                  onPressed: () => Navigator.of(context).pop(),
-                  child: const Text('Keep pinned'),
-                ),
-              ],
-            ),
+        return Padding(
+          padding: const EdgeInsets.all(StrideSpace.lg),
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            crossAxisAlignment: CrossAxisAlignment.stretch,
+            children: [
+              Text(
+                'Unpin ${app.label}?',
+                style: Theme.of(context).textTheme.titleLarge,
+              ),
+              const SizedBox(height: StrideSpace.sm),
+              Text(
+                'It will be removed from ${widget.profiles.active.name}. You can pin it again here later.',
+                style: Theme.of(context).textTheme.bodyMedium,
+              ),
+              const SizedBox(height: StrideSpace.lg),
+              FilledButton.icon(
+                onPressed: () async {
+                  Navigator.of(context).pop();
+                  await widget.profiles.unpin(app.package);
+                  if (!mounted) return;
+                  ScaffoldMessenger.of(this.context).showSnackBar(
+                    SnackBar(content: Text('${app.label} unpinned')),
+                  );
+                },
+                icon: const Icon(Icons.remove_circle_outline),
+                label: const Text('Unpin app'),
+              ),
+              const SizedBox(height: StrideSpace.sm),
+              OutlinedButton(
+                onPressed: () => Navigator.of(context).pop(),
+                child: const Text('Keep pinned'),
+              ),
+            ],
           ),
         );
       },

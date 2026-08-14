@@ -346,6 +346,19 @@ fi
 A failure here does not endanger the console — it produces a false S5 failure, which is its own kind
 of expensive mistake.
 
+**It fails silently, which is worse.** Without this grant `getActiveSessions()` simply reports no
+sessions, so the overlay's now-playing card never appears and the workout/media coupling never
+fires, with nothing logged and no error surfaced. Confirm the grant landed before concluding that
+either feature is broken:
+
+```bash
+adb shell settings get secure enabled_notification_listeners   # must contain io.stride.spikes
+adb shell dumpsys media_session | grep -E 'Sessions Stack|state=Playback'
+```
+
+A `PlaybackState {state=3, ...}` is playing and `state=2` is paused; the card is only expected
+while something is actually playing.
+
 ```bash
 # S10 - Back / Recents. Use the APPEND snippet in §3, not a bare
 # "settings put secure enabled_accessibility_services". Overwriting the list here would undo

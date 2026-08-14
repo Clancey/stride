@@ -3,18 +3,17 @@ package io.stride.spikes
 /**
  * A goal for the current session, plus the progress and ETA derived from it.
  *
- * This type exists because "ETA at current pace" is two very different questions depending on
- * what you are aiming at, and only one of them has an honest answer in Phase 0:
+ * Both goal kinds are now computable, but from different clocks:
  *
- *  - A **time** goal ("run 30 minutes") is measured entirely against [WorkoutSession], which is
- *    ours and is truthful. Progress and ETA are exact, not estimated.
- *  - A **distance** goal ("run 5 km") requires distance and pace. Stride cannot read either — see
- *    [MachineLink]. There is no honest ETA, so every derived value here returns null and the UI
- *    renders [MachineLink.NO_READING].
+ *  - A **time** goal is measured against [WorkoutSession], which is ours and is exact.
+ *  - A **distance** goal is measured against the machine's own distance register, read over
+ *    [MachineLink]. The console reports distance itself; it is not integrated here from speed.
  *
- * The temptation this type is built to defeat: distance ≈ elapsed × assumed_speed. That produces a
- * confident, wrong number, and on a treadmill a confident wrong number about how far you have run
- * is worse than no number at all. Distance goals stay unknowable until the machine link lands.
+ * The temptation this type is built to defeat is still live: when the machine reading is stale or
+ * absent it would be easy to fall back on elapsed x assumed speed. That produces a confident,
+ * wrong number, and a confident wrong number about how far someone has run is worse than no
+ * number. Every derived value below returns null rather than estimating, and the UI renders
+ * [MachineLink.NO_READING].
  */
 object WorkoutGoal {
 
@@ -25,7 +24,7 @@ object WorkoutGoal {
         /** Aim at a duration. Fully computable today. */
         TIME,
 
-        /** Aim at a distance. Settable, but unknowable until [MachineLink] can read distance. */
+        /** Aim at a distance, measured against the machine's own distance register. */
         DISTANCE,
     }
 
@@ -42,6 +41,15 @@ object WorkoutGoal {
     @Volatile
     var targetMiles: Double = 0.0
         private set
+
+    /**
+     * True when a goal exists *and* a session exists to measure it against.
+     *
+     * A goal outliving its workout is what produced an orphaned progress ring reading "0%" over
+     * an idle console: the number was not stale, it was about a workout that had already ended.
+     */
+    fun trackable(): Boolean =
+        kind != Kind.NONE && WorkoutSession.state != WorkoutSession.State.IDLE
 
     fun clear() {
         kind = Kind.NONE
@@ -66,13 +74,17 @@ object WorkoutGoal {
     /**
      * Progress through the goal as 0.0..1.0, or null when it cannot be known.
      *
-     * Null for [Kind.DISTANCE] because we have no distance reading. Draw [MachineLink.NO_READING],
-     * never a zero-length progress ring — an empty ring reads as "you have run nothing", which is
-     * a claim we are not entitled to make.
+     * Null for a distance goal whenever the machine reading is stale or absent. Draw
+     * [MachineLink.NO_READING] then, never a zero-length arc -- an empty ring reads as "you have
+     * run nothing", which is a different claim from "we cannot see how far you have run".
      */
     fun progressFraction(): Double? = when (kind) {
         Kind.NONE -> null
-        Kind.DISTANCE -> null
+        Kind.DISTANCE -> {
+            val covered = MachineLink.distanceMiles
+            if (targetMiles <= 0.0 || covered == null) null
+            else (covered / targetMiles).coerceIn(0.0, 1.0)
+        }
         Kind.TIME -> {
             if (targetMs <= 0L) null
             else (WorkoutSession.elapsedMs().toDouble() / targetMs.toDouble()).coerceIn(0.0, 1.0)
@@ -85,23 +97,62 @@ object WorkoutGoal {
         else -> null
     }
 
+    /** Distance left against a [Kind.DISTANCE] goal, floored at zero. Null when unknowable. */
+    fun remainingMiles(): Double? = when (kind) {
+        Kind.DISTANCE -> {
+            val covered = MachineLink.distanceMiles
+            if (targetMiles <= 0.0 || covered == null) null
+            else (targetMiles - covered).coerceAtLeast(0.0)
+        }
+        else -> null
+    }
+
+    /**
+     * Milliseconds until the goal completes at the pace achieved so far, or null.
+     *
+     * Distance uses the session's *average* pace rather than the instantaneous speed reading.
+     * Instantaneous speed makes the estimate lurch every time the rider touches the belt controls,
+     * and the number people actually want is "if the rest looks like what I have already done".
+     *
+     * Null whenever the answer would be fabricated rather than merely unknown:
+     *  - a paused or idle session, where the finish time is not advancing with the clock;
+     *  - no distance covered yet, where the average pace is a divide by zero;
+     *  - a stationary belt, which projects to infinity.
+     */
+    fun etaMs(): Long? {
+        if (WorkoutSession.state != WorkoutSession.State.RUNNING) return null
+        return when (kind) {
+            Kind.TIME -> remainingMs()
+            Kind.DISTANCE -> {
+                val remaining = remainingMiles() ?: return null
+                if (remaining <= 0.0) return 0L
+                val covered = MachineLink.distanceMiles ?: return null
+                val elapsed = WorkoutSession.elapsedMs()
+                if (covered <= 0.0 || elapsed <= 0L) return null
+                val msPerMile = elapsed.toDouble() / covered
+                (remaining * msPerMile).toLong()
+            }
+            Kind.NONE -> null
+        }
+    }
+
     /**
      * Wall-clock time the goal is expected to complete, as an epoch millisecond value, or null.
      *
-     * Two deliberate nulls:
-     *  - **Distance goals**: no pace, no ETA. Never extrapolate one.
-     *  - **A paused or idle session**: the finish time is not moving with the clock, so any value we
-     *    showed would silently age into a lie while the user is standing still. Show "Paused",
-     *    not a stale time.
-     *
-     * Note the mixed clocks are intentional: elapsed is measured with the monotonic
+     * The mixed clocks are intentional: elapsed is measured with the monotonic
      * `SystemClock.elapsedRealtime()` inside [WorkoutSession] so a time correction cannot make a
      * workout run backwards, while the ETA is *displayed* against the wall clock because that is
      * the thing a person reads off it.
      */
     fun etaEpochMs(): Long? {
-        if (WorkoutSession.state != WorkoutSession.State.RUNNING) return null
-        val remaining = remainingMs() ?: return null
+        val remaining = etaMs() ?: return null
         return System.currentTimeMillis() + remaining
+    }
+
+    /** Short description of the target itself, e.g. "5.0 mi" or "30:00". */
+    fun targetLabel(): String = when (kind) {
+        Kind.NONE -> "No goal"
+        Kind.TIME -> WorkoutSession.formatElapsed(targetMs)
+        Kind.DISTANCE -> String.format(java.util.Locale.US, "%.2f mi", targetMiles)
     }
 }

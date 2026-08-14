@@ -83,6 +83,9 @@ object WorkoutSession {
         val total = elapsedMs()
         accumulatedMs = 0L
         runningSinceMs = 0L
+        // The goal belongs to the workout, not to the app. Carrying it into the next session
+        // silently would hand the rider a target they never chose this time.
+        WorkoutGoal.clear()
         transition(State.IDLE)
         return total
     }

@@ -8,6 +8,7 @@ import android.content.Context
 import android.content.Intent
 import android.content.res.ColorStateList
 import android.graphics.Color
+import android.graphics.Outline
 import android.graphics.PixelFormat
 import android.graphics.Typeface
 import android.graphics.drawable.GradientDrawable
@@ -17,12 +18,16 @@ import android.os.Handler
 import android.os.IBinder
 import android.os.Looper
 import android.os.SystemClock
+import android.text.TextUtils
 import android.util.TypedValue
 import android.view.Gravity
 import android.view.MotionEvent
 import android.view.View
+import android.view.ViewGroup
+import android.view.ViewOutlineProvider
 import android.view.WindowManager
 import android.widget.FrameLayout
+import android.widget.ImageView
 import android.widget.LinearLayout
 import android.widget.ScrollView
 import android.widget.TextView
@@ -61,6 +66,50 @@ class OverlayService : Service() {
         const val ACTION_START = "io.stride.spikes.OVERLAY_START"
         const val ACTION_STOP = "io.stride.spikes.OVERLAY_STOP"
 
+        /** The running overlay, so the launcher can drive it over the method channel. */
+        private var active: OverlayService? = null
+
+        /**
+         * Whether the rider has explicitly chosen a track-floor state this session.
+         *
+         * Until they do, the floor follows what is playing underneath: it is a decorative surface
+         * in the middle of the screen, which is exactly where a film is. An explicit choice is
+         * remembered and stops the automatic suppression second-guessing it. Held here rather than
+         * per-instance so the setting survives an overlay restart and is readable from the bridge.
+         */
+        @Volatile
+        var trackFloorChosen: Boolean? = null
+            private set
+
+        /**
+         * True when the floor is currently drawn — the rider's choice, or the automatic default.
+         *
+         * The default is deliberately narrow: a track floor is a picture of *motion*, so it earns
+         * the middle of the screen only while a workout is under way, and it yields to video even
+         * then. An explicit choice overrides both, in either direction.
+         */
+        fun trackFloorOn(context: Context): Boolean = trackFloorChosen
+            ?: (WorkoutSession.state != WorkoutSession.State.IDLE &&
+                !MainActivity.launcherForeground &&
+                !MediaNowPlaying.videoIsPlaying(context))
+
+        /** Set (or, with null, un-set) the rider's choice and redraw if the overlay is up. */
+        fun setTrackFloor(chosen: Boolean?) {
+            trackFloorChosen = chosen
+            refreshChrome()
+        }
+
+        /**
+         * Rebuild the overlay's windows, if one is running.
+         *
+         * Needed whenever something outside the service changes what the chrome is made of —
+         * setting a goal adds a ring, clearing one takes it away — as opposed to merely changing
+         * what an existing view says.
+         */
+        fun refreshChrome() {
+            active?.let { svc -> svc.mainHandler.post { svc.rebuildChromeViews() } }
+        }
+
         private const val CHANNEL_ID = "stride_spikes_overlay"
         private const val NOTIFICATION_ID = 4321
 
@@ -71,10 +120,35 @@ class OverlayService : Service() {
         private const val EDGE_STRIP_WIDTH_DP = 20f
 
         /** Non-zero first-frame top inset until the metrics pill reports its real laid-out height. */
-        private const val HUD_TOP_ESTIMATE_DP = 126f
+        private const val HUD_TOP_ESTIMATE_DP = 92f
 
         /** Non-zero first-frame bottom inset until the bottom bar reports its real laid-out height. */
         private const val HUD_BOTTOM_ESTIMATE_DP = 112f
+
+        /** Width of a quick-pick column. */
+        private const val RAIL_WIDTH_DP = 132f
+
+        /** Footprint of the track floor. Wide and shallow, so the oval reads as ground. */
+        private const val FLOOR_WIDTH_DP = 1020f
+        private const val FLOOR_HEIGHT_DP = 300f
+
+        /** Diameter of the circular corner toggles, and the room the rails must leave them. */
+        private const val CORNER_SIZE_DP = 84f
+
+        /** Diameter of the goal ring window. */
+        private const val RING_SIZE_DP = 260f
+
+        /**
+         * Bottom space the now-playing card occupies, reserved for Stride's own Flutter UI.
+         *
+         * The card floats over whatever is underneath, and third-party apps neither know nor care.
+         * The launcher does: without this the card sat on top of a pinned tile and hid its label.
+         */
+        private const val NOW_PLAYING_RESERVE_DP = 130f
+
+        /** Stock draws a quarter-mile lap, and the rider's sense of "a lap" should match it. */
+        private const val LAP_MILES = 0.25
+        private const val LAP_TITLE = "\u00BC mile"
 
         private const val HANDLE_WIDTH_DP = 48f
         private const val HANDLE_HEIGHT_DP = 88f
@@ -110,6 +184,15 @@ class OverlayService : Service() {
         /** Last measured bottom edge chrome height. The bridge uses this to inset Flutter independently. */
         @Volatile
         var hudBottomPx: Int = 0
+
+        /**
+         * Extra bottom space occupied by floating overlay cards, over and above the bottom bar.
+         *
+         * Kept separate from [hudBottomPx] on purpose: the bar height is what the overlay's own
+         * windows anchor to, so folding the card's height into it would push the card up by its
+         * own height every time it appeared. Only the inset published to Flutter adds this.
+         */
+        var hudBottomExtraPx: Int = 0
             private set
 
         /** Compatibility for older Flutter/bridge lanes while they migrate to hudTopPx/hudBottomPx. */
@@ -195,6 +278,19 @@ class OverlayService : Service() {
     private val edgeViews = mutableListOf<View>()
     private var chromeVisible: Boolean = true
     private var metricsVisible: Boolean = true
+    private var railsVisible: Boolean = true
+    private var trackFloorView: TrackFloorView? = null
+    private var trackFloorRoot: View? = null
+    private var goalRingView: GoalRingView? = null
+    private var goalRingRoot: View? = null
+    private var cornerLeftView: View? = null
+    private var cornerRightView: View? = null
+    private var nowPlayingRoot: View? = null
+    private var nowPlayingArt: ImageView? = null
+    private var nowPlayingTitle: TextView? = null
+    private var nowPlayingArtist: TextView? = null
+    private var nowPlayingPlay: TextView? = null
+
     private var elapsedHeroView: TextView? = null
     private var bottomStateView: TextView? = null
     private var primaryTransportButton: TextView? = null
@@ -208,8 +304,17 @@ class OverlayService : Service() {
 
     private val workoutListener: (WorkoutSession.State) -> Unit = {
         mainHandler.post {
-            updateWorkoutUi()
-            scheduleElapsedTicker()
+            // The track floor and the goal ring only exist while a workout does, so a state change
+            // is a structural change to the chrome, not just new text in it. Rebuilding only when
+            // the answer actually flipped keeps pause/resume from tearing the overlay down twice.
+            val structural = trackFloorWanted() != (trackFloorView != null) ||
+                WorkoutGoal.trackable() != (goalRingView != null)
+            if (chromeVisible && structural) {
+                rebuildChromeViews()
+            } else {
+                updateWorkoutUi()
+                scheduleElapsedTicker()
+            }
         }
     }
 
@@ -250,9 +355,10 @@ class OverlayService : Service() {
     private val machineTicker = object : Runnable {
         override fun run() {
             updateMachineMetrics()
-            // Re-arm while any machine-backed readout is on screen. Keying this to the top strip
-            // alone would freeze the side rails whenever the metrics were toggled off.
-            if (machineCells.isNotEmpty()) mainHandler.postDelayed(this, 1000L)
+            // Re-arm for as long as the chrome is on screen. Keying this to the metric cells alone
+            // would freeze the track floor, the goal ring, and the now-playing card whenever the
+            // rider collapsed the top strip — which is exactly when those are the only readout left.
+            if (chromeVisible) mainHandler.postDelayed(this, 1000L)
         }
     }
 
@@ -267,31 +373,25 @@ class OverlayService : Service() {
             view.setTextColor(if (blank) entry.blankColor else entry.valueColor)
         }
         machineNoticeView?.text = MachineLink.metricsNotice
+        trackFloorView?.progress = lapProgress()
+        goalRingView?.let { applyGoalRing(it) }
+        refreshNowPlaying()
     }
 
-    /** Register a top metric pill for live refresh. */
-    private fun trackPill(cell: View, unit: String, accent: Int, read: () -> String) {
+    /**
+     * Register a top metric pill for live refresh.
+     *
+     * The unit now lives in the label under the figure, so nothing is appended to the number
+     * itself; the cell keeps an empty unit and the strip stays a column of bare numerals.
+     */
+    private fun trackPill(cell: View, read: () -> String) {
         machineCells += MachineCell(
             root = cell,
-            unit = unit,
-            valueColor = accent,
-            blankColor = Color.rgb(218, 226, 235),
-            valueSize = 30f,
-            blankSize = 18f,
-            read = read,
-        )
-    }
-
-    /** Register a side rail's headline readout for live refresh. Rails draw their unit separately. */
-    private fun trackRail(rail: View?, read: () -> String) {
-        val root = rail ?: return
-        machineCells += MachineCell(
-            root = root,
             unit = "",
             valueColor = Color.WHITE,
-            blankColor = Color.WHITE,
-            valueSize = 30f,
-            blankSize = 16f,
+            blankColor = Color.rgb(150, 165, 188),
+            valueSize = 31f,
+            blankSize = 15f,
             read = read,
         )
     }
@@ -308,6 +408,7 @@ class OverlayService : Service() {
 
     override fun onCreate() {
         super.onCreate()
+        active = this
         windowManager = getSystemService(Context.WINDOW_SERVICE) as WindowManager
         systemAudio = SystemAudio(this)
         WorkoutSession.addListener(workoutListener)
@@ -334,6 +435,9 @@ class OverlayService : Service() {
         mainHandler.removeCallbacks(elapsedTicker)
         hideOverlays()
         isRunning = false
+        // Only clear the shared handle if it still points at us: a restart can construct the new
+        // service before the old one is destroyed, and nulling it then would strand the live one.
+        if (active === this) active = null
         super.onDestroy()
     }
 
@@ -663,8 +767,14 @@ class OverlayService : Service() {
         if (!chromeVisible) return
         if (metricsVisible) addTopMetrics()
         else addCollapsedMetricsToggle()
-        addInclineRail()
-        addSpeedRail()
+        addTrackFloor()
+        addGoalRing()
+        if (railsVisible) {
+            addInclineRail()
+            addSpeedRail()
+        }
+        addCornerControls()
+        addNowPlaying()
         addBottomBar()
         updateWorkoutUi()
         scheduleElapsedTicker()
@@ -674,12 +784,300 @@ class OverlayService : Service() {
         mainHandler.post(machineTicker)
     }
 
+    /**
+     * Whether the track floor should currently be drawn.
+     *
+     * An explicit choice always wins. Absent one, the floor stays out of the way of video: it
+     * occupies the middle of the screen, which is where a film is, and nobody put Netflix on to
+     * watch a lap counter over it. Music is deliberately not treated the same way -- there is
+     * nothing to occlude, and the floor is the more interesting thing to look at.
+     */
+    private fun trackFloorWanted(): Boolean = trackFloorOn(this)
+
+    private fun addTrackFloor() {
+        if (!trackFloorWanted()) return
+        val floor = TrackFloorView(this).apply {
+            lapTitle = LAP_TITLE
+            lapSubtitle = "track length"
+            progress = lapProgress()
+            dim = 0.92f
+        }
+        val root = FrameLayout(this).apply { addView(floor) }
+        // Explicitly untouchable: the floor covers the middle of the screen, and the app running
+        // underneath owns every tap that lands there. A decorative surface that eats touches is a
+        // broken remote control.
+        //
+        // Sized and anchored low on purpose. Stretched to the full window the oval reads as a
+        // giant ring pasted over the screen; kept short and sitting on the bottom bar it reads as
+        // what it is — a floor receding away from the rider.
+        val params = baseParams(dp(FLOOR_WIDTH_DP), dp(FLOOR_HEIGHT_DP), Gravity.BOTTOM or Gravity.CENTER_HORIZONTAL)
+        params.y = (hudBottomPx.takeIf { it > 0 } ?: dp(HUD_BOTTOM_ESTIMATE_DP)) + dp(8f)
+        params.flags = params.flags or WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE
+        try {
+            windowManager.addView(root, params)
+            trackFloorRoot = root
+            trackFloorView = floor
+        } catch (_: Exception) {
+            trackFloorRoot = null
+            trackFloorView = null
+        }
+    }
+
+    /** Fraction of the current lap covered, from the machine's own distance reading. */
+    private fun lapProgress(): Float {
+        val miles = MachineLink.distanceMiles ?: return 0f
+        val laps = miles / LAP_MILES
+        return (laps - kotlin.math.floor(laps)).toFloat()
+    }
+
+    private fun addGoalRing() {
+        if (!WorkoutGoal.trackable()) return
+        val ring = GoalRingView(this).apply {
+            title = if (WorkoutGoal.kind == WorkoutGoal.Kind.DISTANCE) "DISTANCE GOAL" else "TIME GOAL"
+        }
+        applyGoalRing(ring)
+        val root = FrameLayout(this).apply {
+            addView(ring, FrameLayout.LayoutParams(dp(RING_SIZE_DP), dp(RING_SIZE_DP)))
+        }
+        // Bottom-right, mirroring the now-playing card on the left. The ring started in the top
+        // right and collided with the launcher's own header controls there; nothing else competes
+        // for this corner, and it puts goal and media on the same baseline with the track floor
+        // running between them.
+        val params = baseParams(dp(RING_SIZE_DP), dp(RING_SIZE_DP), Gravity.BOTTOM or Gravity.END)
+        params.x = dp(if (railsVisible) RAIL_WIDTH_DP + 24f else CORNER_SIZE_DP + 50f)
+        params.y = (hudBottomPx.takeIf { it > 0 } ?: dp(HUD_BOTTOM_ESTIMATE_DP)) + dp(18f)
+        params.flags = params.flags or WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE
+        try {
+            windowManager.addView(root, params)
+            goalRingRoot = root
+            goalRingView = ring
+        } catch (_: Exception) {
+            goalRingRoot = null
+            goalRingView = null
+        }
+    }
+
+    private fun applyGoalRing(ring: GoalRingView) {
+        val fraction = WorkoutGoal.progressFraction()
+        ring.progress = fraction?.toFloat() ?: 0f
+        ring.caption = if (fraction == null) "NOT MEASURED" else "COMPLETE"
+        val eta = WorkoutGoal.etaMs()
+        ring.footnote = when {
+            eta == null -> WorkoutGoal.targetLabel()
+            eta <= 0L -> "Goal reached"
+            else -> "${WorkoutSession.formatElapsed(eta)} to go"
+        }
+    }
+
+    /**
+     * The circular incline and speed buttons in the bottom corners.
+     *
+     * Stock opens a rotary fine-adjust dial from these. Stride cannot command the machine, so a
+     * dial would be a control that does nothing; they show and hide their own quick-pick column
+     * instead, which is the useful half of what stock does with that corner.
+     */
+    private fun addCornerControls() {
+        cornerLeftView = addCornerControl(
+            icon = R.drawable.ic_metric_incline,
+            accent = amber,
+            gravity = Gravity.START or Gravity.BOTTOM,
+            description = if (railsVisible) "Hide incline and speed columns" else "Show incline and speed columns",
+        )
+        cornerRightView = addCornerControl(
+            icon = R.drawable.ic_metric_speed,
+            accent = cyan,
+            gravity = Gravity.END or Gravity.BOTTOM,
+            description = if (railsVisible) "Hide incline and speed columns" else "Show incline and speed columns",
+        )
+    }
+
+    private fun addCornerControl(icon: Int, accent: Int, gravity: Int, description: String): View? {
+        val size = dp(CORNER_SIZE_DP)
+        val button = ImageView(this).apply {
+            setImageResource(icon)
+            imageTintList = ColorStateList.valueOf(
+                if (railsVisible) Color.rgb(8, 14, 26) else Color.argb(235, 226, 236, 252),
+            )
+            val inset = dp(22f)
+            setPadding(inset, inset, inset, inset)
+            background = rippleRounded(
+                color = if (railsVisible) accent else Color.argb(226, 15, 22, 40),
+                radius = 42f,
+                strokeColor = if (railsVisible) null else Color.argb(150, 62, 76, 116),
+            )
+            contentDescription = description
+            elevation = dp(10f).toFloat()
+            setOnClickListener {
+                railsVisible = !railsVisible
+                rebuildChromeViews()
+                lastGesture = if (railsVisible) "quick picks shown" else "quick picks hidden"
+            }
+        }
+        val root = FrameLayout(this).apply { addView(button, FrameLayout.LayoutParams(size, size)) }
+        val params = baseParams(size, size, gravity)
+        params.x = dp(34f)
+        params.y = (hudBottomPx.takeIf { it > 0 } ?: dp(HUD_BOTTOM_ESTIMATE_DP)) + dp(18f)
+        return try {
+            windowManager.addView(root, params)
+            root
+        } catch (_: Exception) {
+            null
+        }
+    }
+
+    /**
+     * A now-playing card for *music*, anchored above the bottom bar on the left.
+     *
+     * Deliberately not shown for video: a film already fills the screen with its own art and title,
+     * so a card repeating them is noise laid over the thing the rider chose to watch. Music has no
+     * on-screen presence at all, which is the gap this fills.
+     */
+    private fun addNowPlaying() {
+        val snapshot = MediaNowPlaying.snapshot(this) ?: return
+        if (snapshot.isVideo) return
+
+        val art = ImageView(this).apply {
+            scaleType = ImageView.ScaleType.CENTER_CROP
+            background = roundedRect(Color.argb(255, 22, 28, 46), 16f, Color.argb(120, 70, 84, 124))
+            clipToOutline = true
+            outlineProvider = object : ViewOutlineProvider() {
+                override fun getOutline(view: View, outline: Outline) {
+                    outline.setRoundRect(0, 0, view.width, view.height, dp(16f).toFloat())
+                }
+            }
+        }
+        val title = textView("", 21f, Color.WHITE, bold = true).apply {
+            maxLines = 1
+            ellipsize = TextUtils.TruncateAt.END
+        }
+        val artist = textView("", 15f, Color.argb(215, 168, 182, 210)).apply {
+            maxLines = 1
+            ellipsize = TextUtils.TruncateAt.END
+        }
+        val text = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            gravity = Gravity.CENTER_VERTICAL
+            addView(title)
+            addView(artist)
+        }
+        val play = mediaTransport("\u23F8") { MediaNowPlaying.playPause(this); refreshNowPlaying() }
+        val service = this
+        val transport = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+            addView(mediaTransport("\u23EE") {
+                MediaNowPlaying.skipPrevious(service)
+                service.refreshNowPlaying()
+            })
+            addView(play)
+            addView(mediaTransport("\u23ED") {
+                MediaNowPlaying.skipNext(service)
+                service.refreshNowPlaying()
+            })
+        }
+
+        val row = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+            setPadding(dp(14f), dp(14f), dp(18f), dp(14f))
+            background = roundedRect(Color.argb(250, 12, 17, 32), 26f, Color.argb(140, 58, 72, 112))
+            elevation = dp(10f).toFloat()
+            addView(art, LinearLayout.LayoutParams(dp(84f), dp(84f)))
+            addView(text, LinearLayout.LayoutParams(dp(300f), ViewGroup.LayoutParams.WRAP_CONTENT).apply {
+                marginStart = dp(16f)
+            })
+            addView(transport, LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.WRAP_CONTENT,
+                ViewGroup.LayoutParams.WRAP_CONTENT,
+            ).apply { marginStart = dp(10f) })
+        }
+        val root = FrameLayout(this).apply { addView(row) }
+        val params = baseParams(
+            ViewGroup.LayoutParams.WRAP_CONTENT,
+            ViewGroup.LayoutParams.WRAP_CONTENT,
+            Gravity.BOTTOM or Gravity.START,
+        )
+        params.x = dp(if (railsVisible) RAIL_WIDTH_DP + 24f else CORNER_SIZE_DP + 50f)
+        params.y = (hudBottomPx.takeIf { it > 0 } ?: dp(HUD_BOTTOM_ESTIMATE_DP)) + dp(18f)
+        try {
+            windowManager.addView(root, params)
+            hudBottomExtraPx = dp(NOW_PLAYING_RESERVE_DP)
+            nowPlayingRoot = root
+            nowPlayingArt = art
+            nowPlayingTitle = title
+            nowPlayingArtist = artist
+            nowPlayingPlay = play
+            applyNowPlaying(snapshot)
+        } catch (_: Exception) {
+            clearNowPlayingRefs()
+        }
+    }
+
+    private fun mediaTransport(glyph: String, onTap: () -> Unit): TextView {
+        val size = dp(56f)
+        return TextView(this).apply {
+            text = glyph
+            setTextSize(TypedValue.COMPLEX_UNIT_SP, 22f)
+            setTextColor(Color.argb(240, 226, 236, 252))
+            gravity = Gravity.CENTER
+            background = rippleRounded(Color.argb(210, 22, 30, 52), 28f, Color.argb(110, 62, 76, 116))
+            layoutParams = LinearLayout.LayoutParams(size, size).apply { marginStart = dp(8f) }
+            setOnClickListener { onTap() }
+        }
+    }
+
+    private fun applyNowPlaying(snapshot: MediaNowPlaying.Snapshot) {
+        nowPlayingTitle?.text = snapshot.title ?: "Playing"
+        nowPlayingArtist?.text = listOfNotNull(
+            snapshot.artist?.takeIf { it.isNotBlank() },
+            snapshot.album?.takeIf { it.isNotBlank() },
+        ).joinToString(" \u00B7 ").ifEmpty { snapshot.packageName }
+        nowPlayingPlay?.text = if (snapshot.isPlaying) "\u23F8" else "\u25B6"
+        val art = MediaNowPlaying.artwork(this)
+        if (art != null) nowPlayingArt?.setImageBitmap(art) else nowPlayingArt?.setImageDrawable(null)
+    }
+
+    /**
+     * Reconcile the card with reality. The card is added and removed rather than merely hidden,
+     * because a touchable window parked over a media app would keep eating taps meant for it long
+     * after the music stopped.
+     */
+    private fun refreshNowPlaying() {
+        if (!chromeVisible) return
+        val snapshot = MediaNowPlaying.snapshot(this)?.takeIf { !it.isVideo }
+        if (snapshot == null) {
+            nowPlayingRoot?.let { safeRemove(it) }
+            clearNowPlayingRefs()
+            return
+        }
+        if (nowPlayingRoot == null) addNowPlaying() else applyNowPlaying(snapshot)
+    }
+
+    private fun clearNowPlayingRefs() {
+        hudBottomExtraPx = 0
+        nowPlayingRoot = null
+        nowPlayingArt = null
+        nowPlayingTitle = null
+        nowPlayingArtist = null
+        nowPlayingPlay = null
+    }
+
     private fun removeChromeViews() {
-        listOfNotNull(topMetricsView, leftInclineView, rightSpeedView, bottomBarView).forEach { safeRemove(it) }
+        listOfNotNull(
+            topMetricsView, leftInclineView, rightSpeedView, bottomBarView,
+            trackFloorRoot, goalRingRoot, cornerLeftView, cornerRightView, nowPlayingRoot,
+        ).forEach { safeRemove(it) }
         topMetricsView = null
         leftInclineView = null
         rightSpeedView = null
         bottomBarView = null
+        trackFloorRoot = null
+        trackFloorView = null
+        goalRingRoot = null
+        goalRingView = null
+        cornerLeftView = null
+        cornerRightView = null
+        clearNowPlayingRefs()
         elapsedHeroView = null
         bottomStateView = null
         primaryTransportButton = null
@@ -710,9 +1108,9 @@ class OverlayService : Service() {
 
         val pill = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
-            background = roundedRect(Color.argb(238, 4, 10, 22), 34f, Color.argb(140, 120, 146, 178))
-            elevation = dp(12f).toFloat()
-            setPadding(dp(18f), dp(12f), dp(18f), dp(12f))
+            background = roundedRect(Color.argb(242, 8, 13, 28), 40f, Color.argb(90, 108, 128, 168))
+            elevation = dp(14f).toFloat()
+            setPadding(dp(6f), dp(6f), dp(6f), dp(6f))
             layoutParams = FrameLayout.LayoutParams(
                 FrameLayout.LayoutParams.MATCH_PARENT,
                 FrameLayout.LayoutParams.WRAP_CONTENT,
@@ -725,58 +1123,40 @@ class OverlayService : Service() {
             gravity = Gravity.CENTER_VERTICAL
             layoutParams = LinearLayout.LayoutParams(
                 LinearLayout.LayoutParams.MATCH_PARENT,
-                dp(70f),
+                dp(64f),
             )
         }
-        metrics.addView(metricPillCell("Incline", inclineText(), "%", amber, 1f).also {
-            trackPill(it, "%", amber) { inclineText() }
+        metrics.addView(metricPillCell("incline %", inclineText(), R.drawable.ic_metric_incline, amber, 1f).also {
+            trackPill(it) { inclineText() }
         })
         metrics.addView(metricDivider())
-        metrics.addView(metricPillCell("Miles", distanceText(), "", Color.rgb(190, 160, 255), 1f).also {
-            trackPill(it, "", Color.rgb(190, 160, 255)) { distanceText() }
+        metrics.addView(metricPillCell("miles", distanceText(), R.drawable.ic_metric_miles, Color.rgb(126, 162, 255), 1f).also {
+            trackPill(it) { distanceText() }
         })
         metrics.addView(metricDivider())
-        metrics.addView(metricPillCell("Pace/mi", paceText(), "", Color.rgb(78, 232, 220), 1f).also {
-            trackPill(it, "", Color.rgb(78, 232, 220)) { paceText() }
+        metrics.addView(metricPillCell("pace/mi", paceText(), R.drawable.ic_metric_pace, Color.rgb(78, 232, 190), 1f).also {
+            trackPill(it) { paceText() }
         })
         metrics.addView(metricDivider())
-        metrics.addView(metricPillCell("Elapsed", WorkoutSession.formatElapsed(WorkoutSession.elapsedMs()), "", Color.WHITE, 1.28f).also {
+        metrics.addView(metricPillCell("elapsed", WorkoutSession.formatElapsed(WorkoutSession.elapsedMs()), R.drawable.ic_metric_elapsed, Color.rgb(96, 186, 255), 1.12f).also {
             elapsedHeroView = it.findViewWithTag("value")
         })
         metrics.addView(metricDivider())
-        metrics.addView(metricPillCell("Cals", caloriesText(), "", Color.rgb(255, 186, 76), 1f).also {
-            trackPill(it, "", Color.rgb(255, 186, 76)) { caloriesText() }
+        metrics.addView(metricPillCell("cals (est)", caloriesText(), R.drawable.ic_metric_cals, Color.rgb(255, 143, 74), 1f).also {
+            trackPill(it) { caloriesText() }
         })
         metrics.addView(metricDivider())
         // Vertical gain needs incline integrated over distance, which we do not compute yet. It
         // stays honestly blank rather than being faked from a single incline sample.
-        metrics.addView(metricPillCell("Vert gain", MachineLink.NO_READING, "ft", Color.rgb(104, 235, 126), 1f))
+        metrics.addView(metricPillCell("vert gain (ft)", MachineLink.NO_READING, R.drawable.ic_metric_vertgain, Color.rgb(104, 235, 126), 1f))
         metrics.addView(metricDivider())
-        metrics.addView(metricPillCell("Speed", speedText(), "mph", cyan, 1f).also {
-            trackPill(it, "mph", cyan) { speedText() }
+        metrics.addView(metricPillCell("speed mph", speedText(), R.drawable.ic_metric_speed, cyan, 1f).also {
+            trackPill(it) { speedText() }
         })
         pill.addView(metrics)
-
-        val noticeRow = LinearLayout(this).apply {
-            orientation = LinearLayout.HORIZONTAL
-            gravity = Gravity.CENTER_VERTICAL
-            val lp = LinearLayout.LayoutParams(
-                LinearLayout.LayoutParams.MATCH_PARENT,
-                LinearLayout.LayoutParams.WRAP_CONTENT,
-            )
-            lp.topMargin = dp(8f)
-            layoutParams = lp
-        }
-        noticeRow.addView(textView(MachineLink.metricsNotice, 14f, Color.rgb(231, 222, 205), bold = true).apply {
-            machineNoticeView = this
-            layoutParams = LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f)
-        })
-        noticeRow.addView(smallPillButton("Hide metrics", Color.rgb(22, 31, 44), Color.rgb(192, 212, 238)) {
-            metricsVisible = false
-            rebuildChromeViews()
-            lastGesture = "metrics hidden"
-        })
-        pill.addView(noticeRow)
+        // No safety notice here. The bottom bar already carries it, and the same warning printed
+        // twice on one screen is read as decoration -- which is exactly how a rider learns to stop
+        // reading the one that matters.
         root.addView(pill)
 
         val params = baseParams(
@@ -825,71 +1205,91 @@ class OverlayService : Service() {
         }
     }
 
+    /**
+     * One readout in the top strip: a tinted icon beside the figure, with the unit written into
+     * the label beneath rather than trailing the number.
+     *
+     * The figure itself is always white and the colour is carried entirely by the icon. Tinting
+     * seven numbers seven different colours reads as seven warnings; the rider needs to scan the
+     * row, and identical numerals with a coloured glyph to anchor each one scans far faster.
+     */
     private fun metricPillCell(
         label: String,
         value: String,
-        unit: String,
+        icon: Int,
         accent: Int,
         weight: Float,
     ): LinearLayout = LinearLayout(this).apply {
-        orientation = LinearLayout.VERTICAL
-        gravity = Gravity.CENTER
+        orientation = LinearLayout.HORIZONTAL
+        gravity = Gravity.CENTER_VERTICAL
         layoutParams = LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.MATCH_PARENT, weight)
-        val display = if (unit.isEmpty() || value == MachineLink.NO_READING) value else "$value $unit"
-        addView(textView(display, if (label == "Elapsed") 38f else if (value == MachineLink.NO_READING) 18f else 30f, Color.WHITE, bold = true, gravity = Gravity.CENTER).apply {
-            tag = "value"
-            maxLines = 1
-            setTextColor(if (label == "Elapsed") Color.WHITE else if (value == MachineLink.NO_READING) Color.rgb(218, 226, 235) else accent)
-            layoutParams = LinearLayout.LayoutParams(
-                LinearLayout.LayoutParams.MATCH_PARENT,
-                0,
-                1f,
-            )
+        setPadding(dp(14f), 0, dp(6f), 0)
+        addView(ImageView(this@OverlayService).apply {
+            setImageResource(icon)
+            imageTintList = ColorStateList.valueOf(accent)
+            layoutParams = LinearLayout.LayoutParams(dp(26f), dp(26f)).apply { rightMargin = dp(10f) }
         })
-        addView(textView(label, 12f, Color.rgb(176, 190, 210), bold = true, gravity = Gravity.CENTER).apply {
-            maxLines = 1
-            layoutParams = LinearLayout.LayoutParams(
-                LinearLayout.LayoutParams.MATCH_PARENT,
-                LinearLayout.LayoutParams.WRAP_CONTENT,
-            )
+        addView(LinearLayout(this@OverlayService).apply {
+            orientation = LinearLayout.VERTICAL
+            gravity = Gravity.CENTER_VERTICAL
+            layoutParams = LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f)
+            addView(textView(value, if (value == MachineLink.NO_READING) 15f else 31f, Color.WHITE, bold = true).apply {
+                tag = "value"
+                maxLines = 1
+                setTextColor(if (value == MachineLink.NO_READING) Color.rgb(150, 165, 188) else Color.WHITE)
+                layoutParams = LinearLayout.LayoutParams(
+                    LinearLayout.LayoutParams.MATCH_PARENT,
+                    LinearLayout.LayoutParams.WRAP_CONTENT,
+                )
+            })
+            addView(textView(label, 13f, Color.rgb(139, 152, 174), bold = false).apply {
+                maxLines = 1
+                layoutParams = LinearLayout.LayoutParams(
+                    LinearLayout.LayoutParams.MATCH_PARENT,
+                    LinearLayout.LayoutParams.WRAP_CONTENT,
+                )
+            })
         })
     }
 
+    /** Hairline between readouts, inset from the pill's top and bottom as in stock. */
     private fun metricDivider(): View = View(this).apply {
-        setBackgroundColor(Color.argb(130, 107, 128, 154))
-        layoutParams = LinearLayout.LayoutParams(dp(1f), LinearLayout.LayoutParams.MATCH_PARENT)
+        setBackgroundColor(Color.argb(70, 128, 148, 184))
+        layoutParams = LinearLayout.LayoutParams(dp(1f), LinearLayout.LayoutParams.MATCH_PARENT).apply {
+            topMargin = dp(10f)
+            bottomMargin = dp(10f)
+        }
     }
 
+    /**
+     * Preset columns come from the machine when it has told us what it supports
+     * (SpeedService/GetControls and InclineService/GetControls), and fall back to the
+     * documented range for this equipment class only until that read lands.
+     */
     private fun addInclineRail() {
-        val current = MachineLink.inclinePercent?.roundToInt()?.toString()
+        val presets = MachineLink.inclinePresets
+            ?.map { it.roundToInt().toString() }
+            ?: listOf("12", "10", "8", "6", "5", "4", "3", "2", "1", "0", "-1", "-2", "-3")
         leftInclineView = addRail(
-            title = "INCLINE",
-            value = inclineText(),
-            unit = "%",
             accent = amber,
-            muted = amberMuted,
-            entries = listOf("12", "11", "10", "9", "8", "7", "6", "5", "4", "3", "2", "1", "0", "-1", "-2", "-3"),
+            entries = presets,
             entrySuffix = "%",
-            currentEntry = current,
+            currentEntry = MachineLink.inclinePercent?.roundToInt()?.toString(),
             gravity = Gravity.START or Gravity.TOP,
         )
-        trackRail(leftInclineView) { inclineText() }
     }
 
     private fun addSpeedRail() {
-        val current = MachineLink.speedMph?.roundToInt()?.toString()
+        val presets = MachineLink.speedPresets
+            ?.map { it.roundToInt().toString() }
+            ?: listOf("12", "10", "9", "8", "7", "6", "5", "4", "3", "2", "1")
         rightSpeedView = addRail(
-            title = "SPEED",
-            value = speedText(),
-            unit = "MPH",
             accent = cyan,
-            muted = cyanMuted,
-            entries = listOf("12", "11", "10", "9", "8", "7", "6", "5", "4", "3", "2", "1"),
+            entries = presets,
             entrySuffix = "",
-            currentEntry = current,
+            currentEntry = MachineLink.speedMph?.roundToInt()?.toString(),
             gravity = Gravity.END or Gravity.TOP,
         )
-        trackRail(rightSpeedView) { speedText() }
     }
 
     /**
@@ -916,7 +1316,11 @@ class OverlayService : Service() {
         val bottom = if (hudBottomPx > 0) hudBottomPx else dp(HUD_BOTTOM_ESTIMATE_DP)
         val gap = dp(12f)
         val y = top + gap
-        val height = (screenHeight - y - bottom - gap).coerceAtLeast(dp(120f))
+        // The circular quick-pick toggles live in the same columns as the rails, just above the
+        // bottom bar. Without reserving their footprint the last pill slides underneath one and
+        // becomes unreadable and untappable at the same time.
+        val corners = dp(CORNER_SIZE_DP + 18f + 12f)
+        val height = (screenHeight - y - bottom - corners - gap).coerceAtLeast(dp(120f))
         return y to height
     }
 
@@ -936,12 +1340,16 @@ class OverlayService : Service() {
         }
     }
 
+    /**
+     * A quick-pick column: bare pills floating against the video, with no card behind them.
+     *
+     * The card that used to wrap these carried a title, the live reading and a LOCKED badge, all
+     * of which the top strip already says once. Repeating them down the edge cost a broad opaque
+     * slab over whatever the rider was watching, to tell them nothing new. Stock has no card here
+     * for the same reason.
+     */
     private fun addRail(
-        title: String,
-        value: String,
-        unit: String,
         accent: Int,
-        muted: Int,
         entries: List<String>,
         entrySuffix: String,
         currentEntry: String?,
@@ -956,29 +1364,8 @@ class OverlayService : Service() {
         val content = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
             this.gravity = Gravity.CENTER_HORIZONTAL
-            setPadding(dp(24f), dp(12f), dp(24f), dp(12f))
+            setPadding(0, dp(10f), 0, dp(10f))
         }
-        content.addView(textView(title, 16f, accent, bold = true, gravity = Gravity.CENTER).apply {
-            layoutParams = LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT)
-        })
-        content.addView(textView(value, if (value == MachineLink.NO_READING) 16f else 30f, Color.WHITE, bold = true, gravity = Gravity.CENTER).apply {
-            tag = "value"
-            maxLines = 2
-            val lp = LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT)
-            lp.topMargin = dp(8f)
-            layoutParams = lp
-        })
-        content.addView(textView(unit, 12f, muted, bold = true, gravity = Gravity.CENTER).apply {
-            val lp = LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT)
-            lp.topMargin = dp(2f)
-            layoutParams = lp
-        })
-        content.addView(textView("LOCKED", 13f, Color.rgb(7, 12, 20), bold = true, gravity = Gravity.CENTER).apply {
-            background = roundedRect(accent, 12f)
-            val lp = LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, dp(28f))
-            lp.topMargin = dp(10f)
-            layoutParams = lp
-        })
         entries.forEach { entry ->
             val active = currentEntry == entry
             val button = railEntryButton(
@@ -992,27 +1379,18 @@ class OverlayService : Service() {
             if (active) activeView = button
             content.addView(button)
         }
-        content.addView(textView("Use console", 12f, muted, bold = true, gravity = Gravity.CENTER).apply {
-            val lp = LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT)
-            lp.topMargin = dp(10f)
-            layoutParams = lp
-        })
 
         content.layoutParams = FrameLayout.LayoutParams(
             FrameLayout.LayoutParams.MATCH_PARENT,
             FrameLayout.LayoutParams.WRAP_CONTENT,
         )
         val rail = ScrollView(this).apply {
-            // The card lives on the window-sized ScrollView, not on the taller scrolling content.
-            // Drawn on the content, its bottom edge and rounded corners sit hundreds of pixels
-            // below the window, so the rail reads as a box that runs on underneath the bottom bar
-            // even when its window is correctly bounded above it.
-            background = roundedRect(Color.argb(238, 5, 10, 22), 36f, Color.argb(210, Color.red(accent), Color.green(accent), Color.blue(accent)))
-            // A pill guillotined flat at the edge looks like clipping by the bar. Faded, it reads
-            // as what it is: a list with more below.
+            // Faded rather than guillotined: a pill sliced flat at the boundary reads as clipped
+            // by the bar above or below it, instead of as a list with more in it.
             isVerticalFadingEdgeEnabled = true
-            setFadingEdgeLength(dp(32f))
+            setFadingEdgeLength(dp(40f))
             isFillViewport = false
+            overScrollMode = View.OVER_SCROLL_NEVER
             isClickable = true
             setOnScrollChangeListener { _, _, _, _, _ ->
                 railSettling = true
@@ -1029,22 +1407,18 @@ class OverlayService : Service() {
                     false
                 }
             }
-            setOnClickListener {
-                if (railSettling || SystemClock.uptimeMillis() < ignoreClicksUntilMs) return@setOnClickListener
-                showMachineControlUnavailable()
-            }
             addView(content)
         }
-        val params = baseParams(dp(180f), railHeight, gravity)
-        params.x = dp(24f)
+        val params = baseParams(dp(RAIL_WIDTH_DP), railHeight, gravity)
+        params.x = dp(30f)
         params.y = railTop
         try {
             windowManager.addView(rail, params)
             // Report the edge this rail occupies, offset included, so Flutter can inset its grid
-            // out from under it. Measured after layout rather than assumed from dp(180f), because
-            // the rail is what is actually on screen and the constant is only what we asked for.
+            // out from under it. Measured after layout rather than assumed from the constant,
+            // because the rail is what is actually on screen and the constant is only the ask.
             rail.post {
-                val occupied = params.x + (if (rail.width > 0) rail.width else dp(180f))
+                val occupied = params.x + (if (rail.width > 0) rail.width else dp(RAIL_WIDTH_DP))
                 publishSideInset(left = (gravity and Gravity.START) == Gravity.START, value = occupied)
                 activeView?.let { active ->
                     val target = (active.top - (rail.height - active.height) / 2).coerceAtLeast(0)
@@ -1057,21 +1431,26 @@ class OverlayService : Service() {
         }
     }
 
+    /**
+     * One quick-pick pill. Muted by default and accented only when it is the value the machine
+     * currently reports, so the column reads as a scale with the rider's position marked on it
+     * rather than as sixteen competing buttons.
+     */
     private fun railEntryButton(label: String, accent: Int, active: Boolean, onClick: () -> Unit): TextView =
-        textView(label, 26f, if (active) Color.rgb(5, 10, 18) else Color.WHITE, bold = true, gravity = Gravity.CENTER).apply {
+        textView(label, 30f, if (active) Color.rgb(5, 10, 18) else Color.rgb(206, 214, 232), bold = true, gravity = Gravity.CENTER).apply {
             isClickable = true
             isFocusable = true
             contentDescription = "$label locked. ${MachineLink.CONTROL_LOCKED_NOTICE}"
             background = rippleRounded(
-                color = if (active) accent else Color.rgb(17, 25, 36),
-                radius = 28f,
-                strokeColor = if (active) Color.WHITE else Color.argb(190, Color.red(accent), Color.green(accent), Color.blue(accent)),
+                color = if (active) accent else Color.argb(224, 18, 25, 46),
+                radius = 34f,
+                strokeColor = if (active) Color.WHITE else Color.argb(150, 62, 76, 116),
             )
             setOnClickListener { onClick() }
-            val lp = LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, dp(76f))
-            lp.topMargin = dp(8f)
+            val lp = LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, dp(66f))
+            lp.topMargin = dp(11f)
             layoutParams = lp
-            minimumHeight = dp(72f)
+            minimumHeight = dp(66f)
         }
 
     private fun addBottomBar() {
@@ -1113,6 +1492,33 @@ class OverlayService : Service() {
         row.addView(timerCluster())
         row.addView(volumeCluster())
         row.addView(fanCluster())
+        row.addView(smallPillButton(
+            if (metricsVisible) "Metrics on" else "Metrics off",
+            if (metricsVisible) Color.rgb(20, 38, 52) else Color.rgb(22, 26, 34),
+            if (metricsVisible) Color.rgb(190, 232, 255) else Color.rgb(150, 165, 188),
+        ) {
+            metricsVisible = !metricsVisible
+            rebuildChromeViews()
+            lastGesture = if (metricsVisible) "metrics shown" else "metrics hidden"
+        }.apply {
+            val lp = layoutParams as LinearLayout.LayoutParams
+            lp.marginStart = dp(10f)
+            layoutParams = lp
+        })
+        row.addView(smallPillButton(
+            if (trackFloorWanted()) "Track on" else "Track off",
+            if (trackFloorWanted()) Color.rgb(31, 28, 62) else Color.rgb(22, 26, 34),
+            if (trackFloorWanted()) Color.rgb(198, 192, 255) else Color.rgb(150, 165, 188),
+        ) {
+            val next = !trackFloorWanted()
+            trackFloorChosen = next
+            rebuildChromeViews()
+            lastGesture = if (next) "track floor shown" else "track floor hidden"
+        }.apply {
+            val lp = layoutParams as LinearLayout.LayoutParams
+            lp.marginStart = dp(8f)
+            layoutParams = lp
+        })
         row.addView(smallPillButton("Hide overlay", Color.rgb(42, 25, 18), Color.rgb(255, 222, 190)) {
             hideChrome()
         }.apply {

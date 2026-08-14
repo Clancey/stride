@@ -19,7 +19,7 @@ void main() {
     expect(find.text('Workout'), findsOneWidget);
     expect(find.text('Elapsed time'), findsOneWidget);
     expect(find.text('Controls locked'), findsOneWidget);
-    expect(find.text('Start timer'), findsOneWidget);
+    expect(find.text('Start workout'), findsOneWidget);
     expect(find.text('Media volume'), findsOneWidget);
     expect(
       find.textContaining(
