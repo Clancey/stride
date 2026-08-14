@@ -143,9 +143,28 @@ object AppstoreState {
         notifyListeners()
     }
 
+    /**
+     * Seed from a cached catalog after a process restart, without claiming a check just happened.
+     *
+     * [checkedAtWallMs] is the wall-clock of the check that produced these bytes, so the launcher
+     * says "checked 5 minutes ago" - which is true - instead of "not checked yet". Deliberately
+     * leaves [lastCheckElapsedMs] at 0: it is `elapsedRealtime`, which is measured from boot and is
+     * meaningless once carried across a reboot, and it gates freshness decisions that must fail
+     * towards checking again rather than towards trusting a stale value.
+     *
+     * Never overwrites a live result.
+     */
     @Synchronized
-    fun failCheck(reason: String) {
-        checking = false
+    fun restore(catalog: CatalogManifest, plan: List<PlanItem>, checkedAtWallMs: Long) {
+        if (this.catalog != null) return
+        this.catalog = catalog
+        this.plan = plan
+        this.lastCheckWallMs = checkedAtWallMs
+        notifyListeners()
+    }
+
+    @Synchronized
+    fun failCheck(reason: String) {        checking = false
         lastError = reason
         lastCheckElapsedMs = SystemClock.elapsedRealtime()
         lastCheckWallMs = System.currentTimeMillis()

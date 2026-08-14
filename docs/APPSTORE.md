@@ -180,6 +180,19 @@ in app-private prefs, not `AppstoreState`, because the in-process state always r
 checked" after a restart — which is exactly when this runs. It is stamped when a check *begins*, so
 a console with no network does not retry on every single launch.
 
+When that guard says "too soon", the service restores the last catalog from prefs instead of doing
+nothing. Persisting only the timestamp was a half-fix: a restart inside the 30 minutes suppressed the
+check *and* left `AppstoreState` empty, so the store read "not checked yet" and the header badge
+showed nothing while an update was genuinely pending — hidden until the rider happened to tap **Check
+now**. Suppressing the network call is right; forgetting what it returned is not.
+
+Only the catalog bytes are cached, and only after they parse — storing the raw body first would let
+one bad deploy poison every subsequent start with a catalog we already know we cannot read. The plan
+is recomputed on restore rather than stored, because what is installed changes between processes (by
+our own installer, by adb, by an uninstall) and a stale plan would offer an update for something
+already updated. A restore reports the *original* check time, so the launcher says "checked 5 minutes
+ago" rather than claiming a check just happened, and it never overwrites a live result.
+
 The header badge reads `AppstoreStatus.actionableCount` — pending updates *plus* offerable bundles —
 rather than `pendingCount`. `pendingCount` counts only updates to already-installed apps, so a
 console with Google Play still missing would show no badge at all while the one thing worth doing
