@@ -106,7 +106,8 @@ Schema v1, documented in full in the [catalog repository's README][catalog]:
 
 The parser rejects the **whole document**, never one entry, on: an unknown `schema`, a non-https
 `url`, a missing or malformed digest, a non-positive `versionCode`/`sizeBytes`, an implausible
-package name, a duplicate package, or a second `"role": "stride"`. Partial acceptance of a document
+package name, a duplicate package, a second `"role": "stride"`, or a malformed `bundles` array
+(§11). Partial acceptance of a document
 that decides what gets installed on a machine with a motor is not a behaviour worth having.
 
 Rejecting an unknown `schema` outright is the deliberate one: a future field an old client silently
@@ -207,6 +208,7 @@ Stride's *first* copy, which Stride obviously cannot do itself — is the adb wa
 | `appstore/ApkVerifier.kt` | package / version / signer of the archive |
 | `appstore/ApkInstaller.kt` | `PackageInstaller` session + `InstallResultReceiver` |
 | `appstore/ConfirmQueue.kt` | one confirmation on screen at a time, and recoverable (pure) |
+| `appstore/BundlePlan.kt` | ordered multi-package installs, and what to install next (pure) — §11 |
 | `appstore/RelaunchPolicy.kt` | which broadcast means "you were just updated" (pure) |
 | `appstore/PackageReplacedReceiver.kt` | brings the launcher and overlay back after a self-update |
 | `appstore/AppstoreState.kt` | single in-process source of truth |
@@ -215,6 +217,7 @@ Stride's *first* copy, which Stride obviously cannot do itself — is the adb wa
 | `appstore/AppstoreBridge.kt` | method-channel surface + setup checklist |
 | `lib/model/appstore.dart` | typed snapshot, tolerant of missing keys |
 | `lib/screens/updates_sheet.dart` | the entire UI |
+| `lib/widgets/bundle_row.dart` | the one-tap bundle row, shared by the sheet and the Store tab |
 
 ## 10. Deliberately not built
 
@@ -227,3 +230,112 @@ Stride's *first* copy, which Stride obviously cannot do itself — is the adb wa
   sideload is already one too many. A separate updater package is the only way to keep a process
   alive *through* Stride's own install, but §5.1 gets the same outcome without a second APK, second
   install, and second permission grant.
+
+## 11. Google Play, and bundles
+
+This console ships as AOSP with no Google apps. That is not a cosmetic gap: an app that calls Play
+Services for sign-in, DRM or billing does not degrade on a device without it, it crashes on launch.
+Netflix, Spotify and most of what a rider actually wants to run on a treadmill are in that category.
+
+For a long time Stride treated that as permanent — catalog entries carried `requiresGms`, and an app
+that needed Play was shown greyed out with "this console cannot run it". That was wrong, and the
+runbook that disproved it is the origin of this section.
+
+### 11.1 It works, unprivileged
+
+The received wisdom is that Play Services must be a *system* app: signed into `/system/priv-app`,
+holding privileged permissions. Stride's eligibility check enforced that, testing `FLAG_SYSTEM`.
+
+On this hardware it is not true. Sideloading the Google packages as ordinary user apps, in the right
+order, produces a Play Store that signs in and installs apps. Verified on the console, API 33,
+arm64-v8a, dpi 160. `hasUsableGms()` therefore checks that the package is **present and enabled**,
+and nothing more. A stricter check was rejecting a configuration that demonstrably works.
+
+### 11.2 The order matters, and that is the whole problem
+
+Four packages, and getting the sequence wrong fails:
+
+| # | Package | Note |
+|---|---|---|
+| 1 | `com.google.android.gsf.login` | Google Services Framework Login |
+| 2 | `com.google.android.gsf` | must be the **v13** artifact; v14 fails on SDK 33 |
+| 3 | `com.google.android.gms` | Play Services — a **split** install, base + `config.mdpi` |
+| 4 | `com.android.vending` | the Play Store itself |
+
+Two traps in that table are worth stating plainly, because both look like a corrupt download:
+
+- **GMS Core cannot be installed from its base APK alone.** Its manifest declares
+  `requiredSplitTypes`, so a lone `adb install` is rejected. It needs every part in one
+  `PackageInstaller` session — which is exactly what the catalog's `splits` support already does.
+  `config.mdpi` is the split this console's dpi=160 needs.
+- **Stopping halfway is worse than not starting.** A Play Store with no GSF underneath it opens onto
+  a sign-in loop, which reads to a rider as "Stride installed a broken app".
+
+That sequence is knowledge about *the artifacts*, not about the launcher, so it lives in the catalog
+next to them. A console can learn a corrected order from a catalog update rather than an app update.
+
+### 11.3 Bundles
+
+A `bundles` array, added to the catalog alongside `apps`:
+
+```jsonc
+"bundles": [
+  {
+    "id": "google-play",
+    "name": "Google Play",
+    "detail": "The Play Store and the three services it needs, installed in order",
+    "restartRequired": true,
+    "packages": [
+      "com.google.android.gsf.login",
+      "com.google.android.gsf",
+      "com.google.android.gms",
+      "com.android.vending"
+    ]
+  }
+]
+```
+
+This is a **new optional top-level key, not a schema bump** — deliberately. §4 says the parser
+rejects an unknown `schema` wholesale, so bumping it would stop every fielded console from seeing
+any update, including the one that would teach it about bundles. An old client ignores `bundles` and
+keeps working. That constraint governs every future catalog change.
+
+Parsing is still strict about the array's *contents*: every member must resolve to a real entry in
+the same catalog, no bundle may be empty or list a package twice, no two bundles may share an id,
+and no package may appear in two bundles. `tools/verify.sh` checks the same things before a publish,
+because a bundle naming a missing package would take the whole catalog down for everyone.
+
+### 11.4 One button
+
+`BundlePlan` is pure and decides what happens next; `StrideAppstoreService.advanceBundle()` runs it.
+The design point is that **the runner installs exactly one member per call**, and recomputes the next
+one from what is installed *right now* rather than from a stored cursor.
+
+That is what makes a run resumable. Each install raises its own system confirmation, and between two
+of them a rider can dismiss a dialog, start a workout, or leave for an hour and let the process get
+killed. Coming back to a fresh reading of the device means a resumed run picks up at the first real
+gap instead of reinstalling what already landed — and the button says "Finish installing" rather
+than "Install", so it is clear nothing was lost. A failure stops the sequence rather than carrying
+on, since the later members depend on the earlier ones and continuing only buries the error that
+mattered.
+
+Bundle members are hidden from the ordinary store and update lists, in both the Kotlin plan
+(`backgroundInstallable`, `pendingCount`) and the Dart model (`_standalone`). Four rows saying
+"Install" in an order the rider cannot see is precisely the trap the bundle exists to close. They
+are also excluded from background auto-install for the same reason: sequence is the point.
+
+The row appears only while something is missing, and disappears when the bundle is complete.
+
+### 11.5 The step Stride cannot take
+
+Play Services needs a reboot to start working properly, and Stride cannot reboot an unrooted
+console. So `restartRequired` exists purely so the UI can *say so*: when the last member lands the
+row stops offering an install and asks for a power cycle, with a dismiss. Silently finishing would
+leave a rider with a Play Store that looks installed and behaves broken.
+
+### 11.6 Licensing
+
+Re-hosting Google's binaries is redistribution of someone else's software, and the same question the
+third-party APKs raise (§4), only more visible. The mechanism here is neutral — a bundle is an
+ordered install, and the catalog is a list of URLs. What a *published* catalog points at is a
+separate decision, and this document does not claim the default one is settled.

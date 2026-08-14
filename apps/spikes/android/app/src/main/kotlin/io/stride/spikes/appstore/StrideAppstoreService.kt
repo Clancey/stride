@@ -6,7 +6,6 @@ import android.app.NotificationManager
 import android.app.Service
 import android.content.Context
 import android.content.Intent
-import android.content.pm.ApplicationInfo
 import android.content.pm.PackageManager
 import android.os.Build
 import android.os.IBinder
@@ -99,6 +98,11 @@ class StrideAppstoreService : Service() {
                 }
             }
 
+            ACTION_INSTALL_BUNDLE -> {
+                val bundleId = intent.getStringExtra(EXTRA_BUNDLE)
+                if (bundleId != null) worker.execute { advanceBundle(bundleId) }
+            }
+
             else -> worker.execute { check() }
         }
         // START_STICKY would have the platform restart us with a null intent after a kill, which
@@ -142,7 +146,7 @@ class StrideAppstoreService : Service() {
         AppstoreState.completeCheck(catalog, plan)
 
         // Third-party updates proceed on their own; Stride's own upgrade waits for a tap.
-        UpdatePlan.backgroundInstallable(plan).forEach { item ->
+        UpdatePlan.backgroundInstallable(plan, catalog.bundledPackages).forEach { item ->
             runCatching { stageAndInstall(item.entry) }
                 .onFailure { Log.w(TAG, "update failed for ${item.packageName}", it) }
         }
@@ -241,6 +245,64 @@ class StrideAppstoreService : Service() {
             }
     }
 
+    // ----------------------------------------------------------------- bundle
+
+    /**
+     * Installs the next missing member of a bundle, one per call.
+     *
+     * Each member is a separate `PackageInstaller` session with its own confirmation, and the result
+     * arrives asynchronously at [InstallResultReceiver] - so this cannot be a loop. It installs one
+     * package and returns; [onInstallSettled] calls it again when that one lands. What makes the
+     * chain safe to resume is that the next step is recomputed from what is *installed right now*
+     * rather than from a stored cursor, so a run interrupted by a dismissed dialog, a workout, or
+     * process death picks up exactly where the device actually is.
+     */
+    private fun advanceBundle(bundleId: String) {
+        val catalog = AppstoreState.catalog
+        if (catalog == null) {
+            AppstoreState.bundleFailed(bundleId, "check for updates first")
+            return
+        }
+        val bundle = catalog.bundleFor(bundleId)
+        if (bundle == null) {
+            AppstoreState.bundleFailed(bundleId, "the catalog no longer offers this")
+            return
+        }
+
+        val installed = installedApps().map { it.packageName }.toSet()
+        val next = BundlePlan.next(bundle, installed)
+        if (next == null) {
+            AppstoreState.bundleComplete(
+                bundleId = bundleId,
+                restartRequired = bundle.restartRequired,
+                message = if (bundle.restartRequired) {
+                    "${bundle.name} is installed. Restart the console to finish."
+                } else {
+                    "${bundle.name} is installed."
+                },
+            )
+            worker.execute { check() }
+            return
+        }
+
+        val entry = catalog.entryFor(next)
+        if (entry == null) {
+            // parse() rejects a bundle naming an unknown package, so reaching this means the
+            // catalog changed under a run that was already in flight.
+            AppstoreState.bundleFailed(bundleId, "the catalog changed while installing")
+            return
+        }
+
+        val done = BundlePlan.installedCount(bundle, installed)
+        AppstoreState.bundleProgress(
+            bundleId,
+            "Installing ${entry.name} (${done + 1} of ${bundle.packages.size})",
+        )
+        runCatching { stageAndInstall(entry) }.onFailure {
+            AppstoreState.bundleFailed(bundleId, "${entry.name} failed: ${it.message}")
+        }
+    }
+
     /** Everything downloaded and verified but parked by the safety gate. */
     private fun installHeldItems() {
         if (!UpdatePlan.mayInstallNow(workoutIdle(), canRequestInstalls(this))) return
@@ -249,8 +311,10 @@ class StrideAppstoreService : Service() {
             .filter { it.stage == AppstoreState.Stage.READY }
             .mapNotNull { catalog.entryFor(it.packageName) }
             // Stride's own upgrade stays parked: "the workout ended" is not consent to restart the
-            // launcher.
+            // launcher. Bundle members stay parked too - they are resumed in order by the bundle
+            // runner, and installing one here would do it out of sequence.
             .filter { it.role != CatalogRole.STRIDE }
+            .filterNot { it.packageName in (catalog.bundledPackages) }
             .forEach { entry -> runCatching { stageAndInstall(entry) } }
     }
 
@@ -281,17 +345,21 @@ class StrideAppstoreService : Service() {
     )
 
     /**
-     * Whether Google Play Services is present *and privileged*, which is the only form of it worth
-     * reporting true for.
+     * Whether Google Play Services is present and enabled.
      *
-     * The flag check is the point. A user-space sideload of `com.google.android.gms` installs
-     * fine and is then inert — it cannot hold the signature-level permissions it needs — so
-     * presence alone would be a lie to every caller. `FLAG_SYSTEM` is what distinguishes a GMS that
-     * came with the ROM from one somebody pushed with adb after reading a forum post.
+     * This used to additionally require `FLAG_SYSTEM`, on the reasoning that Play Services must live
+     * in `/system/priv-app` to hold its signature-level permissions, so a user-space sideload would
+     * install and then be inert. That was tested on this hardware on 2026-08-14 and is **not** what
+     * happens: an ordinary `PackageInstaller` sideload of GSF Login, GSF, GMS Core (base plus its
+     * density split) and the Play Store, installed in that order and followed by a reboot, gives a
+     * Play Store that signs in and installs apps. See `docs/APPSTORE.md` §11.
+     *
+     * So the check is now presence and enablement, which is what callers actually meant. Requiring
+     * `FLAG_SYSTEM` would report false on a console where Play demonstrably works, and mark every
+     * `requiresGms` app ineligible on the one device that had just earned them.
      */
     private fun hasUsableGms(): Boolean = try {
-        val info = packageManager.getApplicationInfo(GMS_PACKAGE, 0)
-        info.enabled && (info.flags and ApplicationInfo.FLAG_SYSTEM) != 0
+        packageManager.getApplicationInfo(GMS_PACKAGE, 0).enabled
     } catch (e: PackageManager.NameNotFoundException) {
         false
     }
@@ -320,7 +388,9 @@ class StrideAppstoreService : Service() {
         const val ACTION_CHECK = "io.stride.spikes.APPSTORE_CHECK"
         const val ACTION_INSTALL = "io.stride.spikes.APPSTORE_INSTALL"
         const val ACTION_STOP = "io.stride.spikes.APPSTORE_STOP"
+        const val ACTION_INSTALL_BUNDLE = "io.stride.spikes.APPSTORE_INSTALL_BUNDLE"
         const val EXTRA_PACKAGE = "io.stride.spikes.APPSTORE_PACKAGE"
+        const val EXTRA_BUNDLE = "io.stride.spikes.APPSTORE_BUNDLE"
 
         /**
          * Where the catalog lives: the public
@@ -342,8 +412,8 @@ class StrideAppstoreService : Service() {
         private const val TAG = "StrideAppstore"
 
         /**
-         * Google Play Services. Referenced only to detect its absence — nothing here installs it,
-         * because nothing unprivileged can. See [DeviceProfile.hasGms].
+         * Google Play Services. Detected to decide whether `requiresGms` entries are offerable —
+         * and, since the Google Play bundle exists, installable by this very service.
          */
         private const val GMS_PACKAGE = "com.google.android.gms"
 
@@ -392,6 +462,9 @@ class StrideAppstoreService : Service() {
         fun install(context: Context, packageName: String) =
             start(context, ACTION_INSTALL) { it.putExtra(EXTRA_PACKAGE, packageName) }
 
+        fun installBundle(context: Context, bundleId: String) =
+            start(context, ACTION_INSTALL_BUNDLE) { it.putExtra(EXTRA_BUNDLE, bundleId) }
+
         fun stop(context: Context) = start(context, ACTION_STOP)
 
         private fun start(context: Context, action: String, configure: (Intent) -> Unit = {}) {
@@ -405,9 +478,34 @@ class StrideAppstoreService : Service() {
          * Drops the staged artifact — tens of megabytes we have no further use for — and refreshes
          * the plan so the launcher stops offering something already installed.
          */
-        fun onInstallSettled(context: Context, packageName: String) {
+        fun onInstallSettled(context: Context, packageName: String, success: Boolean) {
             val entry = AppstoreState.catalog?.entryFor(packageName) ?: return
             runCatching { File(stagingDir(context), "$packageName-${entry.versionCode}.apk").delete() }
+
+            // A bundle in flight advances itself rather than waiting for the next catalog check:
+            // four sequential installs separated by a network round trip each is a long time to
+            // stand on a treadmill watching nothing happen.
+            val run = AppstoreState.bundleRun
+            if (run != null && run.running) {
+                val bundle = AppstoreState.catalog?.bundleFor(run.bundleId)
+                if (bundle != null && packageName in bundle.packages) {
+                    if (success) {
+                        start(context, ACTION_INSTALL_BUNDLE) {
+                            it.putExtra(EXTRA_BUNDLE, run.bundleId)
+                        }
+                    } else {
+                        // Stop the whole sequence. The later members depend on the earlier ones, so
+                        // carrying on past a failure just produces more failures and buries the one
+                        // that mattered.
+                        AppstoreState.bundleFailed(
+                            run.bundleId,
+                            "${entry.name} did not install, so the rest was not attempted",
+                        )
+                    }
+                    return
+                }
+            }
+
             check(context)
         }
     }

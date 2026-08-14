@@ -81,6 +81,7 @@ class AppstoreItem {
     this.releaseNotesUrl,
     this.ineligibleReason,
     this.iconUrl,
+    this.bundleId,
   });
 
   factory AppstoreItem.fromMap(Map<String, dynamic> map) {
@@ -100,6 +101,7 @@ class AppstoreItem {
       releaseNotesUrl: map['releaseNotesUrl'] as String?,
       ineligibleReason: map['ineligibleReason'] as String?,
       iconUrl: map['iconUrl'] as String?,
+      bundleId: map['bundleId'] as String?,
     );
   }
 
@@ -124,6 +126,14 @@ class AppstoreItem {
   /// Where to fetch an icon for an app that is not on the device yet. Null is ordinary and just
   /// means a letter tile; see [isInstalled] for the case where the device has the real one.
   final String? iconUrl;
+
+  /// Set when this package is only installable as one step of a bundle.
+  ///
+  /// Such rows are hidden from every list. "Google Services Framework Login" is not something a
+  /// rider asked for, and offering it on its own is offering a way to end up with half of Google
+  /// Play - which is worse than none, because Play Store without Play Services is an icon that
+  /// opens onto a sign-in loop. The bundle is offered instead, as one row.
+  final String? bundleId;
 
   /// True when the device already has this app, so its real launcher icon can be read locally
   /// instead of fetched. Everything except [AppstoreKind.notInstalled] is by definition installed.
@@ -158,12 +168,109 @@ class AppstoreItem {
         AppstoreKind.ineligible => switch (ineligibleReason) {
           'sdk_too_old' => 'Needs a newer Android than this console runs',
           'abi_mismatch' => 'Not built for this console',
-          'needs_gms' =>
-            'Needs Google Play Services, which this console cannot run',
+          'needs_gms' => 'Needs Google Play, which is not installed yet',
           _ => 'Not available for this console',
         },
       },
     };
+  }
+}
+
+/// How much of a multi-package bundle is on the device. Mirrors `BundleState`.
+enum AppstoreBundleState {
+  /// None of it. Offered as a single install.
+  missing,
+
+  /// Some of it. Offered as "finish installing" - a half-installed bundle is the
+  /// state most in need of the button, and the one a rider reaches by cancelling
+  /// a confirmation partway through.
+  partial,
+
+  /// All of it. The row disappears.
+  installed;
+
+  static AppstoreBundleState parse(Object? raw) => switch (raw as String?) {
+    'partial' => AppstoreBundleState.partial,
+    'installed' => AppstoreBundleState.installed,
+    _ => AppstoreBundleState.missing,
+  };
+}
+
+/// An ordered group of packages that are only useful together.
+///
+/// Google Play is the reason this exists: restoring it on an AOSP console is four
+/// installs in a specific order, one of which is a split. The rider should press
+/// one button and not have to know any of that.
+class AppstoreBundle {
+  const AppstoreBundle({
+    required this.id,
+    required this.name,
+    required this.state,
+    required this.installedCount,
+    required this.totalCount,
+    required this.sizeBytes,
+    required this.restartRequired,
+    required this.running,
+    required this.failed,
+    required this.restartPending,
+    this.detail,
+    this.message,
+    this.iconUrl,
+  });
+
+  factory AppstoreBundle.fromMap(Map<String, dynamic> map) {
+    int asInt(Object? v) => (v as num?)?.toInt() ?? 0;
+    return AppstoreBundle(
+      id: map['id'] as String? ?? '',
+      name: map['name'] as String? ?? '',
+      detail: map['detail'] as String?,
+      iconUrl: map['iconUrl'] as String?,
+      state: AppstoreBundleState.parse(map['state']),
+      installedCount: asInt(map['installedCount']),
+      totalCount: asInt(map['totalCount']),
+      sizeBytes: asInt(map['sizeBytes']),
+      restartRequired: map['restartRequired'] == true,
+      running: map['running'] == true,
+      failed: map['failed'] == true,
+      restartPending: map['restartPending'] == true,
+      message: map['message'] as String?,
+    );
+  }
+
+  final String id;
+  final String name;
+  final String? detail;
+  final String? iconUrl;
+  final AppstoreBundleState state;
+  final int installedCount;
+  final int totalCount;
+  final int sizeBytes;
+
+  /// True when a reboot is needed before the bundle actually works. Stride cannot
+  /// reboot an unrooted console, so all it can do is say so.
+  final bool restartRequired;
+  final bool running;
+  final bool failed;
+
+  /// Every member landed and the restart is the only thing left.
+  final bool restartPending;
+  final String? message;
+
+  /// Nothing left to offer.
+  bool get isComplete => state == AppstoreBundleState.installed;
+
+  /// What the button says. "Finish installing" is deliberately different from
+  /// "Install": it tells a rider who cancelled a prompt that they have not lost
+  /// the work already done.
+  String get actionLabel =>
+      state == AppstoreBundleState.partial ? 'Finish installing' : 'Install';
+
+  String get subtitle {
+    if (message != null && message!.isNotEmpty) return message!;
+    if (state == AppstoreBundleState.partial) {
+      return '$installedCount of $totalCount parts installed';
+    }
+    return detail ?? '$totalCount parts';
   }
 }
 
@@ -212,6 +319,7 @@ class AppstoreStatus {
     required this.holdReason,
     required this.lastCheckWallMs,
     required this.items,
+    this.bundles = const <AppstoreBundle>[],
     this.lastError,
     this.catalogUrl,
   });
@@ -236,6 +344,12 @@ class AppstoreStatus {
       holdReason: map['holdReason'] as String? ?? '',
       lastCheckWallMs: (map['lastCheckWallMs'] as num?)?.toInt() ?? 0,
       items: items,
+      bundles: switch (map['bundles']) {
+        final List raw => raw
+            .map((e) => AppstoreBundle.fromMap(Map<String, dynamic>.from(e as Map)))
+            .toList(),
+        _ => const <AppstoreBundle>[],
+      },
       lastError: map['lastError'] as String?,
       catalogUrl: map['catalogUrl'] as String?,
     );
@@ -266,14 +380,25 @@ class AppstoreStatus {
   final String holdReason;
   final int lastCheckWallMs;
   final List<AppstoreItem> items;
+  final List<AppstoreBundle> bundles;
   final String? lastError;
   final String? catalogUrl;
 
   /// What the launcher badges. Only genuine updates count — something merely
   /// *offered* by the catalog and never installed is not a pending update and
   /// must not nag like one.
-  int get pendingCount =>
-      items.where((item) => item.kind == AppstoreKind.update).length;
+  int get pendingCount => _standalone
+      .where((item) => item.kind == AppstoreKind.update)
+      .length;
+
+  /// Rows a rider can act on individually. Bundle members are excluded: they are
+  /// offered as their bundle, never one at a time.
+  Iterable<AppstoreItem> get _standalone =>
+      items.where((item) => item.bundleId == null);
+
+  /// Bundles with something left to install. A complete one has nothing to say.
+  List<AppstoreBundle> get offerableBundles =>
+      bundles.where((b) => !b.isComplete || b.restartPending).toList();
 
   /// Stride's own pending upgrade, if any. Always needs an explicit tap.
   AppstoreItem? get selfUpdate {
@@ -283,14 +408,15 @@ class AppstoreStatus {
     return null;
   }
 
-  List<AppstoreItem> get updates => items
+  List<AppstoreItem> get updates => _standalone
       .where((item) => item.kind == AppstoreKind.update && !item.isSelf)
       .toList();
 
-  List<AppstoreItem> get available =>
-      items.where((item) => item.kind == AppstoreKind.notInstalled).toList();
+  List<AppstoreItem> get available => _standalone
+      .where((item) => item.kind == AppstoreKind.notInstalled)
+      .toList();
 
-  List<AppstoreItem> get rest => items
+  List<AppstoreItem> get rest => _standalone
       .where(
         (item) =>
             item.kind == AppstoreKind.upToDate ||

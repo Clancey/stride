@@ -43,8 +43,57 @@ object AppstoreState {
         val message: String? = null,
     )
 
+    /**
+     * A multi-package install in flight.
+     *
+     * Held separately from [PackageStatus] because the rider asked for one thing ("install Google
+     * Play") and should be told about one thing, even though four confirmations and four sessions
+     * are involved. Per-package rows would turn a single decision into four mysteries.
+     */
+    data class BundleRun(
+        val bundleId: String,
+        val running: Boolean,
+        val message: String?,
+        val failed: Boolean = false,
+        /** Set once every member landed and the bundle says a reboot is needed to finish. */
+        val restartRequired: Boolean = false,
+    )
+
     private val listeners = mutableListOf<() -> Unit>()
     private val statuses = LinkedHashMap<String, PackageStatus>()
+
+    @Volatile
+    var bundleRun: BundleRun? = null
+        private set
+
+    @Synchronized
+    fun bundleProgress(bundleId: String, message: String) {
+        bundleRun = BundleRun(bundleId, running = true, message = message)
+        notifyListeners()
+    }
+
+    @Synchronized
+    fun bundleFailed(bundleId: String, message: String) {
+        bundleRun = BundleRun(bundleId, running = false, message = message, failed = true)
+        notifyListeners()
+    }
+
+    @Synchronized
+    fun bundleComplete(bundleId: String, restartRequired: Boolean, message: String) {
+        bundleRun = BundleRun(
+            bundleId = bundleId,
+            running = false,
+            message = message,
+            restartRequired = restartRequired,
+        )
+        notifyListeners()
+    }
+
+    @Synchronized
+    fun clearBundleRun() {
+        bundleRun = null
+        notifyListeners()
+    }
 
     @Volatile
     var catalog: CatalogManifest? = null
@@ -144,7 +193,7 @@ object AppstoreState {
 
     /** True while anything is downloading or installing — the service stays foreground for this. */
     @Synchronized
-    fun busy(): Boolean = checking || statuses.values.any {
+    fun busy(): Boolean = checking || bundleRun?.running == true || statuses.values.any {
         it.stage == Stage.DOWNLOADING || it.stage == Stage.INSTALLING || it.stage == Stage.AWAITING_USER
     }
 
@@ -168,6 +217,7 @@ object AppstoreState {
         lastError = null
         lastCheckElapsedMs = 0L
         lastCheckWallMs = 0L
+        bundleRun = null
     }
 
     private fun notifyListeners() {

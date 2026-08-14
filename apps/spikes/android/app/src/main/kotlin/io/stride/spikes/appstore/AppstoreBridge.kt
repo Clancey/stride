@@ -24,6 +24,8 @@ class AppstoreBridge(private val context: Context) {
     fun status(): Map<String, Any?> {
         val plan = AppstoreState.plan
         val statuses = AppstoreState.allStatuses().associateBy { it.packageName }
+        val catalog = AppstoreState.catalog
+        val bundledPackages = catalog?.bundledPackages ?: emptySet()
 
         val items = plan.map { item ->
             val status = statuses[item.packageName]
@@ -32,6 +34,12 @@ class AppstoreBridge(private val context: Context) {
                 "name" to item.entry.name,
                 "kind" to item.kindName(),
                 "isSelf" to (item is UpdateAvailable && item.isSelfUpdate),
+                // Set when this package is only installable as part of a bundle. The launcher hides
+                // these: "Google Services Framework Login" is not a thing anyone asked for, and
+                // offering it on its own is offering a way to get half of Google Play.
+                "bundleId" to catalog?.bundles?.firstOrNull {
+                    item.packageName in it.packages
+                }?.id,
                 "availableVersionName" to item.entry.versionName,
                 "availableVersionCode" to item.entry.versionCode,
                 "installedVersionName" to item.installedVersionName(),
@@ -46,6 +54,33 @@ class AppstoreBridge(private val context: Context) {
             )
         }
 
+        val installedPackages = plan.mapNotNull { item ->
+            item.packageName.takeIf { item is UpToDate || item is UpdateAvailable }
+        }.toSet()
+        val run = AppstoreState.bundleRun
+        val bundles = (catalog?.bundles ?: emptyList()).map { bundle ->
+            val state = BundlePlan.state(bundle, installedPackages)
+            mapOf(
+                "id" to bundle.id,
+                "name" to bundle.name,
+                "detail" to bundle.detail,
+                "iconUrl" to bundle.iconUrl,
+                "state" to state.name.lowercase(),
+                "installedCount" to BundlePlan.installedCount(bundle, installedPackages),
+                "totalCount" to bundle.packages.size,
+                "restartRequired" to bundle.restartRequired,
+                "sizeBytes" to bundle.packages.sumOf {
+                    catalog?.entryFor(it)?.totalBytes ?: 0L
+                },
+                "running" to (run?.bundleId == bundle.id && run.running),
+                "failed" to (run?.bundleId == bundle.id && run.failed),
+                "message" to run?.takeIf { it.bundleId == bundle.id }?.message,
+                "restartPending" to (
+                    run?.bundleId == bundle.id && run.restartRequired && !run.running
+                    ),
+            )
+        }
+
         return mapOf(
             "checking" to AppstoreState.checking,
             "busy" to AppstoreState.busy(),
@@ -53,7 +88,7 @@ class AppstoreBridge(private val context: Context) {
             "lastCheckWallMs" to AppstoreState.lastCheckWallMs,
             "lastError" to AppstoreState.lastError,
             "catalogUrl" to StrideAppstoreService.catalogUrl(context),
-            "pendingCount" to UpdatePlan.pendingCount(AppstoreState.plan),
+            "pendingCount" to UpdatePlan.pendingCount(AppstoreState.plan, bundledPackages),
             "canRequestInstalls" to StrideAppstoreService.canRequestInstalls(context),
             "workoutIdle" to StrideAppstoreService.workoutIdle(),
             // The launcher disables install buttons on this rather than hiding them: an inert
@@ -64,6 +99,7 @@ class AppstoreBridge(private val context: Context) {
             ),
             "holdReason" to StrideAppstoreService.holdReason(context),
             "items" to items,
+            "bundles" to bundles,
         )
     }
 
@@ -85,6 +121,24 @@ class AppstoreBridge(private val context: Context) {
     /** Forget a failed or parked item so the row stops shouting. Does not abandon a live session. */
     fun cancel(packageName: String): Boolean {
         AppstoreState.clearStatus(packageName)
+        return true
+    }
+
+    /**
+     * Install every member of a bundle, in the catalog's order, from one tap.
+     *
+     * Each member still raises its own system confirmation — nothing here bypasses consent. What it
+     * removes is the need for the rider to know that Google Play is four packages, which order they
+     * go in, and that one of them is a split install.
+     */
+    fun installBundle(bundleId: String): Boolean {
+        StrideAppstoreService.installBundle(context, bundleId)
+        return true
+    }
+
+    /** Dismiss a finished or failed bundle run so its message stops occupying the sheet. */
+    fun clearBundle(): Boolean {
+        AppstoreState.clearBundleRun()
         return true
     }
 

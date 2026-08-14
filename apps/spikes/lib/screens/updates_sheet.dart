@@ -6,6 +6,7 @@ import '../bridge.dart';
 import '../model/appstore.dart';
 import '../theme/stride_tokens.dart';
 import '../widgets/app_models.dart';
+import '../widgets/bundle_row.dart';
 import '../widgets/store_icon.dart';
 import '../widgets/stride_sheet.dart';
 
@@ -74,6 +75,12 @@ class _UpdatesSheetState extends State<_UpdatesSheet> {
       if (confirmed != true) return;
     }
     await SpikeBridge.appstoreInstall(item.package);
+    await _refresh();
+  }
+
+  Future<void> _installBundle(AppstoreBundle bundle) async {
+    if (await confirmBundleInstall(context, bundle) != true) return;
+    await SpikeBridge.appstoreInstallBundle(bundle.id);
     await _refresh();
   }
 
@@ -166,6 +173,25 @@ class _UpdatesSheetState extends State<_UpdatesSheet> {
                 emphasised: true,
               ),
               const SizedBox(height: StrideSpace.lg),
+            ],
+
+            // Google Play is the case this exists for. It is four packages in a
+            // required order, one of which is a split install - so it is offered
+            // as one row, above the ordinary updates, and only while something
+            // is still missing.
+            if (_status.offerableBundles.isNotEmpty) ...[
+              for (final bundle in _status.offerableBundles) ...[
+                BundleRow(
+                  bundle: bundle,
+                  enabled: _status.mayInstallNow,
+                  onInstall: () => _installBundle(bundle),
+                  onDismiss: () async {
+                    await SpikeBridge.appstoreClearBundle();
+                    await _refresh();
+                  },
+                ),
+                const SizedBox(height: StrideSpace.lg),
+              ],
             ],
 
             if (_status.updates.isNotEmpty) ...[

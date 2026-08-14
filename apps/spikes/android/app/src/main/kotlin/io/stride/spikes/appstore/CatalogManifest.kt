@@ -28,12 +28,26 @@ data class CatalogManifest(
     val schema: Int,
     val generated: String?,
     val apps: List<CatalogEntry>,
+    /**
+     * Ordered multi-package installs. Optional, and unknown to clients built before it existed —
+     * which is exactly why it is a new top-level key rather than a new [CatalogRole] or a schema
+     * bump. Both of those are rejected *wholesale* by [parse], so introducing one would stop every
+     * console already in the field from seeing any update at all, including the update that would
+     * have taught it the new form. An old client simply ignores this array and sees the members as
+     * ordinary apps.
+     */
+    val bundles: List<CatalogBundle> = emptyList(),
 ) {
     /** The Stride build itself, if the catalog offers one. At most one entry may claim this role. */
     val strideEntry: CatalogEntry? get() = apps.firstOrNull { it.role == CatalogRole.STRIDE }
 
     fun entryFor(packageName: String): CatalogEntry? =
         apps.firstOrNull { it.packageName == packageName }
+
+    fun bundleFor(id: String): CatalogBundle? = bundles.firstOrNull { it.id == id }
+
+    /** Every package that is only installable as part of a bundle, so the UI can hide them. */
+    val bundledPackages: Set<String> get() = bundles.flatMap { it.packages }.toSet()
 
     companion object {
         /** The only schema version this build understands. */
@@ -85,7 +99,71 @@ data class CatalogManifest(
                 schema = schema,
                 generated = root.optString("generated").takeIf { it.isNotEmpty() },
                 apps = apps,
+                bundles = parseBundles(root, apps),
             )
+        }
+
+        /**
+         * Bundles are validated against [apps] rather than trusted, because the runner installs
+         * their members in the order given here. A bundle naming a package the catalog does not
+         * carry would strand a rider halfway through a multi-part install with no way to finish -
+         * and a half-installed Google Play is worse than none, since Play Store without Play
+         * Services is an icon that opens onto a sign-in loop.
+         */
+        private fun parseBundles(root: JSONObject, apps: List<CatalogEntry>): List<CatalogBundle> {
+            val array = root.optJSONArray("bundles") ?: return emptyList()
+            val known = apps.map { it.packageName }.toSet()
+            val bundles = ArrayList<CatalogBundle>(array.length())
+            for (i in 0 until array.length()) {
+                val obj = array.optJSONObject(i)
+                    ?: throw CatalogFormatException("bundles[$i] is not an object")
+                val id = obj.optString("id")
+                if (id.isEmpty()) throw CatalogFormatException("bundles[$i] is missing id")
+
+                val packagesJson = obj.optJSONArray("packages")
+                    ?: throw CatalogFormatException("bundles[$i] has no packages array")
+                val packages = buildList {
+                    for (p in 0 until packagesJson.length()) {
+                        val name = packagesJson.optString(p)
+                        if (name.isEmpty()) {
+                            throw CatalogFormatException("bundles[$i] packages[$p] is empty")
+                        }
+                        if (name !in known) {
+                            throw CatalogFormatException(
+                                "bundles[$i] names '$name', which the catalog has no entry for"
+                            )
+                        }
+                        add(name)
+                    }
+                }
+                if (packages.isEmpty()) {
+                    throw CatalogFormatException("bundles[$i] has no packages")
+                }
+                if (packages.toSet().size != packages.size) {
+                    throw CatalogFormatException("bundles[$i] lists a package twice")
+                }
+
+                bundles.add(
+                    CatalogBundle(
+                        id = id,
+                        name = obj.optString("name").ifEmpty { id },
+                        detail = obj.optString("detail").takeIf { it.isNotEmpty() },
+                        packages = packages,
+                        restartRequired = obj.optBoolean("restartRequired", false),
+                        iconUrl = obj.optString("iconUrl").takeIf { it.isNotEmpty() },
+                    )
+                )
+            }
+            if (bundles.map { it.id }.toSet().size != bundles.size) {
+                throw CatalogFormatException("catalog declares two bundles with the same id")
+            }
+            // One package in two bundles would make "which bundle is this row part of?" ambiguous,
+            // and the answer decides whether it is hidden from the store list.
+            val allPackages = bundles.flatMap { it.packages }
+            if (allPackages.toSet().size != allPackages.size) {
+                throw CatalogFormatException("a package appears in more than one bundle")
+            }
+            return bundles
         }
 
         private fun parseEntry(obj: JSONObject, index: Int): CatalogEntry {

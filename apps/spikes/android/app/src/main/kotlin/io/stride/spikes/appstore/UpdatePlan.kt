@@ -143,9 +143,18 @@ object UpdatePlan {
     /**
      * The updates Stride may act on without being asked twice. Excludes the self-update by
      * construction — see [UpdateAvailable.isSelfUpdate].
+     *
+     * [bundled] members are excluded too. They are installed as an ordered sequence by
+     * [BundlePlan], and slipping one of them in unattended would install a piece of Google Play on
+     * its own, out of order, behind a confirmation the rider did not ask for.
      */
-    fun backgroundInstallable(plan: List<PlanItem>): List<UpdateAvailable> =
-        plan.filterIsInstance<UpdateAvailable>().filterNot { it.isSelfUpdate }
+    fun backgroundInstallable(
+        plan: List<PlanItem>,
+        bundled: Set<String> = emptySet(),
+    ): List<UpdateAvailable> =
+        plan.filterIsInstance<UpdateAvailable>()
+            .filterNot { it.isSelfUpdate }
+            .filterNot { it.packageName in bundled }
 
     /** Stride's own pending upgrade, if there is one. Always requires an explicit user action. */
     fun selfUpdate(plan: List<PlanItem>): UpdateAvailable? =
@@ -153,9 +162,11 @@ object UpdatePlan {
 
     /**
      * The count the launcher badges. Third-party updates plus Stride's own; things merely *offered*
-     * but never installed are not "updates" and must not nag as if they were.
+     * but never installed are not "updates" and must not nag as if they were, and neither are
+     * bundle members, which are surfaced as their bundle rather than individually.
      */
-    fun pendingCount(plan: List<PlanItem>): Int = plan.count { it is UpdateAvailable }
+    fun pendingCount(plan: List<PlanItem>, bundled: Set<String> = emptySet()): Int =
+        plan.count { it is UpdateAvailable && it.packageName !in bundled }
 
     /**
      * SAFETY GATE (`PLAN.md` section 5, and `docs/APPSTORE.md`).

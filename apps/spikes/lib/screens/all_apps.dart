@@ -6,6 +6,7 @@ import '../bridge.dart';
 import '../theme/stride_tokens.dart';
 import '../widgets/stride_sheet.dart';
 import '../widgets/app_models.dart';
+import '../widgets/bundle_row.dart';
 import '../widgets/store_icon.dart';
 import '../widgets/app_tile.dart';
 import '../model/appstore.dart';
@@ -121,6 +122,12 @@ class _AllAppsScreenState extends State<AllAppsScreen>
     await _refreshStore();
   }
 
+  Future<void> _installBundle(AppstoreBundle bundle) async {
+    if (await confirmBundleInstall(context, bundle) != true) return;
+    await SpikeBridge.appstoreInstallBundle(bundle.id);
+    await _refreshStore();
+  }
+
   @override
   Widget build(BuildContext context) {
     final storeCount = _store.available
@@ -233,7 +240,12 @@ class _AllAppsScreenState extends State<AllAppsScreen>
         .where((item) => item.kind == AppstoreKind.ineligible && matches(item))
         .toList();
 
-    if (offered.isEmpty && blocked.isEmpty) {
+    // Bundles are not filtered by the search box: they are one entry, not a list
+    // of packages, and "google" should not have to match four internal package
+    // names for the Play install to stay reachable.
+    final bundles = _store.offerableBundles;
+
+    if (offered.isEmpty && blocked.isEmpty && bundles.isEmpty) {
       return _StoreEmpty(
         status: _store,
         searching: query.isNotEmpty,
@@ -248,6 +260,18 @@ class _AllAppsScreenState extends State<AllAppsScreen>
       children: [
         if (!_store.mayInstallNow && _store.holdReason.isNotEmpty) ...[
           _Notice(text: _store.holdReason),
+          const SizedBox(height: StrideSpace.md),
+        ],
+        for (final bundle in bundles) ...[
+          BundleRow(
+            bundle: bundle,
+            enabled: _store.mayInstallNow,
+            onInstall: () => _installBundle(bundle),
+            onDismiss: () async {
+              await SpikeBridge.appstoreClearBundle();
+              await _refreshStore();
+            },
+          ),
           const SizedBox(height: StrideSpace.md),
         ],
         for (final item in offered)

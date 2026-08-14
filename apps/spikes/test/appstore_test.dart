@@ -198,14 +198,16 @@ void main() {
       );
     });
 
-    test('a Play Services dependency is named as the reason', () {
-      // Otherwise this reads as an unexplained missing app, and the obvious next
-      // move is to go sideload Play Store, which cannot work here.
+    test('a Play dependency is named as the reason, and as fixable', () {
+      // This used to say Play "cannot run" here, which was true until Stride
+      // could install it. Now the one-tap bundle makes it a missing
+      // prerequisite rather than a permanent verdict, and the copy has to say
+      // so or the rider will not go looking for the button that fixes it.
       expect(
         AppstoreItem.fromMap(
           item(kind: 'ineligible', ineligibleReason: 'needs_gms'),
         ).subtitle,
-        'Needs Google Play Services, which this console cannot run',
+        'Needs Google Play, which is not installed yet',
       );
     });
   });
@@ -234,5 +236,109 @@ void main() {
         expect(step.title, isEmpty);
       },
     );
+  });
+
+  group('bundles', () {
+    Map<String, dynamic> bundle({
+      String id = 'google-play',
+      String state = 'missing',
+      int installedCount = 0,
+      int totalCount = 4,
+      bool running = false,
+      bool failed = false,
+      bool restartPending = false,
+      String? message,
+    }) => <String, dynamic>{
+      'id': id,
+      'name': 'Google Play',
+      'detail': 'Play Store and the services it needs',
+      'state': state,
+      'installedCount': installedCount,
+      'totalCount': totalCount,
+      'sizeBytes': 4096,
+      'restartRequired': true,
+      'running': running,
+      'failed': failed,
+      'restartPending': restartPending,
+      'message': message,
+    };
+
+    Map<String, dynamic> statusWith({
+      List<Map<String, dynamic>> items = const <Map<String, dynamic>>[],
+      List<Map<String, dynamic>> bundles = const <Map<String, dynamic>>[],
+    }) => <String, dynamic>{...status(items: items), 'bundles': bundles};
+
+    test('a status without bundles decodes to none', () {
+      expect(AppstoreStatus.fromMap(status()).bundles, isEmpty);
+      expect(AppstoreStatus.fromMap(status()).offerableBundles, isEmpty);
+    });
+
+    test('members of a bundle are not offered as separate apps', () {
+      // Four rows saying "Install" in an order that matters is exactly the trap
+      // the bundle exists to close. They belong to the bundle row or nowhere.
+      final decoded = AppstoreStatus.fromMap(
+        statusWith(
+          items: <Map<String, dynamic>>[
+            item(package: 'com.android.vending', kind: 'notInstalled')
+              ..['bundleId'] = 'google-play',
+            item(package: 'com.google.android.gsf', kind: 'update')
+              ..['bundleId'] = 'google-play',
+            item(package: 'com.example.solo', kind: 'notInstalled'),
+          ],
+          bundles: <Map<String, dynamic>>[bundle()],
+        ),
+      );
+      expect(
+        decoded.available.map((i) => i.package),
+        <String>['com.example.solo'],
+      );
+      expect(decoded.updates, isEmpty);
+      expect(decoded.pendingCount, 0);
+    });
+
+    test('a half installed bundle offers to finish rather than restart', () {
+      final b = AppstoreStatus.fromMap(
+        statusWith(
+          bundles: <Map<String, dynamic>>[
+            bundle(state: 'partial', installedCount: 2),
+          ],
+        ),
+      ).bundles.single;
+      expect(b.actionLabel, 'Finish installing');
+      expect(b.subtitle, '2 of 4 parts installed');
+      expect(b.isComplete, isFalse);
+    });
+
+    test('a complete bundle stops being offered', () {
+      final decoded = AppstoreStatus.fromMap(
+        statusWith(
+          bundles: <Map<String, dynamic>>[
+            bundle(state: 'installed', installedCount: 4),
+          ],
+        ),
+      );
+      expect(decoded.bundles.single.isComplete, isTrue);
+      expect(decoded.offerableBundles, isEmpty);
+    });
+
+    test('a bundle awaiting its reboot is still shown', () {
+      // The one step Stride cannot take itself. If the row vanished on the last
+      // install the rider would never be told to power cycle, and Play would sit
+      // there broken.
+      final decoded = AppstoreStatus.fromMap(
+        statusWith(
+          bundles: <Map<String, dynamic>>[
+            bundle(
+              state: 'installed',
+              installedCount: 4,
+              restartPending: true,
+              message: 'Restart the console to finish',
+            ),
+          ],
+        ),
+      );
+      expect(decoded.offerableBundles, hasLength(1));
+      expect(decoded.offerableBundles.single.subtitle, contains('Restart'));
+    });
   });
 }

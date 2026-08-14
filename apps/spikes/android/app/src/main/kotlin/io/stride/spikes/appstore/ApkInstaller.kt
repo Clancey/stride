@@ -159,7 +159,7 @@ class InstallResultReceiver : BroadcastReceiver() {
             PackageInstaller.STATUS_SUCCESS -> {
                 AppstoreState.update(packageName, AppstoreState.Stage.INSTALLED)
                 Confirmations.settled(context, packageName)
-                StrideAppstoreService.onInstallSettled(context, packageName)
+                StrideAppstoreService.onInstallSettled(context, packageName, success = true)
             }
 
             else -> {
@@ -169,7 +169,7 @@ class InstallResultReceiver : BroadcastReceiver() {
                     message = describe(status, message),
                 )
                 Confirmations.settled(context, packageName)
-                StrideAppstoreService.onInstallSettled(context, packageName)
+                StrideAppstoreService.onInstallSettled(context, packageName, success = false)
             }
         }
     }
