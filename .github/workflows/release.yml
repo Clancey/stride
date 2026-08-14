@@ -124,6 +124,30 @@ jobs:
           APK="$GITHUB_WORKSPACE/apps/spikes/build/app/outputs/flutter-apk/app-release.apk"
           VC="$(grep -m1 '^version:' apps/spikes/pubspec.yaml | sed 's/.*+//')"
 
+          # Read the catalog before asking for a token. It is a public repo, so the clone needs no
+          # auth - only the push does - and a build whose versionCode is already published has
+          # nothing to do whether or not a token exists. Checking in this order is what makes a
+          # re-run of a tag, or a tag for a release that was published by hand, come back green
+          # instead of failing for work that is already done.
+          git clone --depth 1 https://github.com/Clancey/stride-catalog.git /tmp/catalog
+          cd /tmp/catalog
+
+          # publish.sh reuses an existing release tag and deliberately never overwrites bytes a
+          # console may already have read - but it would then record the sha256 of THIS rebuild
+          # against those older published bytes, and a rebuild is not byte-identical. A changed
+          # build is a new versionCode; that is the rule, so honour it here.
+          # One line on purpose: python3 -c with an indented block is an IndentationError.
+          PUBLISHED="$(python3 -c "import json,sys; a=[x for x in json.load(open('catalog.json'))['apps'] if x.get('role')=='stride']; print(a[0]['versionCode'] if a else 0)")"
+          if [ "$PUBLISHED" -ge "$VC" ]; then
+            echo "catalog already publishes versionCode $PUBLISHED (this build is $VC) - nothing to do."
+            {
+              echo "### Already published"
+              echo
+              echo "The catalog serves versionCode \`$PUBLISHED\`; this build is \`$VC\`. Nothing to do."
+            } >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+
           if [ -z "$GH_TOKEN" ]; then
             {
               echo "### Not published"
@@ -148,23 +172,8 @@ jobs:
             exit 1
           fi
 
-          git clone --depth 1 https://x-access-token:"$GH_TOKEN"@github.com/Clancey/stride-catalog.git /tmp/catalog
-          cd /tmp/catalog
-
-          # Re-running a tag must not try to republish. publish.sh reuses an existing release tag
-          # and deliberately never overwrites bytes a console may already have read - but it would
-          # then record the sha256 of THIS rebuild against those older published bytes, and a
-          # rebuild is not byte-identical. Its own verification would catch that, but failing a
-          # green build for work that is already done is not useful. A changed build is a new
-          # versionCode; that is the rule, so honour it here.
-          # One line on purpose: python3 -c with an indented block is an IndentationError.
-          PUBLISHED="$(python3 -c "import json,sys; a=[x for x in json.load(open('catalog.json'))['apps'] if x.get('role')=='stride']; print(a[0]['versionCode'] if a else 0)")"
-          if [ "$PUBLISHED" -ge "$VC" ]; then
-            echo "catalog already publishes versionCode $PUBLISHED (this build is $VC) - nothing to do."
-            echo "### Already published" >> "$GITHUB_STEP_SUMMARY"
-            echo "The catalog serves versionCode \`$PUBLISHED\`; this build is \`$VC\`." >> "$GITHUB_STEP_SUMMARY"
-            exit 0
-          fi
+          git remote set-url origin \
+            https://x-access-token:"$GH_TOKEN"@github.com/Clancey/stride-catalog.git
 
           ./tools/publish.sh "$APK" --role stride --name Stride
           ./tools/verify.sh
