@@ -140,6 +140,20 @@
                 android:value="Background app catalog and update installer for a sideload-only console with no app store. Never commands the motor."/>
         </service>
 
+        <!-- App store: Stride is both the installer and the thing being installed, and updating a
+             package kills every process it owns. On a phone that is harmless - the Home button
+             starts the freshly updated launcher. This console has no Home button, and Stride's
+             overlay *is* the Home button, so without this the rider is stranded in whatever app was
+             behind Stride. The platform restarts the process to deliver MY_PACKAGE_REPLACED; this
+             receiver uses that to put the launcher and its overlay back. -->
+        <receiver
+            android:name="io.stride.spikes.appstore.PackageReplacedReceiver"
+            android:exported="false">
+            <intent-filter>
+                <action android:name="android.intent.action.MY_PACKAGE_REPLACED"/>
+            </intent-filter>
+        </receiver>
+
         <!-- App store: where PackageInstaller session results land, including the
              STATUS_PENDING_USER_ACTION confirmation intent. Not exported - only the platform's own
              PendingIntent targets it. -->

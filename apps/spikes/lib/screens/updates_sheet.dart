@@ -86,8 +86,9 @@ class _UpdatesSheetState extends State<_UpdatesSheet> {
       backgroundColor: StrideColors.panelRaised,
       title: const Text('Update Stride?'),
       content: Text(
-        'Stride will close while it updates to ${item.availableVersionName}. '
-        'The workout HUD, Back, and Home go away until it comes back.\n\n'
+        'Stride will close while it updates to ${item.availableVersionName}, '
+        'then start itself again. The workout HUD, Back, and Home are gone for '
+        'those few seconds.\n\n'
         'Do this between workouts, not during one.',
       ),
       actions: [

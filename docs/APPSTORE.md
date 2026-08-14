@@ -134,6 +134,34 @@ than something discovered on hardware.
   launcher.
 - Third-party updates install in the background. Stride's own does not.
 
+### 5.1 Coming back after updating itself
+
+Updating a package kills every process it owns, so Stride cannot watch its own install finish, and a
+separate updater *process* would not change that — `android:process` does not survive a package
+replacement. Only a separate *package* would, which means a second APK with its own install and its
+own `REQUEST_INSTALL_PACKAGES` grant.
+
+On a phone none of this matters. When Play updates a launcher the system kills it, leaves you on
+whatever was foreground, and the next press of **Home** starts the new one. The Home button is the
+recovery path, and Play never has the problem itself because `com.android.vending` is not the package
+being replaced.
+
+This console has no Home button, and Stride's overlay *is* the Home button — so it dies with the
+process, and the rider is stranded in whatever app was behind Stride with no way back.
+
+`PackageReplacedReceiver` performs that missing Home press. The platform restarts the process
+specifically to deliver `ACTION_MY_PACKAGE_REPLACED`, and Stride uses it to re-arm the update worker,
+restart `OverlayService`, and start `MainActivity`. Two things make it work:
+
+- It listens for `MY_PACKAGE_REPLACED`, **not** `PACKAGE_REPLACED`. The latter fires for every app on
+  the device, so acting on it would drag a rider out of Spotify the moment Spotify updated.
+- Starting an activity from the background is banned since Android 10, but holding
+  `SYSTEM_ALERT_WINDOW` is an exemption — and Stride already requires it for the overlay. The overlay
+  is started *before* the activity: restore the way out before restoring the thing to get out of.
+
+Verified on hardware: 1.0.3 → 1.0.4 with the console **not** set as HOME, confirming the relaunch
+comes from this receiver and not from the launcher role.
+
 ## 6. Scheduling
 
 `WorkManager`, ~6 hourly, network-constrained, enqueued as unique work with `KEEP`. Registered from
@@ -178,6 +206,9 @@ Stride's *first* copy, which Stride obviously cannot do itself — is the adb wa
 | `appstore/ApkDownloader.kt` | fetch to app-private cache, SHA-256, no resume |
 | `appstore/ApkVerifier.kt` | package / version / signer of the archive |
 | `appstore/ApkInstaller.kt` | `PackageInstaller` session + `InstallResultReceiver` |
+| `appstore/ConfirmQueue.kt` | one confirmation on screen at a time, and recoverable (pure) |
+| `appstore/RelaunchPolicy.kt` | which broadcast means "you were just updated" (pure) |
+| `appstore/PackageReplacedReceiver.kt` | brings the launcher and overlay back after a self-update |
 | `appstore/AppstoreState.kt` | single in-process source of truth |
 | `appstore/StrideAppstoreService.kt` | the pipeline, the safety gate, the catalog URL |
 | `appstore/AppstoreWorker.kt` | the ~6h periodic check |
@@ -193,4 +224,6 @@ Stride's *first* copy, which Stride obviously cannot do itself — is the adb wa
   on a machine plugged into a wall.
 - **Rollback** — a downgrade path is a launcher-bricking path.
 - **A second store app** — Stride surfaces its own updates. On a console with no keyboard, one
-  sideload is already one too many.
+  sideload is already one too many. A separate updater package is the only way to keep a process
+  alive *through* Stride's own install, but §5.1 gets the same outcome without a second APK, second
+  install, and second permission grant.
