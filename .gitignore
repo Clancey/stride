@@ -82,3 +82,8 @@ incident-*.log
 
 # Live telemetry captures may contain workout IDs and machine serials.
 .telemetry/
+
+# Release signing. The .enc file IS committed; the decrypted key and the generated
+# properties file must never be. See tools/keystore.sh.
+keystore/stride-release.jks
+apps/spikes/android/key.properties

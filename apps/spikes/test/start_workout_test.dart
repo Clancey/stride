@@ -36,10 +36,7 @@ void main() {
     expect(find.text('5K'), findsOneWidget);
     // Shown in both the custom stepper readout and the confirm summary.
     expect(find.text('3.1 mi'), findsNWidgets(2));
-    expect(
-      find.widgetWithText(FilledButton, 'Start workout'),
-      findsOneWidget,
-    );
+    expect(find.widgetWithText(FilledButton, 'Start workout'), findsOneWidget);
   });
 
   testWidgets('confirming a distance preset hands off that goal', (

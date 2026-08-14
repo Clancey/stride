@@ -1,13 +1,35 @@
+import java.util.Properties
+
 plugins {
     id("com.android.application")
     // The Flutter Gradle Plugin must be applied after the Android and Kotlin Gradle plugins.
     id("dev.flutter.flutter-gradle-plugin")
 }
 
+// Release signing material, written by `tools/keystore.sh unlock`. Absent on a fresh clone and in
+// CI, and that is deliberate: the build must still work without the secret. See docs/SIGNING.md.
+val keystoreProperties = Properties().apply {
+    val f = rootProject.file("key.properties")
+    if (f.exists()) f.inputStream().use { load(it) }
+}
+
 android {
     namespace = "io.stride.spikes"
     compileSdk = flutter.compileSdkVersion
     ndkVersion = flutter.ndkVersion
+
+    signingConfigs {
+        // Only declared when the keystore has been unlocked; `findByName("release")` in the
+        // release buildType is what falls back to debug when it has not.
+        if (keystoreProperties.getProperty("storeFile") != null) {
+            create("release") {
+                storeFile = file(keystoreProperties.getProperty("storeFile"))
+                storePassword = keystoreProperties.getProperty("storePassword")
+                keyAlias = keystoreProperties.getProperty("keyAlias")
+                keyPassword = keystoreProperties.getProperty("keyPassword")
+            }
+        }
+    }
 
     compileOptions {
         sourceCompatibility = JavaVersion.VERSION_17
@@ -49,9 +71,28 @@ android {
 
     buildTypes {
         release {
-            // TODO: Add your own signing config for the release build.
-            // Signing with the debug keys for now, so `flutter run --release` works.
-            signingConfig = signingConfigs.getByName("debug")
+            // Explicit rather than relying on Flutter's implicit default, because the shrinker
+            // silently broke this app once already: R8 stripped Room's reflectively-loaded
+            // WorkDatabase_Impl and every release build crashed before reaching Dart. Naming the
+            // rules file here is what makes that fixable and reviewable. See proguard-rules.pro.
+            isMinifyEnabled = true
+            isShrinkResources = true
+            proguardFiles(
+                getDefaultProguardFile("proguard-android-optimize.txt"),
+                "proguard-rules.pro",
+            )
+
+            // Signed with the real Stride release key when it has been unlocked
+            // (`tools/keystore.sh unlock`), and with the debug key otherwise so that a fresh
+            // clone, CI, and `flutter run --release` all still work without the secret.
+            //
+            // This matters more than a normal app: Stride updates itself over the air, and
+            // Android refuses an update signed by a different key than the installed copy. An
+            // APK that is *published* must therefore be a release-key build - see
+            // docs/SIGNING.md. The guard below is what stops an accidentally debug-signed
+            // build from being published as if it were genuine.
+            signingConfig = signingConfigs.findByName("release")
+                ?: signingConfigs.getByName("debug")
         }
     }
 
@@ -90,10 +131,22 @@ dependencies {
     // decodes them directly. See protocol/glassos/README.md.
     implementation("com.squareup.okhttp3:okhttp:4.12.0")
 
+    // WorkManager drives the app store's periodic update check (see appstore/AppstoreWorker.kt). It
+    // is the only scheduler that survives Doze, app-standby, and process death on the Android 8/9
+    // this console runs without asking for a battery-optimisation exemption. 2.9.x is the last line
+    // that still supports minSdk 21-26 comfortably and needs no androidx.startup opt-in beyond the
+    // default initializer.
+    implementation("androidx.work:work-runtime-ktx:2.9.1")
+
     // The wire decoder is the one place where a silent, single-digit mistake turns into a wrong
     // number on a screen someone is running in front of. It is pure logic with no Android
     // dependency, so it is testable on the JVM against messages actually captured from the machine.
     testImplementation("junit:junit:4.13.2")
+
+    // android.jar's org.json is a stub that throws on every method in unit tests. The catalog parser
+    // (appstore/CatalogManifest.kt) is exactly the code whose rejection cases must be tested, so the
+    // real implementation is supplied for the JVM test classpath only.
+    testImplementation("org.json:json:20240303")
 }
 
 flutter {

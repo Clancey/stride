@@ -8,6 +8,7 @@ import android.os.Looper
 import io.flutter.embedding.android.FlutterActivity
 import io.flutter.embedding.engine.FlutterEngine
 import io.flutter.plugin.common.MethodChannel
+import io.stride.spikes.appstore.AppstoreWorker
 
 class MainActivity : FlutterActivity() {
     companion object {
@@ -70,6 +71,10 @@ class MainActivity : FlutterActivity() {
         // on screen, and whichever comes up first should start reading the machine.
         StrideSettings.attach(applicationContext)
         MachineLink.attach(applicationContext)
+        // The periodic update check is registered here as well as on boot: a console that is never
+        // rebooted (the common case - it is plugged in) would otherwise only ever check once.
+        // enqueueUniquePeriodicWork(KEEP) makes this idempotent.
+        AppstoreWorker.ensureScheduled(applicationContext)
         channel = MethodChannel(flutterEngine.dartExecutor.binaryMessenger, SpikeBridge.CHANNEL).also {
             it.setMethodCallHandler(SpikeBridge(applicationContext))
             registerWorkoutStateListener(it)

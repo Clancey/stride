@@ -1,6 +1,9 @@
+import 'dart:async';
+
 import 'package:flutter/material.dart';
 
 import '../bridge.dart';
+import '../model/appstore.dart';
 import '../theme/stride_tokens.dart';
 import '../widgets/stride_sheet.dart';
 import '../widgets/app_models.dart';
@@ -13,6 +16,7 @@ import '../model/workout_goal.dart';
 import 'all_apps.dart';
 import 'diagnostics_home.dart';
 import 'start_workout.dart';
+import 'updates_sheet.dart';
 
 class LauncherHome extends StatefulWidget {
   const LauncherHome({super.key});
@@ -33,6 +37,8 @@ class LauncherHomeState extends State<LauncherHome> {
   String? _error;
   String? _overlayStatus;
   WorkoutGoal _goal = const WorkoutGoal.none();
+  AppstoreStatus _appstore = AppstoreStatus.empty;
+  Timer? _appstorePoll;
 
   @override
   void initState() {
@@ -42,6 +48,14 @@ class LauncherHomeState extends State<LauncherHome> {
     _loadGoal();
     _ensureOverlay();
     _workout.addListener(_syncGoalWithSession);
+    _refreshAppstore();
+    // Slow on purpose. The badge only has to be right the next time someone
+    // looks at the launcher; the service is what keeps the console current, and
+    // polling it hard would burn cycles on a screen that is usually idle.
+    _appstorePoll = Timer.periodic(
+      const Duration(seconds: 30),
+      (_) => _refreshAppstore(),
+    );
   }
 
   /// Ending a workout clears its goal on the platform side, because the goal
@@ -53,6 +67,7 @@ class LauncherHomeState extends State<LauncherHome> {
 
   @override
   void dispose() {
+    _appstorePoll?.cancel();
     _workout.removeListener(_syncGoalWithSession);
     _profiles.dispose();
     _workout.dispose();
@@ -120,6 +135,20 @@ class LauncherHomeState extends State<LauncherHome> {
     ).showSnackBar(SnackBar(content: Text(message)));
   }
 
+  /// Reads the app store snapshot for the header badge. Never throws: an update
+  /// service that cannot reach its catalog must not take the launcher with it.
+  Future<void> _refreshAppstore() async {
+    final raw = await SpikeBridge.appstoreStatus();
+    if (!mounted) return;
+    setState(() => _appstore = AppstoreStatus.fromMap(raw));
+  }
+
+  Future<void> _openUpdates() async {
+    await showUpdatesSheet(context);
+    if (!mounted) return;
+    await _refreshAppstore();
+  }
+
   List<LaunchableApp> _pinnedApps() {
     final byPackage = <String, LaunchableApp>{
       for (final app in _apps) app.package: app,
@@ -167,6 +196,8 @@ class LauncherHomeState extends State<LauncherHome> {
                       onSettings: _openSettings,
                       onGoal: _startWorkoutFlow,
                       goal: _goal,
+                      updateCount: _appstore.pendingCount,
+                      onUpdates: _openUpdates,
                     ),
                     const SizedBox(height: StrideSpace.lg),
                     Expanded(
@@ -226,6 +257,12 @@ class LauncherHomeState extends State<LauncherHome> {
           profiles: _profiles,
           iconCache: _iconCache,
           onLaunch: _launch,
+          // Installing from the store changes what the launcher itself shows:
+          // the pinned row, and the update badge that just lost an entry.
+          onAppsChanged: () async {
+            await _loadApps();
+            await _refreshAppstore();
+          },
         ),
       ),
     );
@@ -301,7 +338,8 @@ class LauncherHomeState extends State<LauncherHome> {
       running = status['running'] == true;
       if (!running) running = await SpikeBridge.startOverlay();
       if (!running) {
-        message = "Stride's controls can't appear over other apps yet. "
+        message =
+            "Stride's controls can't appear over other apps yet. "
             'Grant "Draw over other apps" above.';
       }
     } catch (_) {
@@ -358,6 +396,8 @@ class _LauncherHeader extends StatelessWidget {
     required this.onSettings,
     required this.onGoal,
     required this.goal,
+    required this.updateCount,
+    required this.onUpdates,
   });
 
   final VoidCallback onAllApps;
@@ -365,6 +405,10 @@ class _LauncherHeader extends StatelessWidget {
   final VoidCallback onSettings;
   final VoidCallback onGoal;
   final WorkoutGoal goal;
+
+  /// Updates waiting to be installed, including Stride's own.
+  final int updateCount;
+  final VoidCallback onUpdates;
 
   @override
   Widget build(BuildContext context) {
@@ -404,6 +448,27 @@ class _LauncherHeader extends StatelessWidget {
           icon: const Icon(Icons.apps_outlined),
           label: const Text('All apps'),
         ),
+        const SizedBox(width: StrideSpace.sm),
+        // Quiet when there is nothing to do, and never louder than the goal or
+        // overlay controls next to it: an update badge must not compete with
+        // the two things that matter while someone is standing on a belt.
+        if (updateCount > 0)
+          FilledButton.icon(
+            style: FilledButton.styleFrom(
+              minimumSize: const Size(0, StrideSpace.minTouch),
+              backgroundColor: StrideColors.info,
+              foregroundColor: StrideColors.ink,
+            ),
+            onPressed: onUpdates,
+            icon: const Icon(Icons.system_update_alt_rounded),
+            label: Text('Updates ($updateCount)'),
+          )
+        else
+          IconButton(
+            tooltip: 'Updates',
+            onPressed: onUpdates,
+            icon: const Icon(Icons.system_update_alt_rounded),
+          ),
         const SizedBox(width: StrideSpace.sm),
         IconButton(
           tooltip: 'Settings',

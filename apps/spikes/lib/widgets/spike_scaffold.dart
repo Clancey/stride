@@ -31,9 +31,9 @@ class SpikeScaffold extends StatelessWidget {
             icon: const Icon(Icons.copy_all_outlined),
             onPressed: () {
               Clipboard.setData(ClipboardData(text: log.join('\n')));
-              ScaffoldMessenger.of(context).showSnackBar(
-                const SnackBar(content: Text('Log copied')),
-              );
+              ScaffoldMessenger.of(
+                context,
+              ).showSnackBar(const SnackBar(content: Text('Log copied')));
             },
           ),
         ],
@@ -44,7 +44,10 @@ class SpikeScaffold extends StatelessWidget {
             padding: const EdgeInsets.fromLTRB(16, 8, 16, 0),
             child: Align(
               alignment: Alignment.centerLeft,
-              child: Text(question, style: Theme.of(context).textTheme.bodySmall),
+              child: Text(
+                question,
+                style: Theme.of(context).textTheme.bodySmall,
+              ),
             ),
           ),
           Padding(
@@ -88,8 +91,8 @@ class LogView extends StatelessWidget {
               color: isFail
                   ? Theme.of(context).colorScheme.error
                   : isPass
-                      ? Theme.of(context).colorScheme.primary
-                      : null,
+                  ? Theme.of(context).colorScheme.primary
+                  : null,
             ),
           ),
         );

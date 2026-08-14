@@ -58,11 +58,11 @@ class _HudInsetState extends State<HudInset> {
     // system bars, so the two are alternatives rather than additions — summing them would push
     // content twice as far in and leave a visible dead band.
     EdgeInsets merge(EdgeInsets base) => EdgeInsets.fromLTRB(
-          math.max(base.left, hud.left),
-          math.max(base.top, hud.top),
-          math.max(base.right, hud.right),
-          math.max(base.bottom, hud.bottom),
-        );
+      math.max(base.left, hud.left),
+      math.max(base.top, hud.top),
+      math.max(base.right, hud.right),
+      math.max(base.bottom, hud.bottom),
+    );
 
     return MediaQuery(
       data: media.copyWith(

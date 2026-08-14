@@ -20,6 +20,7 @@ import android.util.LruCache
 import android.view.KeyEvent
 import io.flutter.plugin.common.MethodCall
 import io.flutter.plugin.common.MethodChannel
+import io.stride.spikes.appstore.AppstoreBridge
 import java.io.ByteArrayOutputStream
 import java.util.Locale
 import java.util.concurrent.Executors
@@ -40,6 +41,7 @@ private fun Long.toChannelInt(): Int =
 class SpikeBridge(private val context: Context) : MethodChannel.MethodCallHandler {
     private val mainHandler = Handler(Looper.getMainLooper())
     private val systemAudio = SystemAudio(context)
+    private val appstore = AppstoreBridge(context)
     private val iconExecutor = Executors.newSingleThreadExecutor { runnable ->
         Thread(runnable, "StrideIconRenderer")
     }
@@ -179,6 +181,21 @@ class SpikeBridge(private val context: Context) : MethodChannel.MethodCallHandle
                 "foregroundPackage" -> result.success(StrideAccessibilityService.foregroundPackage)
 
                 "launchApp" -> result.success(launchApp(call.argument<String>("package")!!))
+
+                // --- appstore: catalog, updates, installs (see appstore/StrideAppstoreService) ---
+                "appstoreStatus" -> result.success(appstore.status())
+                "appstoreCheckNow" -> result.success(appstore.checkNow())
+                "appstoreInstall" -> result.success(
+                    appstore.install(call.argument<String>("package")!!)
+                )
+                "appstoreCancel" -> result.success(appstore.cancel(call.argument<String>("package")!!))
+                "appstoreSetupChecklist" -> result.success(appstore.setupChecklist())
+                "appstoreCanRequestInstalls" -> result.success(appstore.canRequestInstalls())
+                "appstoreOpenInstallPermission" -> result.success(appstore.openInstallPermission())
+                "appstoreCatalogUrl" -> result.success(appstore.catalogUrl())
+                "appstoreSetCatalogUrl" -> result.success(
+                    appstore.setCatalogUrl(call.argument<String>("url")!!)
+                )
 
                 else -> result.notImplemented()
             }

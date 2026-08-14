@@ -5,6 +5,7 @@ import android.content.Context
 import android.content.Intent
 import android.os.Build
 import android.provider.Settings
+import io.stride.spikes.appstore.AppstoreWorker
 
 /**
  * S3 spike: "does the overlay survive reboot?"
@@ -20,6 +21,11 @@ import android.provider.Settings
 class BootReceiver : BroadcastReceiver() {
     override fun onReceive(context: Context, intent: Intent) {
         if (intent.action != Intent.ACTION_BOOT_COMPLETED) return
+
+        // The update check is scheduled first and unconditionally: it does not depend on any
+        // permission the user might not have granted, and a console whose overlay is not yet set up
+        // is exactly the one most likely to be running an old build.
+        AppstoreWorker.ensureScheduled(context)
 
         // Only bother if the overlay permission is actually granted; OverlayService fails soft
         // otherwise, but starting a service just to no-op is wasteful.

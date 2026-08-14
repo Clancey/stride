@@ -32,6 +32,15 @@
     <uses-permission android:name="android.permission.WRITE_SECURE_SETTINGS"
         tools:ignore="ProtectedPermissions"/>
 
+    <!-- App store: the update checker only runs when there is a network, and WorkManager needs to
+         read that state to honour its NetworkType.CONNECTED constraint. -->
+    <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE"/>
+    <!-- App store: install APKs through PackageInstaller. API 26 replaced the global "unknown
+         sources" toggle with this per-app permission; the user still confirms every single install,
+         so this grants the right to *ask*, not the right to install silently. Grant with:
+         adb shell appops set io.stride.spikes REQUEST_INSTALL_PACKAGES allow -->
+    <uses-permission android:name="android.permission.REQUEST_INSTALL_PACKAGES"/>
+
     <!-- S4 app enumeration under targetSdk 30+ package-visibility filtering.
          This <queries> block restores visibility of exactly the things the launcher legitimately
          resolves: MAIN/LAUNCHER + MAIN/LEANBACK_LAUNCHER (the app grid, incl. TV-only apps),
@@ -113,6 +122,32 @@
             android:exported="true">
             <intent-filter>
                 <action android:name="android.intent.action.BOOT_COMPLETED"/>
+            </intent-filter>
+        </receiver>
+
+        <!-- App store: fetches the catalog, downloads and verifies artifacts, and drives
+             PackageInstaller. Foreground because the work must continue while the rider is inside
+             Spotify and the Flutter engine is dead. "specialUse" for the same reason the overlay is:
+             it is neither media nor location nor any other predefined category.
+             SAFETY: this service has no motor path. It reads WorkoutSession state only, to avoid
+             raising a full-screen install dialog over the stop control while the belt is moving. -->
+        <service
+            android:name="io.stride.spikes.appstore.StrideAppstoreService"
+            android:exported="false"
+            android:foregroundServiceType="specialUse">
+            <property
+                android:name="android.app.PROPERTY_SPECIAL_USE_FGS_SUBTYPE"
+                android:value="Background app catalog and update installer for a sideload-only console with no app store. Never commands the motor."/>
+        </service>
+
+        <!-- App store: where PackageInstaller session results land, including the
+             STATUS_PENDING_USER_ACTION confirmation intent. Not exported - only the platform's own
+             PendingIntent targets it. -->
+        <receiver
+            android:name="io.stride.spikes.appstore.InstallResultReceiver"
+            android:exported="false">
+            <intent-filter>
+                <action android:name="io.stride.spikes.appstore.INSTALL_STATUS"/>
             </intent-filter>
         </receiver>
 
