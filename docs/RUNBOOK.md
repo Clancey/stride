@@ -323,7 +323,7 @@ sees the card.
 **`tools/deploy.sh` does all of this for you** — build, install, grant, verify, launch:
 
 ```bash
-tools/deploy.sh              # defaults to 192.168.10.51:33359
+tools/deploy.sh              # defaults to 192.168.10.51:45557
 tools/deploy.sh <ip>:<port>  # the wireless-debugging port changes on reboot
 ```
 
@@ -335,8 +335,14 @@ to fix a grant, **Stride's own Back and Home buttons are not on screen there.** 
 no physical buttons that is a one-way trip into Settings.
 
 This is why self-repair matters more than a better prompt: with `WRITE_SECURE_SETTINGS` granted,
-"Fix this" repairs the grant in place and never opens Settings at all. If you do end up stranded in
-Settings, from the host:
+"Fix this" repairs the grant in place and never opens Settings at all.
+
+On the console itself, the way back is the **notification shade** — a system window, so it survives
+where our overlay does not. Swipe down, tap "Stride is running". That notification is the escape
+hatch, which is why its channel is `IMPORTANCE_LOW` rather than `MIN` (MIN can be collapsed out of
+sight) and why the Settings button in Stride's own settings screen says so before you tap it.
+
+From the host, if you are wedged:
 
 ```bash
 adb shell am start -n io.stride.spikes/.MainActivity

@@ -8,13 +8,13 @@
 # The grant that matters most is WRITE_SECURE_SETTINGS: it cannot be granted by any dialog, only
 # from here, and once held Stride puts the other two back by itself (StridePermissions.repair).
 #
-#   tools/deploy.sh [device]        # default: 192.168.10.51:33359
+#   tools/deploy.sh [device]        # default: 192.168.10.51:45557
 #
 # The wireless-debugging port changes on reboot. `adb devices` will tell you the new one.
 
 set -euo pipefail
 
-DEVICE="${1:-192.168.10.51:33359}"
+DEVICE="${1:-192.168.10.51:45557}"
 PKG="io.stride.spikes"
 SERVICE="$PKG/$PKG.StrideAccessibilityService"
 LISTENER="$PKG/$PKG.StrideNotificationListener"

@@ -350,6 +350,17 @@ app's permission pages (the standard anti-tapjacking defence). So Stride's Back 
 screen* in exactly the place we would send someone to fix a grant — a one-way trip into Settings on
 a console with no buttons. This is the main reason self-repair is preferred over a better prompt.
 
+The way out is the notification shade, which is a system window and stays reachable where our
+overlay does not. The overlay's foreground-service notification ("Stride is running — tap to return
+to the launcher") is therefore load-bearing, not decoration: it is the only route home from Settings.
+Its channel is `IMPORTANCE_LOW`, not `MIN`, because MIN can be collapsed out of sight.
+
+**Verified on hardware (2026-08-14).** `pm grant WRITE_SECURE_SETTINGS` is accepted on this firmware
+— the assumption the whole design rested on. Deleting `enabled_accessibility_services` and
+relaunching Stride restored it unaided, with no setup card shown, and Back then physically worked
+from inside Jellyfin. Note `adb install -r` *preserved* the grant on that run: the reinstall wipe is
+non-deterministic, so the failure has to be forced by hand to test it.
+
 #### The overlay has no off switch
 
 It briefly had one, in the launcher header, backed by a saved preference. That was a mistake: the
