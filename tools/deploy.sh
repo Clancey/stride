@@ -23,6 +23,15 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 adb() { command adb -s "$DEVICE" "$@"; }
 
 echo "==> building release apk"
+if [ ! -f "$ROOT/apps/spikes/android/key.properties" ]; then
+  # The build falls back to the debug key here, which is fine for your own console and fatal for
+  # anyone else's: Android refuses an update signed by a different key, so a debug-signed build can
+  # never be updated in place. The tester has to uninstall and loses profiles, pins, and goals.
+  echo "WARNING: no key.properties, so this builds with the DEBUG key."
+  echo "         Fine for your own console. Do not hand this build to anyone else -- it can never"
+  echo "         self-update, and they lose their data when they have to uninstall."
+  echo "         Run tools/keystore.sh unlock first. See docs/SIGNING.md."
+fi
 (cd "$ROOT/apps/spikes" && flutter build apk --release)
 
 echo "==> installing to $DEVICE"
