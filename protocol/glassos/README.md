@@ -175,6 +175,66 @@ If we later ship our own credential path, nothing above changes except where the
 - Whether GlassOS is exclusive-client, i.e. whether a second client disturbs `com.ifit.rivendell`'s
   session. Read-only calls succeeded while iFit was installed and idle; this has **not** been
   tested during a live workout and must not be tested while anyone is on the belt.
-- What the metric services return mid-workout. Everything above was measured at `IDLE`, so the
-  populated shape of these messages is still unobserved.
 - Whether the belt keeps moving if a controlling client dies.
+
+## Measured during a live workout, 2026-08-13
+
+Run on an **empty** treadmill, with the user present and the machine's own controls to hand.
+
+**`StartNewWorkout(Empty)` moves the belt.** It is not a passive session start. It took the console
+`IDLE → WARM_UP → WORKOUT` and started the belt at `minKph` (1.609 kph = 1.0 mph) with no speed
+command sent at all. Anything in Stride that calls it must treat it as a motor command, with the
+same gating as `SetSpeed`.
+
+**`WorkoutService/Stop(Empty)` halts it cleanly**, returning `{"success": true}`, and the console
+settles `WORKOUT → WORKOUT_RESULTS → IDLE` with the speed field absent again.
+
+Telemetry populated exactly as hoped, streaming at roughly 2 Hz:
+
+```json
+{"workoutID":"d3a3a6d8-…","timeSeconds":36,"lastDistanceKm":0.016540491104125976,
+ "remainingDistanceKm":19.304549550411686}
+{"workoutID":"d3a3a6d8-…","timeSeconds":36,"lastKph":1.609344482421875,
+ "maxKph":1.6093444978925633,"avgKph":1.6093442159540512}
+```
+
+Distance accrues at 0.000447 km/s, which is exactly 1.609 kph. **Distance is real, measured, and
+does not have to be derived** from elapsed time against an assumed speed.
+
+### The discriminator that makes honest rendering possible
+
+Over the same 36 seconds, `InclineSubscription` delivered 39 messages, and **not one contained an
+incline field**:
+
+```json
+{"workoutID":"d3a3a6d8-b50b-406c-8e46-98b1485cf276"}
+```
+
+Incline was a real, measured `0%`. proto3 dropped it precisely *because* it was zero, and the
+message is field-for-field indistinguishable from the `IDLE` case where we know nothing.
+
+`workoutID` resolves it. GlassOS stamps it on every metric message belonging to a live workout and
+omits it otherwise, so:
+
+- `CanRead` false → **unknown**, whatever else arrives.
+- `workoutID` absent + value absent → **unknown**; nothing is being measured.
+- `workoutID` present + value absent → **genuine zero**.
+- `NaN` → **unknown**; GlassOS uses it for "no figure".
+
+This rule is implemented once, with the evidence attached, in
+`apps/spikes/android/app/src/main/kotlin/io/stride/spikes/GlassOsTelemetry.kt`. Parse through it
+rather than reimplementing the reasoning at each call site.
+
+### The machine describes its own limits
+
+`ConsoleService/GetConsole` returns, among 50+ fields:
+
+```
+machineType = TREADMILL      modelNumber = 17125
+maxKph = 19.313 (12.0 mph)   minKph = 1.608 (1.0 mph)
+maxInclinePercent = 12       minInclinePercent = -3
+canSetSpeed = true           canSetIncline = true
+```
+
+This is Stride's `ControlRanges`, straight from the machine. Note `minKph`: inside a workout there
+is no zero speed, so the speed rail correctly starts at 1 mph rather than 0.
