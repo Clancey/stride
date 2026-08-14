@@ -25,6 +25,15 @@ void main() {
     expect(find.text('Controls locked'), findsNothing);
     expect(find.text('Start workout'), findsOneWidget);
     expect(find.text('Media volume'), findsOneWidget);
+    // No off switch for the overlay, deliberately. It carries Back and Home on a console with no
+    // physical buttons and is the only way to pause a workout once an app is full-screen, so a
+    // one-tap control that could remove it was a way to strand the rider. Hide/show on the bottom
+    // bar is the control that stays.
+    expect(find.text('Overlay on'), findsNothing);
+    expect(find.text('Turn overlay on'), findsNothing);
+    expect(find.text('All apps'), findsOneWidget);
+    expect(find.byTooltip('Settings'), findsOneWidget);
+    expect(find.byTooltip('Diagnostics'), findsOneWidget);
     // With no host attached the machine is unreadable, so the honest sentence is the one about
     // reading. Printing the control warning here too would claim we are reading the machine at the
     // exact moment we are not, and safety copy that is obviously wrong in the easy case is not

@@ -249,6 +249,26 @@ Responsibilities:
 - **Safety-key latch.** A safety-key removal latches a stopped state requiring explicit local reset;
   it cannot be cleared by a companion app or a queued command.
 
+**Built so far** (`MachineCoordinator.kt`, driving the real machine over GlassOS):
+
+| Responsibility | State |
+|---|---|
+| Serialized command queue, one in flight | ✅ `submit` / `drain` on a single worker |
+| Absolute clamps (1.0–12.0 mph, −3 to 12 %) | ✅ transcribed constants, deliberately not read at runtime |
+| Slew limiting | ✅ speed ramps in generation-checked steps |
+| Stop preemption | ✅ `stop()` bumps the generation *before* queueing, so queued work is discarded — but the mid-ramp case is **not yet exercised on hardware** |
+| Generation IDs | ✅ every job carries one; `Outcome.Superseded` is a normal result, not an error |
+| Command ack + timeout | ✅ `COMMAND_TIMEOUT_S = 12` for commands, 2 s for reads so a stalled console degrades to "no reading" instead of freezing the overlay |
+| Telemetry watchdog | ❌ not built |
+| Attach-to-moving-machine recovery | ✅ adopts a workout already running on the console rather than assuming idle |
+| Safety-key latch | ❌ not built — the key is still the only true stop, and the UI says so |
+
+Two protocol facts that cost real time and must not be re-derived: `StartNewWorkout` replies with
+`StartWorkoutResponse { WorkoutResult result = 1; string workoutID = 2 }`, **not** a bare
+`WorkoutResult` — reading field 1 as an error made every successful start look like a refusal.
+And GlassOS **only publishes telemetry while a workout is active**, which is the whole explanation
+for months of "Not measured". Both are pinned by tests in `GlassOsCommandEncodingTest`.
+
 ### 3.2 Launcher app (Android specifics)
 
 Flutter for UI; a Kotlin layer for everything Flutter can't reach.
@@ -300,6 +320,43 @@ adb shell settings put secure accessibility_enabled 1
 ```
 
 Whether this sticks across reboot on this firmware is **S10**.
+
+#### Resolved: the grant does not stick, so Stride restores it itself
+
+S10's real answer turned out to be worse than "does it survive a reboot". **Android clears
+`enabled_accessibility_services` on reinstall** — observed repeatedly on this console, and once from
+uninstalling an entirely unrelated app. Back and Recents then fail *silently*: no error, no log the
+rider can see, the button simply does nothing. On a machine with no physical buttons that means
+discovering it while stranded inside a full-screen video app.
+
+Two mechanisms, in order:
+
+1. **Self-repair.** Stride declares `WRITE_SECURE_SETTINGS` — development-tier, so it can only be
+   granted once over adb, and it then survives reinstalls because the app keeps declaring it. With
+   it held, `StridePermissions.repair()` re-adds Stride's own component on overlay start, on
+   launcher resume, and on the first press of a Back button that is not working. It **only ever
+   appends**: those lists are shared with every other app, and dropping someone else's service to
+   fix ours would be the worse bug (`SecureListMergeTest`).
+2. **Ask, and keep asking.** Without the grant, a non-dismissible setup card on the launcher watches
+   HOME plus all three grants, names the missing one in the rider's terms, and deep-links to it. It
+   cannot be waved away, because a prompt that can be permanently dismissed will be — and then there
+   is no Back button and no explanation.
+
+A failed Back is never silent: it repairs if it can, and otherwise raises a dialog over whatever app
+is running with the fix one tap away.
+
+**Trap worth recording:** Android deliberately hides non-system overlay windows over the Settings
+app's permission pages (the standard anti-tapjacking defence). So Stride's Back and Home are *not on
+screen* in exactly the place we would send someone to fix a grant — a one-way trip into Settings on
+a console with no buttons. This is the main reason self-repair is preferred over a better prompt.
+
+#### The overlay has no off switch
+
+It briefly had one, in the launcher header, backed by a saved preference. That was a mistake: the
+overlay carries Back and Home, and it is the only way to pause a workout once an app is full-screen.
+Turning it off strands the rider, and there is no case where they would want to. It is now simply
+started whenever the launcher comes up. Hide/show on the bottom bar remains — that is the control
+riders actually want, and it does not take the way out away.
 
 **Bonus, not incidental:** the same service reports window-state changes, which gives Stride the
 current foreground package for free. That directly improves media ownership tracking (§3.2, Phase 3) and lets
