@@ -39,6 +39,7 @@ class LauncherHomeState extends State<LauncherHome> {
   WorkoutGoal _goal = const WorkoutGoal.none();
   AppstoreStatus _appstore = AppstoreStatus.empty;
   Timer? _appstorePoll;
+  bool _editingPins = false;
 
   @override
   void initState() {
@@ -77,6 +78,7 @@ class LauncherHomeState extends State<LauncherHome> {
   }
 
   void resetToLauncherRoot() {
+    if (_editingPins) setState(() => _editingPins = false);
     if (_pinnedScroll.hasClients) {
       _pinnedScroll.animateTo(
         0,
@@ -159,6 +161,29 @@ class LauncherHomeState extends State<LauncherHome> {
     ];
   }
 
+  /// Moves a pinned app within the grid the rider can actually see.
+  ///
+  /// The visible grid drops packages that are no longer installed, so its
+  /// indices are not the stored ones. Translating through packages keeps a
+  /// dangling pin from silently absorbing the move.
+  Future<void> _reorderPinned(int oldVisible, int newVisible) async {
+    final visible = _pinnedApps();
+    if (oldVisible < 0 || oldVisible >= visible.length) return;
+    final stored = _profiles.active.pinned;
+    final oldIndex = stored.indexOf(visible[oldVisible].package);
+    if (oldIndex == -1) return;
+    final newIndex = newVisible >= visible.length
+        ? stored.length
+        : stored.indexOf(visible[newVisible].package);
+    if (newIndex == -1) return;
+    try {
+      await _profiles.reorderPinned(oldIndex, newIndex);
+    } catch (_) {
+      if (!mounted) return;
+      _showMessage('Could not save the new order');
+    }
+  }
+
   @override
   Widget build(BuildContext context) {
     return Scaffold(
@@ -186,6 +211,7 @@ class LauncherHomeState extends State<LauncherHome> {
               animation: _profiles,
               builder: (context, _) {
                 final pinned = _pinnedApps();
+                final editing = _editingPins && pinned.isNotEmpty;
                 return Column(
                   crossAxisAlignment: CrossAxisAlignment.start,
                   children: [
@@ -216,6 +242,12 @@ class LauncherHomeState extends State<LauncherHome> {
                               onLaunch: _launch,
                               onAllApps: _openAllApps,
                               onUnpin: _confirmUnpin,
+                              editing: editing,
+                              onStartEditing: () =>
+                                  setState(() => _editingPins = true),
+                              onDoneEditing: () =>
+                                  setState(() => _editingPins = false),
+                              onReorder: _reorderPinned,
                             ),
                           ),
                           // Only one workout surface at a time. When the overlay is up it owns the
@@ -353,8 +385,7 @@ class LauncherHomeState extends State<LauncherHome> {
     });
   }
 
-  void _confirmUnpin(LaunchableApp app) {
-    showStrideSheet<void>(
+  void _confirmUnpin(LaunchableApp app) {    showStrideSheet<void>(
       context: context,
       builder: (context) {
         return Padding(
@@ -371,7 +402,7 @@ class LauncherHomeState extends State<LauncherHome> {
               FilledButton.icon(
                 onPressed: () {
                   Navigator.of(context).pop();
-                  _profiles.unpin(app.package);
+                  _unpin(app);
                 },
                 icon: const Icon(Icons.remove_circle_outline),
                 label: const Text('Unpin app'),
@@ -386,6 +417,16 @@ class LauncherHomeState extends State<LauncherHome> {
         );
       },
     );
+  }
+
+  /// Unpinning the last app leaves nothing to arrange, so edit mode ends with
+  /// it rather than lying in wait for the next pin.
+  Future<void> _unpin(LaunchableApp app) async {
+    await _profiles.unpin(app.package);
+    if (!mounted) return;
+    if (_editingPins && _pinnedApps().isEmpty) {
+      setState(() => _editingPins = false);
+    }
   }
 }
 
@@ -496,6 +537,10 @@ class _LauncherPanel extends StatelessWidget {
     required this.onLaunch,
     required this.onAllApps,
     required this.onUnpin,
+    required this.editing,
+    required this.onStartEditing,
+    required this.onDoneEditing,
+    required this.onReorder,
   });
 
   final ProfileStore profiles;
@@ -507,6 +552,10 @@ class _LauncherPanel extends StatelessWidget {
   final Future<void> Function(LaunchableApp app) onLaunch;
   final VoidCallback onAllApps;
   final void Function(LaunchableApp app) onUnpin;
+  final bool editing;
+  final VoidCallback onStartEditing;
+  final VoidCallback onDoneEditing;
+  final void Function(int oldIndex, int newIndex) onReorder;
 
   @override
   Widget build(BuildContext context) {
@@ -521,10 +570,29 @@ class _LauncherPanel extends StatelessWidget {
           //
           // No "Pin more" button here either: the Add app tile in the grid does the same job at
           // the point the rider is already looking, and the header still has All apps.
-          Text(
-            'Pinned apps',
-            style: Theme.of(context).textTheme.headlineMedium,
+          Row(
+            children: [
+              Expanded(
+                child: Text(
+                  editing ? 'Arrange apps' : 'Pinned apps',
+                  style: Theme.of(context).textTheme.headlineMedium,
+                ),
+              ),
+              if (editing)
+                FilledButton.icon(
+                  onPressed: onDoneEditing,
+                  icon: const Icon(Icons.check),
+                  label: const Text('Done'),
+                ),
+            ],
           ),
+          if (editing) ...[
+            const SizedBox(height: StrideSpace.xs),
+            const Text(
+              'Hold an app to move it. Tap ✕ to unpin.',
+              style: TextStyle(color: StrideColors.textMuted),
+            ),
+          ],
           const SizedBox(height: StrideSpace.md),
           Expanded(child: _pinnedBody()),
         ],
@@ -563,19 +631,144 @@ class _LauncherPanel extends StatelessWidget {
             spacing: AppTileMetrics.gutter,
             runSpacing: AppTileMetrics.gutter,
             children: [
-              for (final app in pinned)
-                AppTile(
-                  app: app,
-                  iconCache: iconCache,
-                  pinned: true,
-                  onLaunch: () => onLaunch(app),
-                  onLongPress: () => onUnpin(app),
+              for (var index = 0; index < pinned.length; index++)
+                _ReorderableSlot(
+                  index: index,
+                  onReorder: onReorder,
+                  onDragStarted: onStartEditing,
+                  child: AppTile(
+                    app: pinned[index],
+                    iconCache: iconCache,
+                    pinned: true,
+                    highlighted: editing,
+                    onLaunch: editing ? () {} : () => onLaunch(pinned[index]),
+                    onRemove: editing ? () => onUnpin(pinned[index]) : null,
+                  ),
                 ),
-              AddAppTile(onPressed: onAllApps),
+              if (editing)
+                _ReorderableSlot(
+                  index: pinned.length,
+                  onReorder: onReorder,
+                  draggable: false,
+                  child: const _EndOfGridSlot(),
+                )
+              else
+                AddAppTile(onPressed: onAllApps),
             ],
           ),
         );
       },
+    );
+  }
+}
+
+/// One grid position that can both be picked up and dropped onto.
+///
+/// The pick-up is a long press, which is also what turns on edit mode: the
+/// rider's first hold both arms the grid and carries the app, instead of
+/// making them hold, wait for a mode to appear, and then start over.
+///
+/// Drop index semantics match [ProfileStore.reorderPinned]: the target is the
+/// slot the app should end up in, so dropping a tile on the app to its right
+/// lands it exactly there rather than one short of it.
+class _ReorderableSlot extends StatelessWidget {
+  const _ReorderableSlot({
+    required this.index,
+    required this.onReorder,
+    required this.child,
+    this.onDragStarted,
+    this.draggable = true,
+  });
+
+  final int index;
+  final bool draggable;
+  final void Function(int oldIndex, int newIndex) onReorder;
+  final VoidCallback? onDragStarted;
+  final Widget child;
+
+  @override
+  Widget build(BuildContext context) {
+    return DragTarget<int>(
+      onWillAcceptWithDetails: (details) => details.data != index,
+      onAcceptWithDetails: (details) {
+        final from = details.data;
+        onReorder(from, from < index ? index + 1 : index);
+      },
+      builder: (context, candidate, _) {
+        final target = _DropIndicator(
+          active: candidate.isNotEmpty,
+          child: child,
+        );
+        if (!draggable) return target;
+        // A long press, not a plain drag: the grid scrolls, and stealing every
+        // vertical drag would make a full page of pinned apps unreachable.
+        return LongPressDraggable<int>(
+          data: index,
+          onDragStarted: onDragStarted,
+          dragAnchorStrategy: pointerDragAnchorStrategy,
+          feedback: Transform.translate(
+            offset: Offset(
+              -AppTileMetrics.home.width / 2,
+              -AppTileMetrics.home.height / 2,
+            ),
+            child: Material(color: Colors.transparent, child: child),
+          ),
+          childWhenDragging: Opacity(opacity: 0.3, child: child),
+          child: target,
+        );
+      },
+    );
+  }
+}
+
+class _DropIndicator extends StatelessWidget {
+  const _DropIndicator({required this.active, required this.child});
+
+  final bool active;
+  final Widget child;
+
+  @override
+  Widget build(BuildContext context) {
+    return DecoratedBox(
+      decoration: BoxDecoration(
+        borderRadius: BorderRadius.circular(StrideRadius.lg),
+        border: Border.all(
+          color: active ? StrideColors.accent : Colors.transparent,
+          width: 2,
+        ),
+      ),
+      child: child,
+    );
+  }
+}
+
+/// The trailing drop slot in edit mode, so an app can be moved to the end
+/// without having to land on another tile.
+class _EndOfGridSlot extends StatelessWidget {
+  const _EndOfGridSlot();
+
+  @override
+  Widget build(BuildContext context) {
+    const metrics = AppTileMetrics.home;
+    return SizedBox(
+      width: metrics.width,
+      height: metrics.height,
+      child: Center(
+        child: Container(
+          width: metrics.icon,
+          height: metrics.icon,
+          alignment: Alignment.center,
+          decoration: BoxDecoration(
+            borderRadius: BorderRadius.circular(metrics.icon * 0.24),
+            border: Border.all(color: StrideColors.line),
+          ),
+          child: const Icon(
+            Icons.south_east,
+            color: StrideColors.textMuted,
+            semanticLabel: 'Move to end',
+          ),
+        ),
+      ),
     );
   }
 }

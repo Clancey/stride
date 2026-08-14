@@ -50,7 +50,9 @@ class AppTile extends StatelessWidget {
     required this.pinned,
     required this.onLaunch,
     this.onPinToggle,
+    this.onRemove,
     this.onLongPress,
+    this.highlighted = false,
     this.metrics = AppTileMetrics.home,
   });
 
@@ -59,7 +61,15 @@ class AppTile extends StatelessWidget {
   final bool pinned;
   final VoidCallback onLaunch;
   final VoidCallback? onPinToggle;
+
+  /// Shows a remove badge instead of the pin badge. Used by the home grid's
+  /// edit mode, where unpinning is the only destructive act on offer.
+  final VoidCallback? onRemove;
   final VoidCallback? onLongPress;
+
+  /// Lifts the tile onto a filled surface so a grid being rearranged reads as
+  /// a set of movable pieces rather than a set of buttons.
+  final bool highlighted;
   final AppTileMetrics metrics;
 
   @override
@@ -68,7 +78,7 @@ class AppTile extends StatelessWidget {
       width: metrics.width,
       height: metrics.height,
       child: Material(
-        color: Colors.transparent,
+        color: highlighted ? StrideColors.panelHigh : Colors.transparent,
         borderRadius: BorderRadius.circular(StrideRadius.lg),
         child: InkWell(
           borderRadius: BorderRadius.circular(StrideRadius.lg),
@@ -88,6 +98,7 @@ class AppTile extends StatelessWidget {
                   size: metrics.icon,
                   pinned: pinned,
                   onPinToggle: onPinToggle,
+                  onRemove: onRemove,
                 ),
                 const SizedBox(height: StrideSpace.sm),
                 SizedBox(
@@ -121,6 +132,7 @@ class _Mark extends StatelessWidget {
     required this.size,
     required this.pinned,
     required this.onPinToggle,
+    required this.onRemove,
   });
 
   final LaunchableApp app;
@@ -128,16 +140,34 @@ class _Mark extends StatelessWidget {
   final double size;
   final bool pinned;
   final VoidCallback? onPinToggle;
+  final VoidCallback? onRemove;
 
   @override
   Widget build(BuildContext context) {
     final icon = AppIconMark(app: app, iconCache: iconCache, size: size);
-    if (onPinToggle == null) {
+    final badge = onRemove != null
+        ? _Badge(
+            onTap: onRemove!,
+            background: StrideColors.danger,
+            icon: Icons.close,
+            foreground: StrideColors.ink,
+            semanticLabel: 'Unpin ${app.label}',
+          )
+        : onPinToggle != null
+        ? _Badge(
+            onTap: onPinToggle!,
+            background: pinned ? StrideColors.accent : StrideColors.panelHigh,
+            icon: pinned ? Icons.push_pin : Icons.push_pin_outlined,
+            foreground: pinned ? StrideColors.ink : StrideColors.text,
+            semanticLabel: pinned ? 'Unpin ${app.label}' : 'Pin ${app.label}',
+          )
+        : null;
+    if (badge == null) {
       return icon;
     }
-    // The pin rides on the icon's corner rather than splitting the tile in two.
-    // Launching is the common act; pinning is the occasional one, and it should
-    // not cost half the tile.
+    // The badge rides on the icon's corner rather than splitting the tile in
+    // two. Launching is the common act; pinning is the occasional one, and it
+    // should not cost half the tile.
     return SizedBox(
       width: size + StrideSpace.md,
       height: size + StrideSpace.xs,
@@ -145,30 +175,48 @@ class _Mark extends StatelessWidget {
         clipBehavior: Clip.none,
         children: [
           Positioned(left: 0, top: StrideSpace.xs, child: icon),
-          Positioned(
-            right: 0,
-            top: 0,
-            child: Material(
-              color: pinned ? StrideColors.accent : StrideColors.panelHigh,
-              shape: const CircleBorder(
-                side: BorderSide(color: StrideColors.ink, width: 2),
-              ),
-              clipBehavior: Clip.antiAlias,
-              child: InkWell(
-                onTap: onPinToggle,
-                child: SizedBox(
-                  width: 38,
-                  height: 38,
-                  child: Icon(
-                    pinned ? Icons.push_pin : Icons.push_pin_outlined,
-                    size: 20,
-                    color: pinned ? StrideColors.ink : StrideColors.text,
-                  ),
-                ),
-              ),
-            ),
-          ),
+          Positioned(right: 0, top: 0, child: badge),
         ],
+      ),
+    );
+  }
+}
+
+class _Badge extends StatelessWidget {
+  const _Badge({
+    required this.onTap,
+    required this.background,
+    required this.foreground,
+    required this.icon,
+    required this.semanticLabel,
+  });
+
+  final VoidCallback onTap;
+  final Color background;
+  final Color foreground;
+  final IconData icon;
+  final String semanticLabel;
+
+  @override
+  Widget build(BuildContext context) {
+    return Material(
+      color: background,
+      shape: const CircleBorder(
+        side: BorderSide(color: StrideColors.ink, width: 2),
+      ),
+      clipBehavior: Clip.antiAlias,
+      child: InkWell(
+        onTap: onTap,
+        child: SizedBox(
+          width: 38,
+          height: 38,
+          child: Icon(
+            icon,
+            size: 20,
+            color: foreground,
+            semanticLabel: semanticLabel,
+          ),
+        ),
       ),
     );
   }
