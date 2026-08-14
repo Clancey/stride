@@ -1,10 +1,12 @@
 import 'package:flutter/material.dart';
 
 import '../bridge.dart';
+import '../model/overlay_prefs.dart';
 import '../theme/stride_tokens.dart';
 import '../widgets/app_models.dart';
 import '../widgets/app_tile.dart';
 import '../model/profile_store.dart';
+import '../model/workout_controller.dart';
 import 'all_apps.dart';
 import 'diagnostics_home.dart';
 
@@ -17,22 +19,30 @@ class LauncherHome extends StatefulWidget {
 
 class LauncherHomeState extends State<LauncherHome> {
   final ProfileStore _profiles = ProfileStore();
+  final WorkoutController _workout = WorkoutController();
+  final OverlayPrefs _overlayPrefs = OverlayPrefs();
   final AppIconCache _iconCache = AppIconCache();
   final ScrollController _pinnedScroll = ScrollController();
 
   List<LaunchableApp> _apps = const <LaunchableApp>[];
   bool _loading = true;
+  bool _overlayLoading = true;
+  bool _overlayRunning = false;
   String? _error;
+  String? _overlayStatus;
 
   @override
   void initState() {
     super.initState();
     _loadApps();
+    _workout.load();
+    _loadOverlayPreference();
   }
 
   @override
   void dispose() {
     _profiles.dispose();
+    _workout.dispose();
     _pinnedScroll.dispose();
     super.dispose();
   }
@@ -137,6 +147,10 @@ class LauncherHomeState extends State<LauncherHome> {
                     _LauncherHeader(
                       onAllApps: _openAllApps,
                       onDiagnostics: _openDiagnostics,
+                      overlayRunning: _overlayRunning,
+                      overlayLoading: _overlayLoading,
+                      onEnableOverlay: _enableOverlay,
+                      onDisableOverlay: _confirmDisableOverlay,
                     ),
                     const SizedBox(height: StrideSpace.lg),
                     Expanded(
@@ -159,13 +173,22 @@ class LauncherHomeState extends State<LauncherHome> {
                               onRenameProfile: _showRenameProfileSheet,
                             ),
                           ),
-                          const SizedBox(width: StrideSpace.lg),
-                          Expanded(
-                            flex: 4,
-                            child: _WorkoutPanel(
-                              onDiagnostics: _openDiagnostics,
+                          // Only one workout surface at a time. When the overlay is up it owns the
+                          // workout entirely, and drawing a second panel behind it produced two
+                          // sets of controls and two safety notices that disagreed with each other
+                          // — the overlay showing live speed while this panel still read
+                          // "Not measured". Contradictory safety copy is worse than none, because
+                          // it teaches the rider to stop believing the notice that matters.
+                          if (!_overlayRunning) ...[
+                            const SizedBox(width: StrideSpace.lg),
+                            Expanded(
+                              flex: 5,
+                              child: _WorkoutPanel(
+                                controller: _workout,
+                                overlayStatus: _overlayStatus,
+                              ),
                             ),
-                          ),
+                          ],
                         ],
                       ),
                     ),
@@ -219,6 +242,133 @@ class LauncherHomeState extends State<LauncherHome> {
     Navigator.of(context).push(
       MaterialPageRoute<void>(builder: (context) => const DiagnosticsHome()),
     );
+  }
+
+  Future<void> _loadOverlayPreference() async {
+    bool running = false;
+    String? message;
+    try {
+      final status = await SpikeBridge.overlayStatus();
+      running = status['running'] == true;
+    } catch (_) {
+      message = 'Overlay bridge unavailable in this environment.';
+    }
+
+    final desired = await _overlayPrefs.readEnabled();
+    if (desired == true && !running) {
+      try {
+        running = await SpikeBridge.startOverlay();
+        message = running
+            ? 'Overlay navigation restored from your saved preference.'
+            : 'Overlay navigation is saved on, but could not start.';
+      } catch (_) {
+        message =
+            'Overlay navigation is saved on, but the bridge is unavailable.';
+      }
+    } else if (desired == null && running) {
+      try {
+        await _overlayPrefs.writeEnabled(true);
+      } catch (_) {
+        message = 'Overlay is running; preference could not be saved.';
+      }
+    }
+
+    if (!mounted) return;
+    setState(() {
+      _overlayRunning = running;
+      _overlayLoading = false;
+      _overlayStatus = message;
+    });
+  }
+
+  Future<void> _enableOverlay() async {
+    setState(() => _overlayLoading = true);
+    try {
+      final ok = await SpikeBridge.startOverlay();
+      if (ok) await _overlayPrefs.writeEnabled(true);
+      if (!mounted) return;
+      setState(() {
+        _overlayRunning = ok;
+        _overlayStatus = ok
+            ? 'Overlay on: Back and Home controls stay visible over apps.'
+            : 'Could not turn overlay on. Check overlay permission in diagnostics.';
+      });
+    } catch (_) {
+      if (!mounted) return;
+      setState(() {
+        _overlayStatus = 'Could not turn overlay on from this environment.';
+      });
+    } finally {
+      if (mounted) setState(() => _overlayLoading = false);
+    }
+  }
+
+  Future<void> _confirmDisableOverlay() async {
+    final confirmed = await showModalBottomSheet<bool>(
+      context: context,
+      backgroundColor: StrideColors.panelRaised,
+      showDragHandle: true,
+      builder: (context) {
+        return SafeArea(
+          child: Padding(
+            padding: const EdgeInsets.all(StrideSpace.lg),
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              crossAxisAlignment: CrossAxisAlignment.stretch,
+              children: [
+                Text(
+                  'Turn off overlay navigation?',
+                  style: Theme.of(context).textTheme.headlineMedium,
+                ),
+                const SizedBox(height: StrideSpace.md),
+                Text(
+                  'Turning off the overlay removes Stride’s on-screen Back and Home controls. '
+                  'While you are inside Netflix or another app, you lose the way back to the '
+                  'launcher from the treadmill console. The physical safety key remains the '
+                  'only true emergency stop.',
+                  style: Theme.of(context).textTheme.bodyLarge,
+                ),
+                const SizedBox(height: StrideSpace.lg),
+                FilledButton.icon(
+                  style: FilledButton.styleFrom(
+                    backgroundColor: StrideColors.warning,
+                    foregroundColor: StrideColors.ink,
+                  ),
+                  onPressed: () => Navigator.of(context).pop(true),
+                  icon: const Icon(Icons.visibility_off_outlined),
+                  label: const Text('Turn overlay off'),
+                ),
+                const SizedBox(height: StrideSpace.sm),
+                OutlinedButton(
+                  onPressed: () => Navigator.of(context).pop(false),
+                  child: const Text('Keep overlay on'),
+                ),
+              ],
+            ),
+          ),
+        );
+      },
+    );
+    if (confirmed == true) await _disableOverlay();
+  }
+
+  Future<void> _disableOverlay() async {
+    setState(() => _overlayLoading = true);
+    try {
+      await SpikeBridge.stopOverlay();
+      await _overlayPrefs.writeEnabled(false);
+      if (!mounted) return;
+      setState(() {
+        _overlayRunning = false;
+        _overlayStatus =
+            'Overlay off: Back and Home controls are no longer on screen.';
+      });
+    } catch (_) {
+      if (!mounted) return;
+      setState(() => _overlayStatus = 'Could not turn overlay off.');
+    } finally {
+      if (mounted) setState(() => _overlayLoading = false);
+    }
   }
 
   Future<void> _renameProfile(String id, String name) async {
@@ -329,10 +479,21 @@ class LauncherHomeState extends State<LauncherHome> {
 }
 
 class _LauncherHeader extends StatelessWidget {
-  const _LauncherHeader({required this.onAllApps, required this.onDiagnostics});
+  const _LauncherHeader({
+    required this.onAllApps,
+    required this.onDiagnostics,
+    required this.overlayRunning,
+    required this.overlayLoading,
+    required this.onEnableOverlay,
+    required this.onDisableOverlay,
+  });
 
   final VoidCallback onAllApps;
   final VoidCallback onDiagnostics;
+  final bool overlayRunning;
+  final bool overlayLoading;
+  final Future<void> Function() onEnableOverlay;
+  final Future<void> Function() onDisableOverlay;
 
   @override
   Widget build(BuildContext context) {
@@ -351,6 +512,36 @@ class _LauncherHeader extends StatelessWidget {
             ],
           ),
         ),
+        SizedBox(
+          width: 216,
+          child: FilledButton.icon(
+            style: FilledButton.styleFrom(
+              minimumSize: const Size(0, StrideSpace.minTouch),
+              backgroundColor: overlayRunning
+                  ? StrideColors.panelHigh
+                  : StrideColors.accent,
+              foregroundColor: overlayRunning
+                  ? StrideColors.text
+                  : StrideColors.ink,
+            ),
+            onPressed: overlayLoading
+                ? null
+                : (overlayRunning ? onDisableOverlay : onEnableOverlay),
+            icon: Icon(
+              overlayRunning
+                  ? Icons.visibility_outlined
+                  : Icons.visibility_off_outlined,
+            ),
+            label: Text(
+              overlayLoading
+                  ? 'Overlay...'
+                  : overlayRunning
+                  ? 'Overlay on'
+                  : 'Turn overlay on',
+            ),
+          ),
+        ),
+        const SizedBox(width: StrideSpace.sm),
         FilledButton.icon(
           onPressed: onAllApps,
           icon: const Icon(Icons.apps_outlined),
@@ -645,49 +836,158 @@ class _ProfilePill extends StatelessWidget {
 }
 
 class _WorkoutPanel extends StatelessWidget {
-  const _WorkoutPanel({required this.onDiagnostics});
+  const _WorkoutPanel({required this.controller, this.overlayStatus});
 
-  final VoidCallback onDiagnostics;
+  final WorkoutController controller;
+  final String? overlayStatus;
 
   @override
   Widget build(BuildContext context) {
-    return _SurfacePanel(
-      highContrast: true,
+    return AnimatedBuilder(
+      animation: controller,
+      builder: (context, _) {
+        return _SurfacePanel(
+          highContrast: true,
+          child: SingleChildScrollView(
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                _WorkoutHeader(state: controller.state),
+                const SizedBox(height: StrideSpace.sm),
+                const _SafetyNotice(
+                  text:
+                      "Stride doesn't control the treadmill. Use the console's own controls or the safety key. Stride can't read the treadmill. The belt may be moving.",
+                ),
+                const SizedBox(height: StrideSpace.sm),
+                _ElapsedHero(elapsedMs: controller.elapsedMs),
+                const SizedBox(height: StrideSpace.sm),
+                Row(
+                  children: [
+                    Expanded(child: _WorkoutActions(controller: controller)),
+                    const SizedBox(width: StrideSpace.sm),
+                    SizedBox(
+                      width: 196,
+                      child: _InlineVolumeControl(controller: controller),
+                    ),
+                  ],
+                ),
+                const SizedBox(height: StrideSpace.sm),
+                _MetricsGrid(machine: controller.machine),
+                const SizedBox(height: StrideSpace.sm),
+                _LockedMachineControls(machine: controller.machine),
+                if (overlayStatus != null) ...[
+                  const SizedBox(height: StrideSpace.md),
+                  Text(
+                    overlayStatus!,
+                    style: Theme.of(context).textTheme.bodySmall,
+                  ),
+                ],
+              ],
+            ),
+          ),
+        );
+      },
+    );
+  }
+}
+
+class _WorkoutHeader extends StatelessWidget {
+  const _WorkoutHeader({required this.state});
+
+  final String state;
+
+  @override
+  Widget build(BuildContext context) {
+    return Row(
+      children: [
+        Expanded(
+          child: Text(
+            'Workout',
+            style: Theme.of(context).textTheme.headlineMedium,
+          ),
+        ),
+        _StatePill(state: state),
+      ],
+    );
+  }
+}
+
+class _StatePill extends StatelessWidget {
+  const _StatePill({required this.state});
+
+  final String state;
+
+  @override
+  Widget build(BuildContext context) {
+    final running = state == 'running';
+    final paused = state == 'paused';
+    return Container(
+      constraints: const BoxConstraints(minHeight: 44),
+      padding: const EdgeInsets.symmetric(
+        horizontal: StrideSpace.md,
+        vertical: StrideSpace.xs,
+      ),
+      decoration: BoxDecoration(
+        color: running
+            ? StrideColors.accent
+            : paused
+            ? StrideColors.warning
+            : StrideColors.panelHigh,
+        borderRadius: BorderRadius.circular(StrideRadius.xl),
+      ),
+      child: Center(
+        child: Text(
+          running
+              ? 'RUNNING'
+              : paused
+              ? 'PAUSED'
+              : 'READY',
+          style: Theme.of(context).textTheme.labelMedium?.copyWith(
+            color: running || paused ? StrideColors.ink : StrideColors.text,
+            fontWeight: FontWeight.w900,
+          ),
+        ),
+      ),
+    );
+  }
+}
+
+class _ElapsedHero extends StatelessWidget {
+  const _ElapsedHero({required this.elapsedMs});
+
+  final int elapsedMs;
+
+  @override
+  Widget build(BuildContext context) {
+    return Container(
+      width: double.infinity,
+      padding: const EdgeInsets.symmetric(
+        horizontal: StrideSpace.sm,
+        vertical: StrideSpace.xxs,
+      ),
+      decoration: BoxDecoration(
+        color: StrideColors.ink,
+        borderRadius: BorderRadius.circular(StrideRadius.lg),
+        border: Border.all(color: StrideColors.accentStrong, width: 1.4),
+      ),
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.start,
         children: [
-          const Icon(
-            Icons.sensors_off_outlined,
-            size: 48,
-            color: StrideColors.warning,
-          ),
-          const SizedBox(height: StrideSpace.md),
-          Text(
-            'Machine not connected',
-            style: Theme.of(context).textTheme.headlineMedium,
-          ),
-          const SizedBox(height: StrideSpace.sm),
-          Text(
-            'Stride has no telemetry connection and no motor control path in this build. Controls stay locked until the console link is proven.',
-            style: Theme.of(context).textTheme.bodyMedium,
-          ),
-          const SizedBox(height: StrideSpace.lg),
-          const _StatusRail(
-            label: 'Connection',
-            value: 'Not connected',
-            icon: Icons.link_off_outlined,
-          ),
-          const SizedBox(height: StrideSpace.sm),
-          const _StatusRail(
-            label: 'Workout controls',
-            value: 'Unavailable',
-            icon: Icons.lock_outline,
-          ),
-          const SizedBox(height: StrideSpace.lg),
-          OutlinedButton.icon(
-            onPressed: onDiagnostics,
-            icon: const Icon(Icons.science_outlined),
-            label: const Text('Hardware diagnostics'),
+          Text('Elapsed time', style: Theme.of(context).textTheme.bodyMedium),
+          const SizedBox(height: StrideSpace.xs),
+          FittedBox(
+            fit: BoxFit.scaleDown,
+            alignment: Alignment.centerLeft,
+            child: Text(
+              _formatElapsed(elapsedMs),
+              style: const TextStyle(
+                color: StrideColors.text,
+                fontSize: 40,
+                height: 0.95,
+                fontWeight: FontWeight.w900,
+                letterSpacing: -1.5,
+              ),
+            ),
           ),
         ],
       ),
@@ -695,23 +995,193 @@ class _WorkoutPanel extends StatelessWidget {
   }
 }
 
-class _StatusRail extends StatelessWidget {
-  const _StatusRail({
-    required this.label,
-    required this.value,
-    required this.icon,
-  });
+class _SafetyNotice extends StatelessWidget {
+  const _SafetyNotice({required this.text});
 
-  final String label;
-  final String value;
-  final IconData icon;
+  final String text;
 
   @override
   Widget build(BuildContext context) {
     return Container(
-      constraints: const BoxConstraints(
-        minHeight: StrideSpace.minTouch - StrideSpace.xs,
+      width: double.infinity,
+      padding: const EdgeInsets.symmetric(
+        horizontal: StrideSpace.sm,
+        vertical: StrideSpace.xs,
       ),
+      decoration: BoxDecoration(
+        color: const Color(0xFF2A1905),
+        borderRadius: BorderRadius.circular(StrideRadius.md),
+        border: Border.all(color: StrideColors.warning, width: 1.2),
+      ),
+      child: Text(
+        text,
+        style: Theme.of(context).textTheme.bodySmall?.copyWith(
+          color: const Color(0xFFFFE2A3),
+          fontSize: 12,
+          height: 1.08,
+          fontWeight: FontWeight.w900,
+        ),
+      ),
+    );
+  }
+}
+
+class _WorkoutActions extends StatelessWidget {
+  const _WorkoutActions({required this.controller});
+
+  final WorkoutController controller;
+
+  @override
+  Widget build(BuildContext context) {
+    if (controller.isIdle) {
+      return FilledButton.icon(
+        style: FilledButton.styleFrom(
+          minimumSize: const Size(double.infinity, StrideSpace.minTouch),
+          backgroundColor: StrideColors.accent,
+          foregroundColor: StrideColors.ink,
+        ),
+        onPressed: () => _runBool(
+          context,
+          controller.startWorkout,
+          'Could not start timer.',
+        ),
+        icon: const Icon(Icons.play_arrow_rounded, size: 34),
+        label: const _ButtonLabel('Start timer'),
+      );
+    }
+
+    return Row(
+      children: [
+        Expanded(
+          child: FilledButton.icon(
+            style: FilledButton.styleFrom(
+              minimumSize: const Size(0, StrideSpace.minTouch),
+              backgroundColor: controller.isPaused
+                  ? StrideColors.accent
+                  : StrideColors.warning,
+              foregroundColor: StrideColors.ink,
+            ),
+            onPressed: () => _runBool(
+              context,
+              controller.isPaused
+                  ? controller.resumeWorkout
+                  : controller.pauseWorkout,
+              controller.isPaused
+                  ? 'Could not resume timer.'
+                  : 'Could not pause timer.',
+            ),
+            icon: Icon(
+              controller.isPaused
+                  ? Icons.play_arrow_rounded
+                  : Icons.pause_rounded,
+              size: 32,
+            ),
+            label: _ButtonLabel(
+              controller.isPaused ? 'Resume timer' : 'Pause timer',
+            ),
+          ),
+        ),
+        const SizedBox(width: StrideSpace.sm),
+        SizedBox(
+          width: 108,
+          child: OutlinedButton(
+            style: OutlinedButton.styleFrom(
+              minimumSize: const Size(0, StrideSpace.minTouch),
+            ),
+            onPressed: () async {
+              final total = await controller.finishWorkout();
+              if (total == null && context.mounted) {
+                _showPanelMessage(context, 'Could not end workout.');
+              }
+            },
+            child: const _ButtonLabel('End workout'),
+          ),
+        ),
+      ],
+    );
+  }
+}
+
+class _ButtonLabel extends StatelessWidget {
+  const _ButtonLabel(this.text);
+
+  final String text;
+
+  @override
+  Widget build(BuildContext context) {
+    return FittedBox(fit: BoxFit.scaleDown, child: Text(text, maxLines: 1));
+  }
+}
+
+class _MetricsGrid extends StatelessWidget {
+  const _MetricsGrid({required this.machine});
+
+  final MachineSnapshot machine;
+
+  @override
+  Widget build(BuildContext context) {
+    final metrics = <Widget>[
+      _MetricTile(
+        label: 'Distance',
+        value: _formatDecimal(
+          machine.distanceMiles,
+          machine.noReadingLabel,
+          fractionDigits: 2,
+        ),
+        unit: 'mi',
+        noReadingLabel: machine.noReadingLabel,
+      ),
+      _MetricTile(
+        label: 'Pace',
+        value: _formatPace(machine.paceMinPerMile, machine.noReadingLabel),
+        unit: '/mi',
+        noReadingLabel: machine.noReadingLabel,
+      ),
+      _MetricTile(
+        label: 'Speed',
+        value: _formatDecimal(machine.speedMph, machine.noReadingLabel),
+        unit: 'mph',
+        noReadingLabel: machine.noReadingLabel,
+      ),
+      _MetricTile(
+        label: 'Incline',
+        value: _formatDecimal(machine.inclinePercent, machine.noReadingLabel),
+        unit: '%',
+        noReadingLabel: machine.noReadingLabel,
+      ),
+    ];
+    return SizedBox(
+      height: 58,
+      child: Row(
+        children: [
+          for (var index = 0; index < metrics.length; index++) ...[
+            Expanded(child: metrics[index]),
+            if (index != metrics.length - 1)
+              const SizedBox(width: StrideSpace.xs),
+          ],
+        ],
+      ),
+    );
+  }
+}
+
+class _MetricTile extends StatelessWidget {
+  const _MetricTile({
+    required this.label,
+    required this.value,
+    required this.unit,
+    required this.noReadingLabel,
+  });
+
+  final String label;
+  final String value;
+  final String unit;
+  final String noReadingLabel;
+
+  @override
+  Widget build(BuildContext context) {
+    final unknown = value == noReadingLabel;
+    return Container(
       padding: const EdgeInsets.symmetric(
         horizontal: StrideSpace.md,
         vertical: StrideSpace.sm,
@@ -721,24 +1191,306 @@ class _StatusRail extends StatelessWidget {
         borderRadius: BorderRadius.circular(StrideRadius.md),
         border: Border.all(color: StrideColors.line),
       ),
-      child: Row(
-        children: [
-          Icon(icon, color: StrideColors.textMuted),
-          const SizedBox(width: StrideSpace.md),
-          Expanded(
-            child: Column(
-              mainAxisAlignment: MainAxisAlignment.center,
+      child: FittedBox(
+        fit: BoxFit.scaleDown,
+        alignment: Alignment.centerLeft,
+        child: Row(
+          crossAxisAlignment: CrossAxisAlignment.end,
+          children: [
+            Column(
               crossAxisAlignment: CrossAxisAlignment.start,
               children: [
                 Text(label, style: Theme.of(context).textTheme.bodySmall),
-                Text(value, style: Theme.of(context).textTheme.titleMedium),
+                Text(
+                  value,
+                  style: TextStyle(
+                    color: unknown ? StrideColors.textMuted : StrideColors.text,
+                    fontSize: 30,
+                    height: 1,
+                    fontWeight: FontWeight.w900,
+                  ),
+                ),
               ],
             ),
+            const SizedBox(width: StrideSpace.xs),
+            Padding(
+              padding: const EdgeInsets.only(bottom: 3),
+              child: Text(unit, style: Theme.of(context).textTheme.bodySmall),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+}
+
+class _InlineVolumeControl extends StatelessWidget {
+  const _InlineVolumeControl({required this.controller});
+
+  final WorkoutController controller;
+
+  @override
+  Widget build(BuildContext context) {
+    final volume = controller.volume;
+    final enabled = volume.available;
+    return Container(
+      height: StrideSpace.minTouch,
+      padding: EdgeInsets.zero,
+      decoration: BoxDecoration(
+        color: StrideColors.panel.withValues(alpha: 0.9),
+        borderRadius: BorderRadius.circular(StrideRadius.lg),
+        border: Border.all(color: StrideColors.line),
+      ),
+      child: Row(
+        children: [
+          _RoundConsoleButton(
+            icon: Icons.remove,
+            enabled: enabled && volume.level > 0,
+            onPressed: () => controller.setVolume(volume.level - 1),
+          ),
+          Expanded(
+            child: FittedBox(
+              fit: BoxFit.scaleDown,
+              child: Column(
+                mainAxisAlignment: MainAxisAlignment.center,
+                children: [
+                  Text(
+                    'Media volume',
+                    style: Theme.of(context).textTheme.bodySmall,
+                  ),
+                  Text(
+                    enabled ? '${volume.level}/${volume.max}' : 'Unavailable',
+                    style: const TextStyle(
+                      color: StrideColors.text,
+                      fontSize: 26,
+                      fontWeight: FontWeight.w900,
+                    ),
+                  ),
+                ],
+              ),
+            ),
+          ),
+          _RoundConsoleButton(
+            icon: Icons.add,
+            enabled: enabled && volume.level < volume.max,
+            onPressed: () => controller.setVolume(volume.level + 1),
           ),
         ],
       ),
     );
   }
+}
+
+class _LockedMachineControls extends StatelessWidget {
+  const _LockedMachineControls({required this.machine});
+
+  final MachineSnapshot machine;
+
+  @override
+  Widget build(BuildContext context) {
+    return Container(
+      width: double.infinity,
+      padding: const EdgeInsets.all(StrideSpace.sm),
+      decoration: BoxDecoration(
+        color: StrideColors.panel.withValues(alpha: 0.9),
+        borderRadius: BorderRadius.circular(StrideRadius.lg),
+        border: Border.all(color: StrideColors.line),
+      ),
+      child: Column(
+        children: [
+          Row(
+            crossAxisAlignment: CrossAxisAlignment.center,
+            children: [
+              SizedBox(
+                width: 120,
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Text(
+                      'Controls locked',
+                      style: Theme.of(context).textTheme.titleMedium,
+                    ),
+                    const SizedBox(height: StrideSpace.xs),
+                    Text(
+                      machine.reason,
+                      maxLines: 2,
+                      overflow: TextOverflow.ellipsis,
+                      style: Theme.of(context).textTheme.bodySmall,
+                    ),
+                  ],
+                ),
+              ),
+              const SizedBox(width: StrideSpace.xs),
+              Expanded(
+                child: _LockedMiniControl(
+                  label: 'Speed',
+                  unit: 'mph',
+                  noReadingLabel: machine.noReadingLabel,
+                ),
+              ),
+              const SizedBox(width: 6),
+              Expanded(
+                child: _LockedMiniControl(
+                  label: 'Incline',
+                  unit: '%',
+                  noReadingLabel: machine.noReadingLabel,
+                ),
+              ),
+              const SizedBox(width: 6),
+              Expanded(
+                child: _LockedMiniControl(
+                  label: 'Fan',
+                  unit: 'level',
+                  noReadingLabel: machine.noReadingLabel,
+                ),
+              ),
+            ],
+          ),
+        ],
+      ),
+    );
+  }
+}
+
+class _LockedMiniControl extends StatelessWidget {
+  const _LockedMiniControl({
+    required this.label,
+    required this.unit,
+    required this.noReadingLabel,
+  });
+
+  final String label;
+  final String unit;
+  final String noReadingLabel;
+
+  @override
+  Widget build(BuildContext context) {
+    return Material(
+      color: const Color(0xFF151A1E),
+      borderRadius: BorderRadius.circular(StrideRadius.md),
+      child: InkWell(
+        borderRadius: BorderRadius.circular(StrideRadius.md),
+        onTap: () => _showPanelMessage(
+          context,
+          "Stride can't control the belt yet. Use the console's own controls.",
+        ),
+        child: Container(
+          height: 72,
+          padding: const EdgeInsets.all(StrideSpace.xs),
+          decoration: BoxDecoration(
+            borderRadius: BorderRadius.circular(StrideRadius.md),
+            border: Border.all(color: StrideColors.warning, width: 1.6),
+          ),
+          child: Row(
+            children: [
+              const Icon(
+                Icons.lock_outline,
+                color: StrideColors.warning,
+                size: 18,
+              ),
+              const SizedBox(width: StrideSpace.xxs),
+              Expanded(
+                child: FittedBox(
+                  fit: BoxFit.scaleDown,
+                  alignment: Alignment.centerLeft,
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      Text(label, style: Theme.of(context).textTheme.bodySmall),
+                      Text(
+                        '$noReadingLabel $unit',
+                        style: Theme.of(context).textTheme.titleMedium
+                            ?.copyWith(color: StrideColors.textMuted),
+                      ),
+                    ],
+                  ),
+                ),
+              ),
+              const Icon(
+                Icons.touch_app_outlined,
+                color: StrideColors.warning,
+                size: 18,
+              ),
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+}
+
+class _RoundConsoleButton extends StatelessWidget {
+  const _RoundConsoleButton({
+    required this.icon,
+    required this.enabled,
+    this.onPressed,
+  });
+
+  final IconData icon;
+  final bool enabled;
+  final VoidCallback? onPressed;
+
+  @override
+  Widget build(BuildContext context) {
+    return SizedBox.square(
+      dimension: StrideSpace.minTouch,
+      child: FilledButton(
+        style: FilledButton.styleFrom(
+          padding: EdgeInsets.zero,
+          backgroundColor: enabled
+              ? StrideColors.panelHigh
+              : StrideColors.panelHigh.withValues(alpha: 0.55),
+          foregroundColor: enabled ? StrideColors.text : StrideColors.textMuted,
+          shape: RoundedRectangleBorder(
+            borderRadius: BorderRadius.circular(StrideRadius.md),
+          ),
+        ),
+        onPressed: enabled && onPressed != null ? onPressed : null,
+        child: Icon(icon, size: 30),
+      ),
+    );
+  }
+}
+
+String _formatElapsed(int ms) {
+  final duration = Duration(milliseconds: ms < 0 ? 0 : ms);
+  final hours = duration.inHours;
+  final minutes = duration.inMinutes.remainder(60).toString().padLeft(2, '0');
+  final seconds = duration.inSeconds.remainder(60).toString().padLeft(2, '0');
+  if (hours > 0) return '$hours:$minutes:$seconds';
+  return '$minutes:$seconds';
+}
+
+String _formatDecimal(
+  double? value,
+  String noReadingLabel, {
+  int fractionDigits = 1,
+}) {
+  if (value == null) return noReadingLabel;
+  if (value == 0) return '0';
+  return value.toStringAsFixed(fractionDigits);
+}
+
+String _formatPace(double? paceMinPerMile, String noReadingLabel) {
+  if (paceMinPerMile == null) return noReadingLabel;
+  if (paceMinPerMile == 0) return '0:00';
+  final totalSeconds = (paceMinPerMile * 60).round();
+  final minutes = totalSeconds ~/ 60;
+  final seconds = (totalSeconds % 60).toString().padLeft(2, '0');
+  return '$minutes:$seconds';
+}
+
+Future<void> _runBool(
+  BuildContext context,
+  Future<bool> Function() run,
+  String failureMessage,
+) async {
+  final ok = await run();
+  if (!ok && context.mounted) _showPanelMessage(context, failureMessage);
+}
+
+void _showPanelMessage(BuildContext context, String message) {
+  ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text(message)));
 }
 
 class _SurfacePanel extends StatelessWidget {
@@ -750,7 +1502,9 @@ class _SurfacePanel extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     return Container(
-      padding: const EdgeInsets.all(StrideSpace.lg),
+      padding: highContrast
+          ? const EdgeInsets.all(StrideSpace.md)
+          : const EdgeInsets.all(StrideSpace.lg),
       decoration: BoxDecoration(
         color: highContrast
             ? StrideColors.panelRaised

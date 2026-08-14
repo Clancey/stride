@@ -1,6 +1,7 @@
 package io.stride.spikes
 
 import android.content.Context
+import android.util.Log
 import android.util.Base64
 import java.io.File
 import java.security.KeyFactory
@@ -106,6 +107,10 @@ object GlassOsCredentials {
             }
             Material(ssl.socketFactory, trustManager)
         } catch (t: Throwable) {
+            // Never propagate: a malformed certificate must leave Stride disconnected and honest.
+            // But it must not be *silent* either — an unexplained blank readout is exactly the
+            // thing that wastes an hour on a treadmill. Log the failure class, never the contents.
+            Log.w("StrideGlassOs", "credentials unusable: ${t.javaClass.simpleName}: ${t.message}")
             null
         }
     }

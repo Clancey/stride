@@ -16,7 +16,23 @@ void main() {
     await tester.pumpAndSettle();
 
     expect(find.text('Stride'), findsOneWidget);
-    expect(find.text('Machine not connected'), findsOneWidget);
+    expect(find.text('Workout'), findsOneWidget);
+    expect(find.text('Elapsed time'), findsOneWidget);
+    expect(find.text('Controls locked'), findsOneWidget);
+    expect(find.text('Start timer'), findsOneWidget);
+    expect(find.text('Media volume'), findsOneWidget);
+    expect(
+      find.textContaining(
+        "Stride doesn't control the treadmill. Use the console's own controls or the safety key.",
+      ),
+      findsOneWidget,
+    );
+    expect(
+      find.textContaining(
+        "Stride can't read the treadmill. The belt may be moving.",
+      ),
+      findsOneWidget,
+    );
     expect(find.text('All apps'), findsOneWidget);
 
     await tester.tap(find.byTooltip('Diagnostics'));

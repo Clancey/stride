@@ -1,13 +1,19 @@
 /// Thin typed wrapper over the `io.stride.spikes/bridge` MethodChannel.
 library;
 
+import 'dart:math' as math;
+
+import 'package:flutter/painting.dart' show EdgeInsets;
 import 'package:flutter/services.dart';
 
 class SpikeBridge {
-  static const MethodChannel _channel = MethodChannel('io.stride.spikes/bridge');
+  static const MethodChannel _channel = MethodChannel(
+    'io.stride.spikes/bridge',
+  );
 
   /// Callbacks the *host* pushes to us, rather than us polling it.
   static void Function()? onHomePressed;
+  static void Function(String state)? onWorkoutStateChanged;
 
   /// Wire the host->Flutter direction. Call once at startup.
   ///
@@ -20,6 +26,10 @@ class SpikeBridge {
         case 'onHomePressed':
           onHomePressed?.call();
           return null;
+        case 'onWorkoutStateChanged':
+          final state = call.arguments;
+          if (state is String) onWorkoutStateChanged?.call(state);
+          return null;
         default:
           return null;
       }
@@ -30,7 +40,8 @@ class SpikeBridge {
 
   // S1 - launcher
   static Future<bool> isDefaultHome() => _bool('isDefaultHome');
-  static Future<List<Map<String, dynamic>>> homeCandidates() => _list('homeCandidates');
+  static Future<List<Map<String, dynamic>>> homeCandidates() =>
+      _list('homeCandidates');
   static Future<bool> openHomeSettings() => _bool('openHomeSettings');
   static Future<bool> goHome() => _bool('goHome');
 
@@ -41,12 +52,38 @@ class SpikeBridge {
   static Future<Map<String, dynamic>> overlayStatus() => _map('overlayStatus');
   static Future<bool> resetOverlayCounters() => _bool('resetOverlayCounters');
 
+  // Workout + console controls
+  static Future<String> workoutState() async =>
+      await _channel.invokeMethod<String>('workoutState') ?? 'idle';
+  static Future<int> workoutElapsedMs() => _int('workoutElapsedMs');
+  static Future<bool> workoutStart() => _bool('workoutStart');
+  static Future<bool> workoutPause() => _bool('workoutPause');
+  static Future<bool> workoutResume() => _bool('workoutResume');
+  static Future<int> workoutStop() => _int('workoutStop');
+  static Future<Map<String, dynamic>> volumeGet() => _map('volumeGet');
+  static Future<bool> volumeSet(int level) =>
+      _bool('volumeSet', {'level': level});
+  static Future<Map<String, dynamic>> machineSnapshot() =>
+      _map('machineSnapshot');
+
   /// Height in **physical pixels** of the always-on HUD strip along the top edge.
   ///
   /// The HUD is a separate system window drawn over everything, so Flutter has no idea it is there
   /// and happily renders its app bar underneath it. Content must be inset by this much.
   static Future<double> hudHeightPx() async =>
       (await _channel.invokeMethod<num>('hudHeightPx'))?.toDouble() ?? 0;
+
+  /// Every edge the overlay occupies, in **physical pixels**, as one consistent snapshot.
+  ///
+  /// The side rails cover the launcher's app grid just as surely as the top strip covers its app
+  /// bar, so all four edges have to be inset. Fetched in a single call because four separate calls
+  /// could straddle an overlay rebuild and return a mix of old and new geometry.
+  static Future<EdgeInsets> hudInsetsPx() async {
+    final raw = await _channel.invokeMapMethod<String, num>('hudInsetsPx');
+    if (raw == null) return EdgeInsets.zero;
+    double at(String key) => math.max(0, (raw[key] ?? 0).toDouble());
+    return EdgeInsets.fromLTRB(at('left'), at('top'), at('right'), at('bottom'));
+  }
 
   // S4 - app inventory
   static Future<List<Map<String, dynamic>>> listApps() => _list('listApps');
@@ -64,15 +101,19 @@ class SpikeBridge {
       });
 
   // S5 - media sessions
-  static Future<bool> notificationListenerEnabled() => _bool('notificationListenerEnabled');
-  static Future<List<Map<String, dynamic>>> mediaSessions() => _list('mediaSessions');
+  static Future<bool> notificationListenerEnabled() =>
+      _bool('notificationListenerEnabled');
+  static Future<List<Map<String, dynamic>>> mediaSessions() =>
+      _list('mediaSessions');
   static Future<List<String>> pauseAllPlaying() => _strings('pauseAllPlaying');
-  static Future<List<String>> resumePausedByUs() => _strings('resumePausedByUs');
+  static Future<List<String>> resumePausedByUs() =>
+      _strings('resumePausedByUs');
   static Future<bool> dispatchMediaKey(int keyCode) =>
       _bool('dispatchMediaKey', {'keyCode': keyCode});
 
   // S10 - navigation
-  static Future<bool> accessibilityConnected() => _bool('accessibilityConnected');
+  static Future<bool> accessibilityConnected() =>
+      _bool('accessibilityConnected');
   static Future<bool> accessibilityEnabledInSettings() =>
       _bool('accessibilityEnabledInSettings');
   static Future<bool> goBack() => _bool('goBack');
@@ -85,8 +126,13 @@ class SpikeBridge {
 
   // ---------------------------------------------------------------- helpers
 
-  static Future<bool> _bool(String method, [Map<String, dynamic>? args]) async =>
-      await _channel.invokeMethod<bool>(method, args) ?? false;
+  static Future<bool> _bool(
+    String method, [
+    Map<String, dynamic>? args,
+  ]) async => await _channel.invokeMethod<bool>(method, args) ?? false;
+
+  static Future<int> _int(String method) async =>
+      (await _channel.invokeMethod<num>(method))?.round() ?? 0;
 
   static Future<Map<String, dynamic>> _map(String method) async {
     final result = await _channel.invokeMapMethod<String, dynamic>(method);
@@ -137,7 +183,15 @@ int mediaLikelihood(Map<String, dynamic> app) {
   if (knownMedia.contains(app['package'])) score += 40;
 
   final pkg = (app['package'] as String? ?? '').toLowerCase();
-  for (final hint in const ['music', 'video', 'audio', 'radio', 'player', 'podcast', 'tv']) {
+  for (final hint in const [
+    'music',
+    'video',
+    'audio',
+    'radio',
+    'player',
+    'podcast',
+    'tv',
+  ]) {
     if (pkg.contains(hint)) {
       score += 10;
       break;

@@ -16,7 +16,7 @@ class HudInset extends StatefulWidget {
 
 class _HudInsetState extends State<HudInset> {
   Timer? _timer;
-  double _hudHeightPx = 0;
+  EdgeInsets _hudPx = EdgeInsets.zero;
 
   @override
   void initState() {
@@ -33,39 +33,41 @@ class _HudInsetState extends State<HudInset> {
 
   Future<void> _refresh() async {
     try {
-      final next = await SpikeBridge.hudHeightPx();
+      final next = await SpikeBridge.hudInsetsPx();
       if (!mounted) return;
-      if ((next - _hudHeightPx).abs() > 0.5) {
-        setState(() => _hudHeightPx = math.max(0, next));
-      }
+      if (_differs(next, _hudPx)) setState(() => _hudPx = next);
     } catch (_) {
       if (!mounted) return;
-      if (_hudHeightPx != 0) setState(() => _hudHeightPx = 0);
+      if (_hudPx != EdgeInsets.zero) setState(() => _hudPx = EdgeInsets.zero);
     }
   }
+
+  static bool _differs(EdgeInsets a, EdgeInsets b) =>
+      (a.left - b.left).abs() > 0.5 ||
+      (a.top - b.top).abs() > 0.5 ||
+      (a.right - b.right).abs() > 0.5 ||
+      (a.bottom - b.bottom).abs() > 0.5;
 
   @override
   Widget build(BuildContext context) {
     final media = MediaQuery.of(context);
     final ratio = media.devicePixelRatio <= 0 ? 1.0 : media.devicePixelRatio;
-    final hudLogical = _hudHeightPx / ratio;
-    final topPadding = math.max(media.padding.top, hudLogical);
-    final topViewPadding = math.max(media.viewPadding.top, hudLogical);
+    final hud = _hudPx / ratio;
+
+    // Take the larger of the system inset and ours on each edge. The overlay sits on top of the
+    // system bars, so the two are alternatives rather than additions — summing them would push
+    // content twice as far in and leave a visible dead band.
+    EdgeInsets merge(EdgeInsets base) => EdgeInsets.fromLTRB(
+          math.max(base.left, hud.left),
+          math.max(base.top, hud.top),
+          math.max(base.right, hud.right),
+          math.max(base.bottom, hud.bottom),
+        );
 
     return MediaQuery(
       data: media.copyWith(
-        padding: EdgeInsets.fromLTRB(
-          media.padding.left,
-          topPadding,
-          media.padding.right,
-          media.padding.bottom,
-        ),
-        viewPadding: EdgeInsets.fromLTRB(
-          media.viewPadding.left,
-          topViewPadding,
-          media.viewPadding.right,
-          media.viewPadding.bottom,
-        ),
+        padding: merge(media.padding),
+        viewPadding: merge(media.viewPadding),
       ),
       child: widget.child,
     );

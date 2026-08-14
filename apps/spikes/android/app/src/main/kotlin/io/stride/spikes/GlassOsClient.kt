@@ -1,6 +1,7 @@
 package io.stride.spikes
 
 import android.content.Context
+import android.util.Log
 import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.OkHttpClient
 import okhttp3.Protocol
@@ -57,7 +58,11 @@ class GlassOsClient(private val context: Context) {
 
     private fun ensureClient(): OkHttpClient? {
         http?.let { return it }
-        val material = GlassOsCredentials.load(context) ?: return null
+        val material = GlassOsCredentials.load(context)
+        if (material == null) {
+            note("no credentials in files/glassos — staying disconnected")
+            return null
+        }
         val built = OkHttpClient.Builder()
             .sslSocketFactory(material.socketFactory, material.trustManager)
             // The server certificate is CN-only with no SAN; the chain is still verified against
@@ -84,18 +89,39 @@ class GlassOsClient(private val context: Context) {
                 .post(GlassOsWire.EMPTY_FRAME.toRequestBody(GRPC))
                 .build()
             client.newCall(request).execute().use { response ->
-                if (!response.isSuccessful) return null
-                // grpc-status rides in the trailers; a non-zero status means the body is not a
-                // message and must not be parsed as one.
-                val status = response.trailers()["grpc-status"]
-                if (status != null && status != "0") return null
+                if (!response.isSuccessful) {
+                    note("$service/$method http ${response.code}")
+                    return null
+                }
+                // The body must be read before the trailers exist. Asking for trailers first
+                // throws, and aborting the response early resets the stream, which the server
+                // logs as a protocol error — the request never gets a chance to succeed.
                 val body = response.body?.bytes() ?: return null
+                val status = response.trailers()["grpc-status"]
+                if (status != null && status != "0") {
+                    note("$service/$method grpc-status $status ${response.trailers()["grpc-message"]}")
+                    return null
+                }
                 GlassOsWire.unframe(body)?.let { GlassOsWire.parse(it) }
             }
         } catch (t: Throwable) {
+            note("$service/$method ${t.javaClass.simpleName}: ${t.message}")
             null
         }
     }
+
+    /**
+     * Diagnostics for the link. Deliberately logs only the call name and failure reason — never
+     * headers, certificates or key material, which is the one thing that must not end up in a
+     * logcat buffer that any app on this console could once read.
+     */
+    private fun note(message: String) {
+        if (lastNote == message) return
+        lastNote = message
+        Log.i("StrideGlassOs", message)
+    }
+
+    @Volatile private var lastNote: String? = null
 
     /**
      * Ask a service whether a reading is available at all.

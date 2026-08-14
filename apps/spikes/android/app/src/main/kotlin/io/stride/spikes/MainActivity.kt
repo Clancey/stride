@@ -10,12 +10,24 @@ import io.flutter.plugin.common.MethodChannel
 class MainActivity : FlutterActivity() {
     private val mainHandler = Handler(Looper.getMainLooper())
     private var channel: MethodChannel? = null
+    private var workoutStateListener: ((WorkoutSession.State) -> Unit)? = null
 
     override fun configureFlutterEngine(flutterEngine: FlutterEngine) {
         super.configureFlutterEngine(flutterEngine)
+        // Idempotent, and deliberately also done by OverlayService: either surface can be the one
+        // on screen, and whichever comes up first should start reading the machine.
+        MachineLink.attach(applicationContext)
         channel = MethodChannel(flutterEngine.dartExecutor.binaryMessenger, SpikeBridge.CHANNEL).also {
             it.setMethodCallHandler(SpikeBridge(applicationContext))
+            registerWorkoutStateListener(it)
         }
+    }
+
+    override fun cleanUpFlutterEngine(flutterEngine: FlutterEngine) {
+        removeWorkoutStateListener()
+        channel?.setMethodCallHandler(null)
+        channel = null
+        super.cleanUpFlutterEngine(flutterEngine)
     }
 
     override fun onNewIntent(intent: Intent) {
@@ -37,5 +49,23 @@ class MainActivity : FlutterActivity() {
         return categories == null ||
             categories.contains(Intent.CATEGORY_HOME) ||
             categories.contains(Intent.CATEGORY_LAUNCHER)
+    }
+
+    private fun registerWorkoutStateListener(activeChannel: MethodChannel) {
+        removeWorkoutStateListener()
+        val listener: (WorkoutSession.State) -> Unit = { state ->
+            mainHandler.post {
+                if (channel === activeChannel) {
+                    activeChannel.invokeMethod("onWorkoutStateChanged", state.channelName())
+                }
+            }
+        }
+        workoutStateListener = listener
+        WorkoutSession.addListener(listener)
+    }
+
+    private fun removeWorkoutStateListener() {
+        workoutStateListener?.let(WorkoutSession::removeListener)
+        workoutStateListener = null
     }
 }

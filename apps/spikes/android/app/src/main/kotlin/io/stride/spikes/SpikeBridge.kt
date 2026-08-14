@@ -11,7 +11,6 @@ import android.graphics.Rect
 import android.graphics.drawable.Drawable
 import android.media.AudioManager
 import android.media.session.MediaController
-import android.media.session.MediaSessionManager
 import android.media.session.PlaybackState
 import android.os.Build
 import android.os.Handler
@@ -22,7 +21,14 @@ import android.view.KeyEvent
 import io.flutter.plugin.common.MethodCall
 import io.flutter.plugin.common.MethodChannel
 import java.io.ByteArrayOutputStream
+import java.util.Locale
 import java.util.concurrent.Executors
+
+internal fun WorkoutSession.State.channelName(): String =
+    name.lowercase(Locale.US)
+
+private fun Long.toChannelInt(): Int =
+    coerceAtMost(Int.MAX_VALUE.toLong()).toInt()
 
 /**
  * Platform bridge for the Phase 0 spike harness.
@@ -33,10 +39,15 @@ import java.util.concurrent.Executors
  */
 class SpikeBridge(private val context: Context) : MethodChannel.MethodCallHandler {
     private val mainHandler = Handler(Looper.getMainLooper())
+    private val systemAudio = SystemAudio(context)
     private val iconExecutor = Executors.newSingleThreadExecutor { runnable ->
         Thread(runnable, "StrideIconRenderer")
     }
     private val iconCache = LruCache<String, ByteArray>(128)
+
+    init {
+        WorkoutMediaCoupling.attach(context)
+    }
 
     companion object {
         const val CHANNEL = "io.stride.spikes/bridge"
@@ -63,6 +74,7 @@ class SpikeBridge(private val context: Context) : MethodChannel.MethodCallHandle
                 "overlayStatus" -> result.success(overlayStatus())
                 "resetOverlayCounters" -> result.success(resetOverlayCounters())
                 "hudHeightPx" -> result.success(hudHeightPx())
+                "hudInsetsPx" -> result.success(hudInsetsPx())
 
                 // --- S4: media apps present ---
                 "listApps" -> result.success(listApps())
@@ -74,6 +86,17 @@ class SpikeBridge(private val context: Context) : MethodChannel.MethodCallHandle
                 "pauseAllPlaying" -> result.success(pauseAllPlaying())
                 "resumePausedByUs" -> result.success(resumePausedByUs())
                 "dispatchMediaKey" -> result.success(dispatchMediaKey(call.argument<Int>("keyCode")!!))
+
+                // --- workout/state layer for overlay controls ---
+                "workoutState" -> result.success(WorkoutSession.state.channelName())
+                "workoutElapsedMs" -> result.success(WorkoutSession.elapsedMs().toChannelInt())
+                "workoutStart" -> result.success(workoutStart())
+                "workoutPause" -> result.success(workoutPause())
+                "workoutResume" -> result.success(workoutResume())
+                "workoutStop" -> result.success(workoutStop())
+                "volumeGet" -> result.success(systemAudio.snapshot())
+                "volumeSet" -> result.success(volumeSet(call))
+                "machineSnapshot" -> result.success(machineSnapshot())
 
                 // --- S10: navigation ---
                 "accessibilityConnected" -> result.success(StrideAccessibilityService.isConnected())
@@ -199,6 +222,25 @@ class SpikeBridge(private val context: Context) : MethodChannel.MethodCallHandle
 
     private fun hudHeightPx(): Int =
         if (OverlayService.isRunning) OverlayService.hudHeightPx else 0
+
+    /**
+     * Every edge the overlay currently occupies, in device pixels.
+     *
+     * Returned as one map rather than four channel calls so the four numbers Flutter lays out
+     * against always describe the same instant. Fetching them separately would let a rebuild land
+     * between two calls and inset the grid against a mix of the old and new chrome.
+     */
+    private fun hudInsetsPx(): Map<String, Int> {
+        if (!OverlayService.isRunning) {
+            return mapOf("top" to 0, "bottom" to 0, "left" to 0, "right" to 0)
+        }
+        return mapOf(
+            "top" to OverlayService.hudTopPx,
+            "bottom" to OverlayService.hudBottomPx,
+            "left" to OverlayService.hudLeftPx,
+            "right" to OverlayService.hudRightPx,
+        )
+    }
 
     // ------------------------------------------------------------------ S4 app inventory
 
@@ -333,10 +375,7 @@ class SpikeBridge(private val context: Context) : MethodChannel.MethodCallHandle
     // ------------------------------------------------------------------ S5 media sessions
 
     private fun activeControllers(): List<MediaController> {
-        if (!StrideNotificationListener.isConnected) return emptyList()
-        val msm = context.getSystemService(Context.MEDIA_SESSION_SERVICE) as MediaSessionManager
-        val component = ComponentName(context, StrideNotificationListener::class.java)
-        return msm.getActiveSessions(component)
+        return WorkoutMediaCoupling.activeControllers(context)
     }
 
     private fun mediaSessions(): List<Map<String, Any?>> {
@@ -377,6 +416,48 @@ class SpikeBridge(private val context: Context) : MethodChannel.MethodCallHandle
         am.dispatchMediaKeyEvent(KeyEvent(KeyEvent.ACTION_UP, keyCode))
         return true
     }
+
+    // ------------------------------------------------------------------ workout/state layer
+
+    private fun workoutStart(): Boolean {
+        if (WorkoutSession.state != WorkoutSession.State.IDLE) return false
+        WorkoutSession.start()
+        return true
+    }
+
+    private fun workoutPause(): Boolean {
+        if (WorkoutSession.state != WorkoutSession.State.RUNNING) return false
+        WorkoutSession.pause()
+        return true
+    }
+
+    private fun workoutResume(): Boolean {
+        if (WorkoutSession.state != WorkoutSession.State.PAUSED) return false
+        WorkoutSession.resume()
+        return true
+    }
+
+    private fun workoutStop(): Int = WorkoutSession.stop().toChannelInt()
+
+    private fun volumeSet(call: MethodCall): Boolean {
+        val level = call.argument<Number>("level")?.toInt() ?: return false
+        return systemAudio.setLevel(level)
+    }
+
+    private fun machineSnapshot(): Map<String, Any?> = mapOf(
+        "status" to MachineLink.status.name.lowercase(Locale.US),
+        "reason" to MachineLink.reason,
+        "speedMph" to MachineLink.speedMph,
+        "inclinePercent" to MachineLink.inclinePercent,
+        "distanceMiles" to MachineLink.distanceMiles,
+        "paceMinPerMile" to MachineLink.paceMinPerMile,
+        "calories" to MachineLink.calories,
+        "elapsedSeconds" to MachineLink.elapsedSeconds,
+        "consoleState" to MachineLink.consoleState,
+        "beltMayBeMoving" to MachineLink.beltMayBeMoving,
+        "fanLevel" to MachineLink.fanLevel,
+        "canCommand" to MachineLink.canCommand(),
+    )
 
     // ------------------------------------------------------------------ S10 accessibility
 
