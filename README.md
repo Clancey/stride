@@ -8,8 +8,10 @@ YouTube, Plex — underneath it. Media pauses when the workout pauses. Since the
 physical Home or Back button, Stride supplies system navigation too.
 
 **Status: Phase 0.** Nothing here controls a treadmill yet. The repository currently contains the
-architecture plan and a spike harness whose only job is to answer, on real hardware, whether the
-approach is viable at all.
+architecture plan, a spike harness whose only job is to answer — on real hardware — whether the
+approach is viable at all, the safety coordinator that will own every motor command, and a mock
+console to test it against. **No spike has been run on hardware yet**; every question in
+`docs/SPIKES.md` is still open.
 
 ---
 
@@ -41,12 +43,23 @@ operate.
 
 ```
 stride/
-├─ apps/spikes/        # Phase 0 spike harness (throwaway) - answers S1-S10 on real hardware
-└─ docs/               # Plan, runbook, spike results
+├─ apps/spikes/          # Phase 0 spike harness (throwaway) - answers S1-S10 on real hardware
+├─ packages/
+│  └─ stride_control/    # Control & Safety Coordinator - sole owner of motor commands (PLAN 3.1)
+├─ tools/
+│  └─ glassos_mock/      # Mock GlassOS console, so control logic is testable without a treadmill
+└─ docs/                 # Plan, runbook, spike results
 ```
 
-Packages get extracted when real reuse appears, not before. The device abstraction is deliberately
-deferred to Phase 6, *after* two concrete implementations exist (`docs/PLAN.md` §4).
+`stride_control` and `glassos_mock` exist early for one reason: the safety logic is the part that
+must not be written under time pressure on a live machine. The coordinator is fully unit-tested
+against a fake machine link with fault injection (dropped acks, stalled telemetry, safety-key
+pulls, external actors), and the mock console lets those paths run without anyone standing near a
+belt. The mock's protobuf field numbers are **guesses** until spike S2-A confirms the real schema;
+they are isolated in one file so that swap is cheap.
+
+Other packages get extracted when real reuse appears, not before. The device abstraction is
+deliberately deferred to Phase 6, *after* two concrete implementations exist (`docs/PLAN.md` §4).
 
 ---
 
@@ -59,11 +72,26 @@ adb install -r build/app/outputs/flutter-apk/app-debug.apk
 ```
 
 Then grant permissions per [`docs/RUNBOOK.md`](docs/RUNBOOK.md) §6 and work through
-[`docs/SPIKES.md`](docs/SPIKES.md).
+[`docs/SPIKES.md`](docs/SPIKES.md). If an install is rejected with "built for an older version of
+Android", see `docs/RUNBOOK.md` §7 — that is the low-target-SDK block, and it is usually a
+third-party APK, not this one.
+
+The harness targets `minSdk 26 / targetSdk 28` to match the console. **That is deliberate**: at
+targetSdk 30+ package-visibility filtering breaks app enumeration, which is the launcher's whole
+job. A modern-target build for phone testing is available via `-PstrideTargetSdk=35`, but its
+results do not transfer to the console.
 
 The harness deliberately **cannot command the motor**. It observes, extracts credentials, probes
 the transport, and measures — nothing more. Motor control does not arrive until Phase 1, and only
 behind the Control & Safety Coordinator (`docs/PLAN.md` §3.1).
+
+## Running the tests
+
+```bash
+cd apps/spikes         && flutter test    # harness: DER scanner, protobuf inspector, mTLS
+cd packages/stride_control && dart test   # safety coordinator, incl. failure modes
+cd tools/glassos_mock      && dart test   # mock console physics and fault injection
+```
 
 ---
 

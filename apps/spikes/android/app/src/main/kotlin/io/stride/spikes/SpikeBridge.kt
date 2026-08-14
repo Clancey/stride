@@ -29,9 +29,6 @@ class SpikeBridge(private val context: Context) : MethodChannel.MethodCallHandle
         const val IFIT_CONSOLE_PACKAGE = "com.ifit.rivendell"
     }
 
-    /** Packages Stride paused, so it can resume exactly those and nothing else. */
-    private val pausedByUs = mutableSetOf<String>()
-
     override fun onMethodCall(call: MethodCall, result: MethodChannel.Result) {
         try {
             when (call.method) {
@@ -48,6 +45,7 @@ class SpikeBridge(private val context: Context) : MethodChannel.MethodCallHandle
                 "startOverlay" -> result.success(startOverlay())
                 "stopOverlay" -> result.success(stopOverlay())
                 "overlayStatus" -> result.success(overlayStatus())
+                "resetOverlayCounters" -> result.success(resetOverlayCounters())
 
                 // --- S4: media apps present ---
                 "listApps" -> result.success(listApps())
@@ -170,8 +168,16 @@ class SpikeBridge(private val context: Context) : MethodChannel.MethodCallHandle
         "canDrawOverlays" to canDrawOverlays(),
         "lastGesture" to OverlayService.lastGesture,
         "edgeTouchCount" to OverlayService.edgeTouchCount,
-        "consumedGestureCount" to OverlayService.consumedGestureCount,
+        "navGestureCount" to OverlayService.navGestureCount,
+        "stolenTouchCount" to OverlayService.stolenTouchCount,
+        "cancelledGestureCount" to OverlayService.cancelledGestureCount,
+        "lastTouchForegroundPackage" to OverlayService.lastTouchForegroundPackage,
     )
+
+    private fun resetOverlayCounters(): Boolean {
+        OverlayService.resetCounters()
+        return true
+    }
 
     // ------------------------------------------------------------------ S4 app inventory
 
@@ -213,11 +219,34 @@ class SpikeBridge(private val context: Context) : MethodChannel.MethodCallHandle
         return out.values.map { it.toMap() }
     }
 
+    /**
+     * Launch an app by package.
+     *
+     * getLaunchIntentForPackage only finds CATEGORY_LAUNCHER entry points, so TV-only apps
+     * (e.g. Netflix Ninja) that expose only a LEANBACK_LAUNCHER activity would look unlaunchable.
+     * Fall back to the leanback launch intent, then to an explicit component built from the recorded
+     * leanback launcher activity, before giving up.
+     */
     private fun launchApp(pkg: String): Boolean {
-        val intent = context.packageManager.getLaunchIntentForPackage(pkg) ?: return false
+        val pm = context.packageManager
+        val intent = pm.getLaunchIntentForPackage(pkg)
+            ?: pm.getLeanbackLaunchIntentForPackage(pkg)
+            ?: leanbackComponentIntent(pkg)
+            ?: return false
         intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
         context.startActivity(intent)
         return true
+    }
+
+    /** Build an explicit launch intent from a package's LEANBACK_LAUNCHER activity, if it has one. */
+    private fun leanbackComponentIntent(pkg: String): Intent? {
+        val query = Intent(Intent.ACTION_MAIN)
+            .addCategory(Intent.CATEGORY_LEANBACK_LAUNCHER)
+            .setPackage(pkg)
+        val ri = context.packageManager.queryIntentActivities(query, 0).firstOrNull() ?: return null
+        return Intent(Intent.ACTION_MAIN)
+            .addCategory(Intent.CATEGORY_LEANBACK_LAUNCHER)
+            .setComponent(ComponentName(ri.activityInfo.packageName, ri.activityInfo.name))
     }
 
     // ------------------------------------------------------------------ S5 media sessions
@@ -229,50 +258,36 @@ class SpikeBridge(private val context: Context) : MethodChannel.MethodCallHandle
         return msm.getActiveSessions(component)
     }
 
-    private fun mediaSessions(): List<Map<String, Any?>> = activeControllers().map { c ->
-        val state = c.playbackState?.state
-        mapOf(
-            "package" to c.packageName,
-            "state" to (state ?: -1),
-            "isPlaying" to (state == PlaybackState.STATE_PLAYING),
-            "title" to c.metadata?.getString(android.media.MediaMetadata.METADATA_KEY_TITLE),
-            "artist" to c.metadata?.getString(android.media.MediaMetadata.METADATA_KEY_ARTIST),
-            "pausedByStride" to pausedByUs.contains(c.packageName),
-        )
+    private fun mediaSessions(): List<Map<String, Any?>> {
+        val controllers = activeControllers()
+        // Keep the ownership tracker's callbacks registered for every live session, even when the UI
+        // is only observing, so state transitions are seen as they happen.
+        MediaOwnershipTracker.sync(controllers)
+        return controllers.map { c ->
+            val state = c.playbackState?.state
+            mapOf(
+                "package" to c.packageName,
+                "state" to (state ?: -1),
+                "isPlaying" to (state == PlaybackState.STATE_PLAYING),
+                "title" to c.metadata?.getString(android.media.MediaMetadata.METADATA_KEY_TITLE),
+                "artist" to c.metadata?.getString(android.media.MediaMetadata.METADATA_KEY_ARTIST),
+                "pausedByStride" to MediaOwnershipTracker.isOwned(c.sessionToken),
+            )
+        }
     }
 
     /**
-     * Pause only what is actually playing, and remember exactly which packages we touched.
+     * Pause only what is actually playing, and remember exactly which sessions we touched.
      *
-     * Plan section 3.2 / Phase 3: resuming must restore only what Stride paused, never media the
-     * user had already paused themselves.
+     * Ownership is tracked by [MediaOwnershipTracker] against MediaSession.Token identity and is only
+     * recorded once the pause is actually observed, so resuming later restores only what Stride
+     * paused and never media the user paused themselves (plan section 3.2 / Phase 3).
      */
-    private fun pauseAllPlaying(): List<String> {
-        val paused = mutableListOf<String>()
-        activeControllers().forEach { c ->
-            if (c.playbackState?.state == PlaybackState.STATE_PLAYING) {
-                c.transportControls.pause()
-                pausedByUs.add(c.packageName)
-                paused.add(c.packageName)
-            }
-        }
-        return paused
-    }
+    private fun pauseAllPlaying(): List<String> =
+        MediaOwnershipTracker.pauseAllPlaying(activeControllers())
 
-    private fun resumePausedByUs(): List<String> {
-        val resumed = mutableListOf<String>()
-        val controllers = activeControllers().associateBy { it.packageName }
-        pausedByUs.toList().forEach { pkg ->
-            val c = controllers[pkg] ?: return@forEach
-            // Only resume if it is still paused - if the user pressed play themselves, leave it.
-            if (c.playbackState?.state == PlaybackState.STATE_PAUSED) {
-                c.transportControls.play()
-                resumed.add(pkg)
-            }
-        }
-        pausedByUs.clear()
-        return resumed
-    }
+    private fun resumePausedByUs(): List<String> =
+        MediaOwnershipTracker.resumePausedByUs(activeControllers())
 
     /** Last-resort fallback. Nondeterministic: whichever app the system thinks owns media keys. */
     private fun dispatchMediaKey(keyCode: Int): Boolean {

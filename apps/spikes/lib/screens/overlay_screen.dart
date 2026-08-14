@@ -7,9 +7,14 @@ import '../widgets/spike_scaffold.dart';
 
 /// S3 - overlay survival and edge-gesture interference.
 ///
-/// The counters matter as much as the visual result: `edgeTouchCount` rising while you use a media
-/// app underneath is the direct measure of how much input the edge strips steal (plan section 3.3,
-/// "the unavoidable cost").
+/// The counters matter as much as the visual result, and they are split so intentional navigation
+/// is not confused with stolen input (plan section 3.3, "the unavoidable cost"):
+///   - edge touches      = every touch that landed in a strip (each one is taken from the app)
+///   - nav gestures      = touches that became a real navigation swipe (the strip did its job)
+///   - stolen touches    = touches that entered a strip but never navigated (pure interference)
+///   - cancelled         = gesture streams the system cancelled (cleanup, never a completed swipe)
+/// `stolen touches` climbing while you use a media app underneath is the direct measure of harmful
+/// interference. `last fg` attributes the most recent touch to the foreground app.
 class OverlayScreen extends StatefulWidget {
   const OverlayScreen({super.key});
 
@@ -86,10 +91,20 @@ class _OverlayScreenState extends State<OverlayScreen> with SpikeLog {
           icon: const Icon(Icons.refresh),
           label: const Text('Refresh'),
         ),
+        OutlinedButton.icon(
+          onPressed: () => guard('reset counters', () async {
+            await SpikeBridge.resetOverlayCounters();
+            logLine('Interference counters reset. Attribute the next run to one foreground app.');
+            await _refreshQuiet();
+          }),
+          icon: const Icon(Icons.restart_alt),
+          label: const Text('Reset counters'),
+        ),
       ],
       body: Padding(
         padding: const EdgeInsets.symmetric(horizontal: 16),
-        child: Card(
+        child: SingleChildScrollView(
+          child: Card(
           child: Padding(
             padding: const EdgeInsets.all(12),
             child: Column(
@@ -111,9 +126,12 @@ class _OverlayScreenState extends State<OverlayScreen> with SpikeLog {
                 ),
                 const SizedBox(height: 8),
                 Text(
-                  'edge touches:      ${_status['edgeTouchCount'] ?? '-'}\n'
-                  'consumed gestures: ${_status['consumedGestureCount'] ?? '-'}\n'
-                  'last gesture:      ${_status['lastGesture'] ?? '-'}',
+                  'edge touches (stolen while down): ${_status['edgeTouchCount'] ?? '-'}\n'
+                  'nav gestures (intentional):       ${_status['navGestureCount'] ?? '-'}\n'
+                  'stolen touches (no navigation):   ${_status['stolenTouchCount'] ?? '-'}\n'
+                  'cancelled gestures:               ${_status['cancelledGestureCount'] ?? '-'}\n'
+                  'last touch fg package:            ${_status['lastTouchForegroundPackage'] ?? '-'}\n'
+                  'last gesture:                     ${_status['lastGesture'] ?? '-'}',
                   style: const TextStyle(fontFamily: 'monospace', fontSize: 11),
                 ),
                 const SizedBox(height: 8),
@@ -125,6 +143,7 @@ class _OverlayScreenState extends State<OverlayScreen> with SpikeLog {
                 ),
               ],
             ),
+          ),
           ),
         ),
       ),

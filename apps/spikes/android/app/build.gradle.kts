@@ -21,10 +21,28 @@ android {
         // For more information, see: https://flutter.dev/to/review-gradle-config.
         // Console is Android 8/9. API 26 is also the floor for TYPE_APPLICATION_OVERLAY.
         minSdk = 26
-        // Deliberately targeting 28: staying under API 30 avoids package-visibility
-        // filtering, scoped storage, and foreground-service-type requirements, none of
-        // which help a sideloaded app on a fixed Android 8/9 console.
-        targetSdk = 28
+
+        // targetSdk is DELIBERATELY 28 and is load-bearing for the spike results - do NOT bump the
+        // default to "modernise" it. Each step above 28 silently changes platform behaviour the
+        // spikes are trying to measure on the real console:
+        //   - 29+: scoped storage. Breaks reading the iFit APK / any /sdcard path work that S2
+        //          (locating com.ifit.rivendell) depends on. Also restricts background activity
+        //          starts, which changes overlay and app-launch behaviour (S3, S4).
+        //   - 30+: package-visibility filtering. Breaks queryIntentActivities app enumeration - the
+        //          launcher's single core feature (S4, the app grid). A <queries> block in the
+        //          manifest restores the honest, policy-safe subset.
+        //   - 31+: android:exported must be explicit on every component with an intent-filter, and
+        //          every PendingIntent must declare mutability.
+        //   - 34:  foreground services MUST declare a foregroundServiceType or the app is killed
+        //          with MissingForegroundServiceTypeException.
+        // The manifest below is already written to satisfy 30/31/34, so a high-targetSdk build is
+        // valid; only the runtime *behaviour* differs, which is exactly why 28 stays the default.
+        //
+        // Override only for install-compatibility experiments on OEMs that block low targetSdk
+        // (INSTALL_FAILED_DEPRECATED_SDK_VERSION), e.g. `-PstrideTargetSdk=35`. compileSdk must be
+        // >= the chosen targetSdk (it tracks the Flutter SDK, currently well above 35).
+        val strideTargetSdk = (project.findProperty("strideTargetSdk") as String?)?.toIntOrNull() ?: 28
+        targetSdk = strideTargetSdk
         versionCode = flutter.versionCode
         versionName = flutter.versionName
     }

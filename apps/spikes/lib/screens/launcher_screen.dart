@@ -84,8 +84,10 @@ class _LauncherScreenState extends State<LauncherScreen> with SpikeLog {
             child: Text(
               'Revert without a UI:\n'
               '  adb shell cmd package set-home-activity <pkg>/<activity>\n'
-              'or clear the default:\n'
-              '  adb shell pm clear android\n\n'
+              'or force a fallback by disabling this app:\n'
+              '  adb shell pm disable-user --user 0 io.stride.spikes\n\n'
+              'Never run "pm clear android" - it wipes system package settings '
+              'and can take ADB with it. See docs/RUNBOOK.md.\n\n'
               'S1 passes only after a full reboot with Stride as HOME, followed by a '
               'successful return to iFit.',
               style: TextStyle(fontFamily: 'monospace', fontSize: 11),

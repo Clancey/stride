@@ -1,0 +1,10 @@
+# Dart
+.dart_tool/
+.packages
+pubspec.lock
+
+# Throwaway mTLS material - never commit. The repo root .gitignore also covers
+# these; this is a local backstop.
+certs/
+*.pem
+*.key

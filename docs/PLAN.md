@@ -393,8 +393,8 @@ late firmware discovery could have invalidated a lot of work. Reordered:
 
 | Phase | Outcome | Gate |
 |---|---|---|
-| **0. Spikes** | Retire the existential unknowns (§6) | S1, S2, S6 all pass |
-| **1. Coordinator + GlassOS** | §3.1 service, on-device cert extraction wizard, GlassOS gRPC client (Dart stubs from the iFit protos), `ConsoleInfo`-seeded ranges, + **one safely-bounded command** (incline only, or speed capped low). Headless — no launcher, no UI polish | Real control on the 1750, with clamps / watchdog / stop-preemption enforced from the very first command |
+| **0. Spikes** | Retire the existential unknowns (§6) | S1, **S2-A**, S6 all pass |
+| **1. Coordinator + GlassOS** | §3.1 service, on-device cert extraction wizard, GlassOS gRPC client (Dart stubs from the iFit protos), `ConsoleInfo`-seeded ranges, + **one safely-bounded command** (incline only, or speed capped low). Headless — no launcher, no UI polish | **S2-B** passes: real control on the 1750, with clamps / watchdog / stop-preemption enforced from the very first command, and the dead-client behaviour documented |
 | **2. Overlay + navigation** | Always-visible strip + expanded panel; **AccessibilityService providing Back / Home / Recents**; edge-swipe gesture layer (§3.3). Simplest possible rendering | Overlay survives launching Spotify, you can get *back out* of it, and stop is always reachable |
 | **3. Media coupling** | MediaSession control with ownership tracking; pause/resume tied to workout state | Pause workout → Spotify pauses; resume restores only what Stride paused |
 | **4. Launcher shell** | Default HOME, app grid, pin/unpin, iFit still launchable as escape hatch | Boots and survives reboot |
@@ -452,7 +452,8 @@ moving.
 
 ## 6. Phase 0 spikes
 
-Each answers a yes/no question. A "no" on S1, S2, or S6 changes or kills the project.
+Each answers a yes/no question. A "no" on S1, S2-A, or S6 changes or kills the project. S2-B does not
+gate Phase 0 — it gates shipping any control code, and it belongs behind the Coordinator (see below).
 
 - **S1 — Can the launcher be replaced *and reverted*?** Sideload a hello-world HOME app, set it
   default, reboot, and get back to iFit. Establishes the escape hatch and the documented recovery
@@ -473,11 +474,21 @@ Each answers a yes/no question. A "no" on S1, S2, or S6 changes or kills the pro
   7. reconnect cleanly after GlassOS restart, app restart, and process death;
   8. determine **what the belt does when the controlling client disappears** (feeds §5 hazard row 1);
   9. check for SELinux / endpoint restrictions on a non-system app.
+
+  **Split into two gates.** Steps 1-4, 6, 7 and 9 are read-only and safe to run alone; call that
+  **S2-A**, and it is what gates starting Phase 1. Steps 5 and 8 move a treadmill; call that
+  **S2-B**, and it gates shipping *any* control code. S2-B belongs behind the Control and Safety
+  Coordinator (§3.1) with clamps and stop-preemption already enforced — not in a throwaway spike
+  harness. Note also that step 2 must verify the server genuinely *demands* the client certificate;
+  a handshake that would also succeed without one has not proven mTLS.
 - **S2b — Are certs per-device or shared?** tHUD's docs say per-device; NordicFTMS's prebuilt-APK
-  distribution implies shared. Test by trying NordicFTMS's release APK against your 1750: if it
-  connects, the cert is shared at least across that model line. Doesn't block anything — on-device
-  self-extraction is correct either way — but it determines how much onboarding friction real users
-  will face.
+  distribution implies shared. **Do not test this by seeing whether NordicFTMS's release APK
+  connects.** Success there is real evidence of sharing, but *failure is inconclusive* — it is
+  equally explained by firmware version, GlassOS API drift, a rejected `client_id`, an ABI mismatch,
+  or an ordinary bug. Test it directly instead: inspect the extracted client certificate's subject,
+  SAN, validity window and SHA-256 fingerprint. A subject carrying the console's serial number
+  settles it from a single machine. Doesn't block anything — on-device self-extraction is correct
+  either way — but it determines how much onboarding friction real users will face.
 - **S10 — AccessibilityService for Back/Home/Recents.** Can it be enabled via
   `settings put secure enabled_accessibility_services`, does it **survive reboot** on this firmware,
   and does `GLOBAL_ACTION_BACK` actually work over third-party apps here? **Back has no alternative

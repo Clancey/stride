@@ -1,0 +1,22 @@
+name: glassos_mock
+description: >-
+  Mock GlassOS gRPC server for Stride. Simulates a NordicTrack Commercial 1750
+  iFit console (mTLS, belt physics, fault injection) so the treadmill control
+  app can be developed without hardware. See docs/PLAN.md sections 3.4, 5, 7.
+publish_to: 'none'
+version: 0.1.0
+
+environment:
+  sdk: ^3.12.2
+
+# grpc gives us the HTTP/2 + mTLS server. We deliberately do NOT depend on any
+# generated protobuf stubs: the real GlassOS schema is unknown, so messages are
+# hand-encoded with a small wire-format codec (lib/src/proto_codec.dart) that
+# mirrors the decoder in apps/spikes/lib/glassos_probe.dart. Swapping in the
+# real schema later means replacing lib/src/messages.dart only.
+dependencies:
+  grpc: ^4.0.0
+
+dev_dependencies:
+  lints: ^5.0.0
+  test: ^1.25.0

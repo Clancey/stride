@@ -19,6 +19,7 @@ class SpikeBridge {
   static Future<bool> startOverlay() => _bool('startOverlay');
   static Future<bool> stopOverlay() => _bool('stopOverlay');
   static Future<Map<String, dynamic>> overlayStatus() => _map('overlayStatus');
+  static Future<bool> resetOverlayCounters() => _bool('resetOverlayCounters');
 
   // S4 - app inventory
   static Future<List<Map<String, dynamic>>> listApps() => _list('listApps');

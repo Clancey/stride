@@ -6,11 +6,41 @@
 
     <!-- S9: keep the coordinator/overlay service alive -->
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE"/>
+    <!-- API 34+ requires a typed foreground service. The overlay is neither media nor location nor
+         any of the other predefined categories - it draws diagnostic/navigation windows for a
+         console with no hardware buttons - so "special use" is the honest type. Harmless below 34. -->
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_SPECIAL_USE"/>
     <uses-permission android:name="android.permission.RECEIVE_BOOT_COMPLETED"/>
     <uses-permission android:name="android.permission.WAKE_LOCK"/>
 
     <!-- S2: GlassOS gRPC is on loopback, but INTERNET is still required for sockets -->
     <uses-permission android:name="android.permission.INTERNET"/>
+
+    <!-- S4 app enumeration under targetSdk 30+ package-visibility filtering.
+         This <queries> block restores visibility of exactly the things the launcher legitimately
+         resolves: MAIN/LAUNCHER + MAIN/LEANBACK_LAUNCHER (the app grid, incl. TV-only apps),
+         MAIN/HOME (S1 home candidates / revert path), the MediaBrowserService signal (S5 ranking),
+         and the iFit console package by name (S2 cert extraction).
+         We deliberately do NOT request QUERY_ALL_PACKAGES: it is a Google Play policy-restricted
+         permission and has no place in a shipping launcher. Ignored below targetSdk 30. -->
+    <queries>
+        <intent>
+            <action android:name="android.intent.action.MAIN"/>
+            <category android:name="android.intent.category.LAUNCHER"/>
+        </intent>
+        <intent>
+            <action android:name="android.intent.action.MAIN"/>
+            <category android:name="android.intent.category.LEANBACK_LAUNCHER"/>
+        </intent>
+        <intent>
+            <action android:name="android.intent.action.MAIN"/>
+            <category android:name="android.intent.category.HOME"/>
+        </intent>
+        <intent>
+            <action android:name="android.media.browse.MediaBrowserService"/>
+        </intent>
+        <package android:name="com.ifit.rivendell"/>
+    </queries>
 
     <application
         android:label="Stride Spikes"
@@ -46,10 +76,29 @@
             </intent-filter>
         </activity>
 
-        <!-- S3 / S9: overlay host -->
+        <!-- S3 / S9: overlay host. foregroundServiceType is required at API 34+ (see permission
+             note above); "specialUse" is the honest category for diagnostic/navigation overlay
+             windows. The subtype property documents that use for review tooling. Both are ignored
+             below API 34, so the targetSdk 28 build is unaffected. -->
         <service
             android:name=".OverlayService"
-            android:exported="false"/>
+            android:exported="false"
+            android:foregroundServiceType="specialUse">
+            <property
+                android:name="android.app.PROPERTY_SPECIAL_USE_FGS_SUBTYPE"
+                android:value="Diagnostic overlay and edge-navigation windows for a console with no hardware Home/Back buttons (Phase 0 spike harness). Never commands the motor."/>
+        </service>
+
+        <!-- S3: restart the draw-only overlay after reboot so "survives reboot" can be tested.
+             SAFETY: this harness has no motor-control path, so nothing started on boot can move the
+             belt (see BootReceiver). -->
+        <receiver
+            android:name=".BootReceiver"
+            android:exported="true">
+            <intent-filter>
+                <action android:name="android.intent.action.BOOT_COMPLETED"/>
+            </intent-filter>
+        </receiver>
 
         <!-- S10: Back / Recents. The ONLY mechanism available to a non-system app.
              Enable with:
