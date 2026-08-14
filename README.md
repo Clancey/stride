@@ -93,6 +93,37 @@ cd packages/stride_control && dart test   # safety coordinator, incl. failure mo
 cd tools/glassos_mock      && dart test   # mock console physics and fault injection
 ```
 
+**Also run Android lint — `flutter build` does not, and the Dart tests cannot see Kotlin:**
+
+```bash
+cd apps/spikes/android
+JAVA_HOME=/Library/Java/JavaVirtualMachines/temurin-17.jdk/Contents/Home \
+  ./gradlew :app:lintDebug     # Gradle needs JDK 17+
+```
+
+`NewApi`/`InlinedApi` are errors that abort the build. This is not pedantry. We compile against a
+modern SDK but target a console on API 26-28, so a newer method overload compiles fine, passes every
+test, and then throws `NoSuchMethodError` on the device. That already happened once:
+`MotionEvent.getRawX(int)` is API 29+, and it crashed the overlay on the first edge swipe — taking
+out the only Back and Home button the console has.
+
+### Testing on an emulator first
+
+Use an **API 28 touch** device, not an Android TV image and not API 33+:
+
+```bash
+sdkmanager "system-images;android-28;google_apis;arm64-v8a"
+avdmanager create avd -n Stride_Console_API28 \
+  -k "system-images;android-28;google_apis;arm64-v8a" -d "Nexus 10"
+# edit ~/.android/avd/Stride_Console_API28.avd/config.ini:
+#   hw.lcd.width=1280  hw.lcd.height=800  hw.lcd.density=160  hw.screen=multi-touch
+```
+
+A TV image has no touchscreen, so the edge-swipe navigation is untestable on it; an API 33+ image
+hides API-level bugs because the newer methods exist. See `docs/SPIKES.md` for what an emulator run
+does and does not tell you — the short version is that it catches crashes and API mistakes, and
+answers **nothing** about GlassOS, certificates, the motor, or the safety key.
+
 ---
 
 ## Credentials

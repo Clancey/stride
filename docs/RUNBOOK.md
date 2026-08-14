@@ -244,8 +244,10 @@ Collected here so a fresh flash can be brought back to a testable state quickly.
 adb shell appops set io.stride.spikes SYSTEM_ALERT_WINDOW allow
 
 # S5 - MediaSessionManager.getActiveSessions() requires an enabled notification listener.
-# Verified present on API 33. NOT present on API 26 (NotificationManagerService gained this
-# shell command in API 27), so try it and check the result rather than assuming it worked:
+# Verified present on API 33 and on API 28, where it also *appends* rather than overwriting
+# (an unrelated setupwizard listener already in the list survived). NOT present on API 26
+# (NotificationManagerService gained this shell command in API 27), so try it and check the
+# result rather than assuming it worked:
 adb shell cmd notification allow_listener \
   io.stride.spikes/io.stride.spikes.StrideNotificationListener
 adb shell settings get secure enabled_notification_listeners

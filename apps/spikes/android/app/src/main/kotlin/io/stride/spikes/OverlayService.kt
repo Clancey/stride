@@ -324,6 +324,25 @@ class OverlayService : Service() {
     }
 
     /**
+     * Raw screen X for a pointer index, safe on API 26-28.
+     *
+     * [MotionEvent.getRawX] with a pointer-index argument is API 29+. The console is API 26-28, where
+     * calling it throws NoSuchMethodError and kills OverlayService outright. That is not a cosmetic
+     * bug: on a machine with no physical Home or Back button the overlay is the only navigation, so
+     * the crash strands the user in whatever app is foregrounded. Derive the raw coordinate from the
+     * pointer-0 raw/local delta instead, which is exact because every pointer in one MotionEvent
+     * shares the same window-to-screen offset.
+     */
+    private fun rawXCompat(event: MotionEvent, pointerIndex: Int): Float =
+        if (pointerIndex == 0) event.rawX
+        else event.getX(pointerIndex) + (event.rawX - event.getX(0))
+
+    /** Raw screen Y for a pointer index, safe on API 26-28. See [rawXCompat]. */
+    private fun rawYCompat(event: MotionEvent, pointerIndex: Int): Float =
+        if (pointerIndex == 0) event.rawY
+        else event.getY(pointerIndex) + (event.rawY - event.getY(0))
+
+    /**
      * A thin, always-touchable strip at one edge.
      *
      * Gesture tracking is bound to a single pointer (the one that started the gesture). The cost is
@@ -451,7 +470,7 @@ class OverlayService : Service() {
                         event.findPointerIndex(activePointerId) != -1
                     if (ours) {
                         val idx = event.findPointerIndex(activePointerId)
-                        evaluateGesture(event.getRawX(idx), event.getRawY(idx))
+                        evaluateGesture(rawXCompat(event, idx), rawYCompat(event, idx))
                     }
                     restoreStrip(view)
                     activePointerId = MotionEvent.INVALID_POINTER_ID

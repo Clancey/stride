@@ -54,6 +54,25 @@ android {
             signingConfig = signingConfigs.getByName("debug")
         }
     }
+
+    lint {
+        // NewApi is a correctness gate, not style. `flutter build` never runs lint and the Dart
+        // tests cannot see Kotlin, so an API-29-only call compiled and shipped happily and then
+        // threw NoSuchMethodError on the first edge swipe on an API 28 device - killing the overlay,
+        // which is the only Back/Home this console has. Fail the build instead.
+        //
+        // This matters more here than in a normal app because we target an old console (API 26-28)
+        // while compiling against a modern SDK, so almost every convenient new API overload is a
+        // latent crash that only reproduces on hardware nobody has yet.
+        error += listOf("NewApi", "InlinedApi")
+        abortOnError = true
+
+        // Everything else stays advisory: this is a spike harness and unrelated style noise should
+        // not block a build we need in order to answer hardware questions.
+        warningsAsErrors = false
+        checkReleaseBuilds = true
+        textReport = true
+    }
 }
 
 kotlin {

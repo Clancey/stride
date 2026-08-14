@@ -43,6 +43,61 @@ tree-shaking. Measuring it tells you nothing useful about shipping performance. 
 cannot tell you whether resuming was the *right* call — that depends on whether the user intervened,
 which only you observed.
 
+### The API 28 emulator: run this before you touch the treadmill
+
+An emulator cannot answer a single hardware question — there is no GlassOS, no certs, no motor, no
+safety key. What it *can* do is catch the failures that would otherwise burn a hardware session, and
+it already earned its keep.
+
+```bash
+sdkmanager "system-images;android-28;google_apis;arm64-v8a"
+avdmanager create avd -n Stride_Console_API28 \
+  -k "system-images;android-28;google_apis;arm64-v8a" -d "Nexus 10"
+# then edit ~/.android/avd/Stride_Console_API28.avd/config.ini:
+#   hw.lcd.width=1280  hw.lcd.height=800  hw.lcd.density=160  hw.screen=multi-touch
+```
+
+Match the console's API level (26-28) and use a **touch** device. This matters more than it sounds:
+
+- An Android **TV** image cannot test the edge swipes at all — no touchscreen — so the entire
+  navigation feature is untestable there. The overlay looked perfectly healthy on the TV emulator.
+- An API 33+ image silently hides every API-level bug, because the newer method actually exists.
+
+Running the harness on an API 28 touch emulator immediately crashed `OverlayService` with
+`NoSuchMethodError: getRawX(I)F` on the first edge swipe — `MotionEvent.getRawX(int)` is API 29+.
+On the console that crash would have killed the overlay, which is the **only** Back and Home on a
+machine with no physical buttons, and it would have looked exactly like a mysterious hardware
+incompatibility while standing next to a treadmill.
+
+What the emulator confirmed, and what it did not:
+
+| Checked on API 28 emulator | Result | Transfers to the console? |
+|---|---|---|
+| Stride can be set as HOME, and reverted | both work | **No** — GlassOS may lock HOME. S1 still required |
+| ADB survives a reboot | yes | **No** — emulator ADB is not the console's. Gate still required |
+| Accessibility service survives reboot, stays bound | yes | **Partly** — good sign for S10; OEM policy may differ |
+| Overlay auto-restarts at boot, stays foreground | yes | Partly, same caveat |
+| Edge swipe reveals the nav panel over a third-party app | yes | Partly — real apps are more hostile |
+| Back/Home/Recents act via accessibility | yes | Partly |
+| Touch interference counters attribute to the foreground app | yes, 0 stolen | Yes, mechanism is generic |
+| App enumeration + media ranking (S4) | 19 apps, ranked correctly | **No** — a non-GMS console has a different app set |
+| `cmd notification allow_listener` exists and *appends* | yes on API 28 | Likely; still unverified below 28 |
+| Anything about GlassOS, certs, the motor, or the safety key | **nothing** | — |
+
+### Run Android lint. `flutter build` does not.
+
+The `getRawX` crash was a compile-clean, test-clean, ship-ready bug: the Dart tests cannot see Kotlin,
+and `flutter build apk` never invokes lint. Lint catches it instantly.
+
+```bash
+cd apps/spikes/android && JAVA_HOME=<jdk17> ./gradlew :app:lintDebug
+```
+
+`NewApi` and `InlinedApi` are now `error` + `abortOnError` in `app/build.gradle.kts`, so this class of
+bug fails the build. Expect this to keep mattering: we compile against a modern SDK while targeting a
+console stuck on API 26-28, so every convenient new overload is a latent crash that only reproduces
+on hardware nobody has yet.
+
 ---
 
 ## Status board
