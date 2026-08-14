@@ -238,6 +238,27 @@ name will wrongly look like a failure. If the label is absent, re-add the compon
 surgical snippet in §3 (append, never overwrite — the list is shared with OEM services), then set
 `accessibility_enabled 1` and re-check `dumpsys`.
 
+**Installing a new build does both of these to you.** `adb install -r` stops the app, which tears
+down `OverlayService` — so the HUD and the edge swipes are gone until you start them again from
+**Hardware diagnostics → S3 — Overlay → Start**. `OverlayService` is deliberately not exported, so
+`am startservice` from the host is refused (`Requires permission not exported from uid`); it has to
+be started from inside the app. And if you `force-stop` at any point, the accessibility service is
+wiped as described above and **Back** stops working even though **Home** still does — Home is a real
+intent that Stride receives as the HOME activity, whereas Back exists only through accessibility.
+That asymmetry is the tell: if Home works and Back does not, it is this, not the overlay.
+
+After any reinstall, the full restore is:
+
+```bash
+adb shell settings put secure enabled_accessibility_services \
+  io.stride.spikes/io.stride.spikes.StrideAccessibilityService
+adb shell settings put secure accessibility_enabled 1
+# then, in the app: Hardware diagnostics → S3 — Overlay → Start
+```
+
+On the real console, do this **before** you step on the belt, and confirm both Back and Home work
+against a third-party app first.
+
 ---
 
 ## 5. If the belt is moving and you cannot stop it
