@@ -3,6 +3,7 @@ package io.stride.spikes
 import android.app.Notification
 import android.app.NotificationChannel
 import android.app.NotificationManager
+import android.app.PendingIntent
 import android.app.Service
 import android.content.Context
 import android.content.Intent
@@ -113,7 +114,9 @@ class OverlayService : Service() {
             active?.let { svc -> svc.mainHandler.post { svc.rebuildChromeViews() } }
         }
 
-        private const val CHANNEL_ID = "stride_spikes_overlay"
+        // v2: Android freezes a channel's importance at creation time, so raising this from MIN to
+        // LOW needs a new id to reach consoles that already ran an older build.
+        private const val CHANNEL_ID = "stride_overlay_v2"
         private const val NOTIFICATION_ID = 4321
 
         /** Minimum travel before an edge touch is treated as navigation rather than passed up. */
@@ -480,15 +483,31 @@ class OverlayService : Service() {
             val channel = NotificationChannel(
                 CHANNEL_ID,
                 "Stride overlay",
-                NotificationManager.IMPORTANCE_MIN,
+                // LOW, not MIN: MIN can be collapsed out of sight, and this notification is the
+                // only way back to Stride from screens that hide our overlay.
+                NotificationManager.IMPORTANCE_LOW,
             )
             channel.setShowBadge(false)
             nm.createNotificationChannel(channel)
         }
+        // Android hides our overlay windows over Settings (anti-tapjacking), which takes Back and
+        // Home away exactly where a rider is most likely to get lost. The shade is a system window
+        // and stays reachable, so this notification is the escape hatch back to the launcher.
+        val home = Intent(this, MainActivity::class.java).apply {
+            action = Intent.ACTION_MAIN
+            addCategory(Intent.CATEGORY_LAUNCHER)
+            flags = Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_RESET_TASK_IF_NEEDED
+        }
+        var flags = PendingIntent.FLAG_UPDATE_CURRENT
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
+            flags = flags or PendingIntent.FLAG_IMMUTABLE
+        }
+        val backToStride = PendingIntent.getActivity(this, 0, home, flags)
         val notification: Notification = Notification.Builder(this, CHANNEL_ID)
-            .setContentTitle("Stride spike overlay")
-            .setContentText("Diagnostic overlay - no telemetry, no motor control")
+            .setContentTitle("Stride is running")
+            .setContentText("Tap to return to the launcher")
             .setSmallIcon(android.R.drawable.ic_menu_compass)
+            .setContentIntent(backToStride)
             .setOngoing(true)
             .build()
         startForeground(NOTIFICATION_ID, notification)

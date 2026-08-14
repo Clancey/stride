@@ -111,6 +111,14 @@ class _SettingsScreenState extends State<SettingsScreen>
                     ),
                   ),
                   const SizedBox(height: StrideSpace.lg),
+                  _Section(
+                    title: 'Android settings',
+                    subtitle:
+                        "Wi-Fi, sound, display and everything else that belongs to the console "
+                        "rather than to Stride.",
+                    child: _AndroidSettingsRow(onOpen: _openSystemSettings),
+                  ),
+                  const SizedBox(height: StrideSpace.lg),
                   _AdvancedSection(
                     open: _advancedOpen,
                     onToggle: () =>
@@ -121,6 +129,14 @@ class _SettingsScreenState extends State<SettingsScreen>
                 ],
               ),
       ),
+    );
+  }
+
+  Future<void> _openSystemSettings() async {
+    final ok = await SpikeBridge.openSystemSettings();
+    if (!mounted || ok) return;
+    ScaffoldMessenger.of(context).showSnackBar(
+      const SnackBar(content: Text("Android settings wouldn't open on this console.")),
     );
   }
 
@@ -196,6 +212,60 @@ class _Section extends StatelessWidget {
           ],
           const SizedBox(height: StrideSpace.md),
           child,
+        ],
+      ),
+    );
+  }
+}
+
+class _AndroidSettingsRow extends StatelessWidget {
+  const _AndroidSettingsRow({required this.onOpen});
+
+  final Future<void> Function() onOpen;
+
+  @override
+  Widget build(BuildContext context) {
+    return Container(
+      padding: const EdgeInsets.all(StrideSpace.md),
+      decoration: BoxDecoration(
+        color: StrideColors.panelHigh,
+        borderRadius: BorderRadius.circular(StrideRadius.md),
+        border: Border.all(color: StrideColors.line),
+      ),
+      child: Row(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          const Icon(
+            Icons.info_outline,
+            color: StrideColors.warning,
+            size: 26,
+          ),
+          const SizedBox(width: StrideSpace.sm),
+          // The rider needs this before they tap, not after: Android blanks non-system overlays
+          // over its own settings pages, so Stride's Back and Home disappear in there and this
+          // console has no physical buttons to fall back on.
+          Expanded(
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Text(
+                  'Stride’s controls are hidden in there',
+                  style: Theme.of(context).textTheme.titleMedium,
+                ),
+                const SizedBox(height: StrideSpace.xxs),
+                Text(
+                  'Android blanks them over its own settings screens. To come back, swipe down '
+                  'from the top of the screen and tap Stride.',
+                  style: Theme.of(context).textTheme.bodyMedium,
+                ),
+              ],
+            ),
+          ),
+          const SizedBox(width: StrideSpace.sm),
+          FilledButton(
+            onPressed: onOpen,
+            child: const Text('Open Android settings'),
+          ),
         ],
       ),
     );

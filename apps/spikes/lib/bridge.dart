@@ -145,6 +145,7 @@ class SpikeBridge {
   static Future<List<Map<String, dynamic>>> grantsGet() => _list('grantsGet');
   static Future<bool> grantOpenSettings(String id) =>
       _bool('grantOpenSettings', <String, dynamic>{'id': id});
+  static Future<bool> openSystemSettings() => _bool('openSystemSettings');
   static Future<Map<String, dynamic>> trackFloorGet() => _map('trackFloorGet');
   static Future<bool> trackFloorSet(bool? chosen) =>
       _bool('trackFloorSet', <String, dynamic>{'chosen': chosen});

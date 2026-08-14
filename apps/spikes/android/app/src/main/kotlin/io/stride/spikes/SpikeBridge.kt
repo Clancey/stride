@@ -127,6 +127,8 @@ class SpikeBridge(private val context: Context) : MethodChannel.MethodCallHandle
                         ),
                 )
 
+                "openSystemSettings" -> result.success(openSystemSettings())
+
                 // --- S10: navigation ---
                 "accessibilityConnected" -> result.success(StrideAccessibilityService.isConnected())
                 "accessibilityEnabledInSettings" -> result.success(accessibilityEnabledInSettings())
@@ -207,6 +209,13 @@ class SpikeBridge(private val context: Context) : MethodChannel.MethodCallHandle
             }
         }
         return false
+    }
+
+    private fun openSystemSettings(): Boolean {
+        val intent = Intent(Settings.ACTION_SETTINGS).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+        if (intent.resolveActivity(context.packageManager) == null) return false
+        context.startActivity(intent)
+        return true
     }
 
     private fun goHome(): Boolean {
