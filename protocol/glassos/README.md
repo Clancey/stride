@@ -33,9 +33,31 @@ Confirmed by reading `/proc/net/tcp6` on the console: the listening socket on po
 loopback-only — unreachable from the network, but directly reachable by any app running on the
 console. Which is exactly what Stride is.
 
-Authentication is believed to require mutual TLS plus a `client_id` header. **Unverified on this
-firmware.** The client credentials are *not* in the GlassOS APK — it ships only Let's Encrypt
-roots (`res/3l.pem`, `res/8R.pem`) for outbound HTTPS. Their real location is still open.
+Authentication requires mutual TLS. **Verified live against the user's console**, not assumed.
+
+The server presents a certificate with `CN=localhost`, issued by `CN=testca`
+(`O=Internet Widgits Pty Ltd` — OpenSSL's placeholder defaults). Connecting without a client
+certificate fails the handshake with TLS alert 40; connecting with a *wrong* client certificate
+fails with alert 46 (`certificate_unknown`). So the server genuinely verifies clients.
+
+The credentials are **not** in the GlassOS APK, and looking there was a mistake: GlassOS is the
+*server*. It ships only Let's Encrypt roots (`res/3l.pem`, `res/8R.pem`) for its own outbound
+HTTPS. Client credentials live in the *clients*.
+
+`org.cagnulen.qdomyoszwift` bundles them uncompiled at `assets/ca_cert.pem`,
+`assets/client_cert.pem`, `assets/client_key.pem`. The client certificate's subject is
+`CN=com.ifit.eriador` — it authenticates as one of iFit's own applications.
+
+These are iFit's factory credentials, not per-device ones: the CA in that APK verifies the server
+certificate on this console (`openssl verify` → `OK`), and the two were minted three minutes apart
+on 2023-10-25. They expire **2033-10-22**.
+
+Two client-side gotchas:
+
+- The server certificate uses a legacy Common Name with **no SAN**, which modern TLS stacks reject
+  outright (Go refuses it; Android will too). The Android client needs a trust manager pinned to
+  this CA that verifies the chain without hostname matching, rather than blanket-trusting everything.
+- ALPN must offer `h2`. Negotiated cipher is `ECDHE-RSA-AES128-GCM-SHA256` over TLS 1.2.
 
 ## Why this changes the design
 
@@ -54,6 +76,48 @@ definitions provide one, and reading is categorically safer than commanding:
   resolves the "a session is user intent, not machine state" divergence flagged in review: we can
   now show both, and reconcile them, instead of guessing.
 
+## The proto3 trap that would make Stride lie
+
+This is the most important thing in this document.
+
+**proto3 does not serialize default values.** A field that is `0.0` and a field that was never set
+are byte-identical on the wire. Read against the real console while it sat `IDLE`, every metric
+service answered like this:
+
+```
+SpeedService/GetSpeed          -> {}
+InclineService/GetIncline      -> {}
+CaloriesBurnedService/...      -> {}
+DistanceService/GetDistance    -> { "remainingDistanceKm": "NaN" }
+ElapsedTimeService/...         -> { "timeRemaining": "NaN" }
+```
+
+An empty message deserialized into a Kotlin data class with numeric fields yields **`0.0`
+everywhere**. Rendered without care, that puts a confident `0.0 mph` beside a belt whose real
+state we do not know. That is precisely the fabricated-zero bug this project already shipped once
+and deliberately removed, and the API hands it to us by default.
+
+Rules, non-negotiable:
+
+1. **Absent numeric field means no reading, not zero.** Parse into nullable types. Never let a
+   protobuf default reach the UI as a number.
+2. **`NaN` means no reading.** It appears in normal operation, as above. Check explicitly;
+   `NaN` also fails every comparison, so it will silently survive range checks.
+3. **`CanRead` must default to false.** `AvailabilityResponse{ bool isAvailable }` is *also*
+   proto3, so an unavailable service answers `{}` — the `false` is omitted, not transmitted. A
+   client that defaults this field to `true` concludes the opposite of the truth. Deny by default.
+
+Rule 3 is not hypothetical. Measured on the 1750:
+
+| Service | `CanRead` | Meaning |
+|---|---|---|
+| Distance, Speed, Incline, ElapsedTime, CaloriesBurned, HeartRate | `{"isAvailable": true}` | readable |
+| **StepCount, Cadence** | `{}` | **not available** |
+
+Cadence being unavailable settles an open question — the 1750 has no cadence sensor, and the
+console reports that honestly. Ask `CanRead` before showing a metric, and show "Not measured"
+rather than a zero when it says no.
+
 ## The services that matter to Stride
 
 | Service | Get | Stream | Key field |
@@ -64,7 +128,7 @@ definitions provide one, and reading is categorically safer than commanding:
 | `ElapsedTimeService` | `GetElapsedTime` | — | `timeSeconds` |
 | `CaloriesBurnedService` | `GetCaloriesBurned` | — | calories |
 | `HeartRateService` | — | — | heart rate |
-| `StepCountService` | — | — | steps |
+| `StepCountService` | — | — | steps (unavailable on 1750) |
 | `ConsoleService` | `GetConsoleState` | `ConsoleStateChanged` | `ConsoleState` enum |
 
 Units are metric at the wire (`Km`, `Kph`). Convert at the edge, and only at the edge.
@@ -72,10 +136,45 @@ Units are metric at the wire (`Km`, `Kph`). Convert at the edge, and only at the
 Pace is not a service — iFit derives it from speed. Derive it the same way, from a *measured*
 speed, and never from elapsed time against an assumed speed.
 
+## Reproducing the read
+
+Verified working against the console on 2026-08-13. Read-only calls only.
+
+```sh
+adb -s <console> forward tcp:54321 tcp:54321
+grpcurl -insecure \
+  -cert client_cert.pem -key client_key.pem \
+  -import-path protocol/glassos -proto console/ConsoleService.proto \
+  -H client_id:com.ifit.eriador \
+  127.0.0.1:54321 com.ifit.glassos.ConsoleService/GetConsoleState
+# -> { "consoleState": "IDLE" }
+```
+
+`-insecure` here skips Go's hostname verification only; the chain itself was verified separately
+with `openssl verify -CAfile ca_cert.pem`. Stride must not take the blanket-trust shortcut — see
+the SAN note above.
+
+**`CanRead`, `Get*` and the `*Subscription` streams are safe: reading cannot move the belt.**
+`SetSpeed`, `SetIncline`, `StartNewWorkout` and anything else in `control/` can, and are governed
+by the safety rules in `docs/PLAN.md`. Do not call them casually, and never while someone is on
+the machine.
+
+## On reusing qz's credentials
+
+`org.cagnulen.qdomyoszwift` is GPL-3 and distributes these files publicly in its source tree, so
+obtaining them involves no circumvention — they are published, and they authenticate as
+`com.ifit.eriador` rather than as a per-user identity.
+
+That is a legal and ethical question worth deciding deliberately rather than by default, and it is
+the user's call, not this repo's. The engineering point is narrower: the protocol is reachable and
+the credential shape is known, so Stride's telemetry design no longer depends on solving access.
+If we later ship our own credential path, nothing above changes except where the bytes come from.
+
 ## Still open
 
-- Where the mTLS client certificate and key actually live on this firmware.
 - Whether GlassOS is exclusive-client, i.e. whether a second client disturbs `com.ifit.rivendell`'s
-  session. Read-only calls are expected to be safe in parallel; **this has not been tested on the
-  user's machine and must not be tested while anyone is on the belt.**
-- Whether `CadenceService` returns anything real on a 1750, which has no cadence sensor.
+  session. Read-only calls succeeded while iFit was installed and idle; this has **not** been
+  tested during a live workout and must not be tested while anyone is on the belt.
+- What the metric services return mid-workout. Everything above was measured at `IDLE`, so the
+  populated shape of these messages is still unobserved.
+- Whether the belt keeps moving if a controlling client dies.
