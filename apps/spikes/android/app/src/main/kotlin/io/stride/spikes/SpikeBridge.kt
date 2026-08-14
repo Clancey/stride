@@ -3,6 +3,7 @@ package io.stride.spikes
 import android.content.ComponentName
 import android.content.Context
 import android.content.Intent
+import android.content.pm.ApplicationInfo
 import android.content.pm.PackageManager
 import android.content.pm.ResolveInfo
 import android.graphics.Bitmap
@@ -12,6 +13,7 @@ import android.graphics.drawable.Drawable
 import android.media.AudioManager
 import android.media.session.MediaController
 import android.media.session.PlaybackState
+import android.net.Uri
 import android.os.Build
 import android.os.Handler
 import android.os.Looper
@@ -181,6 +183,9 @@ class SpikeBridge(private val context: Context) : MethodChannel.MethodCallHandle
                 "foregroundPackage" -> result.success(StrideAccessibilityService.foregroundPackage)
 
                 "launchApp" -> result.success(launchApp(call.argument<String>("package")!!))
+                "uninstallApp" -> result.success(
+                    uninstallApp(call.argument<String>("package")!!)
+                )
 
                 // --- appstore: catalog, updates, installs (see appstore/StrideAppstoreService) ---
                 "appstoreStatus" -> result.success(appstore.status())
@@ -364,6 +369,7 @@ class SpikeBridge(private val context: Context) : MethodChannel.MethodCallHandle
                         "activity" to ri.activityInfo.name,
                         "leanback" to false,
                         "hasMediaBrowserService" to false,
+                        "removable" to isRemovable(pkg),
                     )
                 }
                 if (category == Intent.CATEGORY_LEANBACK_LAUNCHER) entry["leanback"] = true
@@ -456,6 +462,41 @@ class SpikeBridge(private val context: Context) : MethodChannel.MethodCallHandle
             ?: leanbackComponentIntent(pkg)
             ?: return false
         intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+        context.startActivity(intent)
+        return true
+    }
+
+    /**
+     * Whether this package can be removed by the rider.
+     *
+     * System-image apps refuse `ACTION_DELETE` (or silently offer to remove updates only), so the
+     * tile must not advertise a delete that the platform will reject. Stride itself is excluded for
+     * the obvious reason: uninstalling the launcher from the launcher leaves the console with no
+     * home screen.
+     */
+    private fun isRemovable(pkg: String): Boolean {
+        if (pkg == context.packageName) return false
+        return try {
+            val info = context.packageManager.getApplicationInfo(pkg, 0)
+            info.flags and ApplicationInfo.FLAG_SYSTEM == 0
+        } catch (_: PackageManager.NameNotFoundException) {
+            false
+        }
+    }
+
+    /**
+     * Hand the package to the system uninstaller.
+     *
+     * `ACTION_DELETE` rather than `PackageInstaller.uninstall`: the system dialog is the
+     * confirmation of record and needs no REQUEST_DELETE_PACKAGES grant. Stride asks the rider
+     * first anyway, because this is a full-screen system activity and a rider mid-walk deserves to
+     * know what is about to take over the screen.
+     */
+    private fun uninstallApp(pkg: String): Boolean {
+        if (!isRemovable(pkg)) return false
+        val intent = Intent(Intent.ACTION_DELETE, Uri.fromParts("package", pkg, null))
+            .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+        if (intent.resolveActivity(context.packageManager) == null) return false
         context.startActivity(intent)
         return true
     }

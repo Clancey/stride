@@ -10,6 +10,7 @@ class LaunchableApp {
     required this.leanback,
     required this.hasMediaBrowserService,
     required this.raw,
+    this.removable = false,
   });
 
   factory LaunchableApp.fromMap(Map<String, dynamic> map) {
@@ -20,6 +21,9 @@ class LaunchableApp {
       activity: map['activity'] as String?,
       leanback: map['leanback'] == true,
       hasMediaBrowserService: map['hasMediaBrowserService'] == true,
+      // Absent means "not removable": an older platform side that does not report
+      // this must not make Stride offer a delete the system will reject.
+      removable: map['removable'] == true,
       raw: map,
     );
   }
@@ -29,6 +33,10 @@ class LaunchableApp {
   final String? activity;
   final bool leanback;
   final bool hasMediaBrowserService;
+
+  /// Whether the console will let the rider uninstall this app. System-image apps
+  /// and Stride itself are not removable.
+  final bool removable;
   final Map<String, dynamic> raw;
 
   int get mediaScore => mediaLikelihood(raw);

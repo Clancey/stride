@@ -64,6 +64,13 @@
         <intent>
             <action android:name="android.media.browse.MediaBrowserService"/>
         </intent>
+        <!-- Removing a pinned app hands the package to the system uninstaller. Without this the
+             ACTION_DELETE resolve fails under package-visibility filtering and the tile's Remove
+             from console button would look broken rather than simply unavailable. -->
+        <intent>
+            <action android:name="android.intent.action.DELETE"/>
+            <data android:scheme="package"/>
+        </intent>
         <package android:name="com.ifit.rivendell"/>
     </queries>
 
