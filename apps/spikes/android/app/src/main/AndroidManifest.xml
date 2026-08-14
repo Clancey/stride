@@ -1,4 +1,5 @@
-<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:tools="http://schemas.android.com/tools">
 
     <!-- S3: overlay windows over other apps. Grant with:
          adb shell appops set io.stride.spikes SYSTEM_ALERT_WINDOW allow -->
@@ -15,6 +16,21 @@
 
     <!-- S2: GlassOS gRPC is on loopback, but INTERNET is still required for sockets -->
     <uses-permission android:name="android.permission.INTERNET"/>
+
+    <!-- Lets Stride put its own accessibility and notification-listener grants back after Android
+         drops them. Reinstalling the app clears enabled_accessibility_services, which silently
+         kills Back and Recents on a console that has no physical buttons - the rider is then stuck
+         inside whatever app is on screen with no way out and nothing on screen explaining why.
+
+         This is a development-tier permission: it can never be granted by a dialog, only once over
+         adb, and it then survives reinstalls because the app keeps declaring it:
+             adb shell pm grant io.stride.spikes android.permission.WRITE_SECURE_SETTINGS
+
+         Without the grant Stride simply falls back to asking the rider, so this is an upgrade to
+         the recovery path rather than a requirement. Stride writes exactly two keys with it and
+         only ever adds its own component - see StridePermissions.repair. -->
+    <uses-permission android:name="android.permission.WRITE_SECURE_SETTINGS"
+        tools:ignore="ProtectedPermissions"/>
 
     <!-- S4 app enumeration under targetSdk 30+ package-visibility filtering.
          This <queries> block restores visibility of exactly the things the launcher legitimately

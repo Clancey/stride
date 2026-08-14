@@ -18,7 +18,11 @@ void main() {
     expect(find.text('Stride'), findsOneWidget);
     expect(find.text('Workout'), findsOneWidget);
     expect(find.text('Elapsed time'), findsOneWidget);
-    expect(find.text('Controls locked'), findsOneWidget);
+    // The launcher used to carry a "Controls locked" panel of dead mini-controls. Stride drives
+    // speed, incline and fan for real now, so that panel was a lie and is gone. The machine
+    // controls live on the overlay, where a rider can reach them mid-run; duplicating them here
+    // only invited the two copies to disagree.
+    expect(find.text('Controls locked'), findsNothing);
     expect(find.text('Start workout'), findsOneWidget);
     expect(find.text('Media volume'), findsOneWidget);
     // With no host attached the machine is unreadable, so the honest sentence is the one about

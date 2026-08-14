@@ -117,14 +117,15 @@ object MachineLink {
 
     /**
      * Why we are in this state, in words a person on the machine can act on — not an error code.
-     * Even when linked, the sentence still leads with what Stride will *not* do, because that is
-     * the part that matters to someone standing on a belt.
+     * This used to lead with what Stride would *not* do, which was the honest thing to say when
+     * nothing here could move a belt. Stride drives the machine now, so saying otherwise would
+     * send a rider to the console for something they can do under their thumb.
      */
     val reason: String
         get() = when (status) {
             Status.LINKED ->
-                "Stride is reading this machine, but doesn't control it. " +
-                    "Speed, incline and fan stay on the console."
+                "Stride is linked to this machine. " +
+                    "Speed, incline and fan respond here or on the console."
             Status.DISCONNECTED -> DISCONNECTED_REASON
         }
 

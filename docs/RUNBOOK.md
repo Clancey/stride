@@ -294,6 +294,54 @@ adb shell settings put secure accessibility_enabled 1
 On the real console, do this **before** you step on the belt, and confirm both Back and Home work
 against a third-party app first.
 
+### Stop having to do this at all
+
+The restore above is a workaround for a problem Stride can fix itself. Grant it once:
+
+```bash
+adb shell pm grant io.stride.spikes android.permission.WRITE_SECURE_SETTINGS
+```
+
+`WRITE_SECURE_SETTINGS` is development-tier: no dialog can ever grant it, and it **survives
+reinstalls** as long as the app keeps declaring it. With it held, `StridePermissions.repair()` puts
+the accessibility and notification-listener entries back by itself — on overlay start, on every
+launcher resume, and on the first press of a Back button that isn't working. It only ever *appends*
+Stride's own component; other apps' entries in those shared lists are preserved
+(`SecureListMergeTest` pins that).
+
+Confirm it took:
+
+```bash
+adb shell dumpsys package io.stride.spikes | grep WRITE_SECURE_SETTINGS
+# expect: android.permission.WRITE_SECURE_SETTINGS: granted=true
+```
+
+Without the grant nothing breaks — Stride falls back to the non-dismissible setup card on the
+launcher, which names the missing grant and deep-links to it. The grant just means the rider never
+sees the card.
+
+**`tools/deploy.sh` does all of this for you** — build, install, grant, verify, launch:
+
+```bash
+tools/deploy.sh              # defaults to 192.168.10.51:33359
+tools/deploy.sh <ip>:<port>  # the wireless-debugging port changes on reboot
+```
+
+### A trap: your overlay is hidden over Settings
+
+Android hides non-system overlay windows over the Settings app's permission pages, on purpose —
+it is the standard defence against overlay tapjacking. So when Stride sends the rider to Settings
+to fix a grant, **Stride's own Back and Home buttons are not on screen there.** On a console with
+no physical buttons that is a one-way trip into Settings.
+
+This is why self-repair matters more than a better prompt: with `WRITE_SECURE_SETTINGS` granted,
+"Fix this" repairs the grant in place and never opens Settings at all. If you do end up stranded in
+Settings, from the host:
+
+```bash
+adb shell am start -n io.stride.spikes/.MainActivity
+```
+
 ---
 
 ## 5. If the belt is moving and you cannot stop it
@@ -314,8 +362,13 @@ adb logcat -d > ~/stride-incident-$(date +%s).log
 ## 6. Permission grants used by the spike harness
 
 Collected here so a fresh flash can be brought back to a testable state quickly.
+`tools/deploy.sh` runs all of these; they are spelled out here for when you need one on its own.
 
 ```bash
+# Grant this one FIRST. It is what lets Stride restore the other two by itself after a reinstall,
+# and it is the only grant here that cannot be repaired from inside the app once lost.
+adb shell pm grant io.stride.spikes android.permission.WRITE_SECURE_SETTINGS
+
 # S3 - overlay windows
 adb shell appops set io.stride.spikes SYSTEM_ALERT_WINDOW allow
 

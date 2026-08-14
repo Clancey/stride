@@ -313,6 +313,7 @@ class OverlayService : Service() {
     private var endTransportButton: TextView? = null
     private var volumeValueView: TextView? = null
     private var moreMenuView: View? = null
+    private var fixItView: View? = null
     private val fanSegmentViews = mutableMapOf<Int, TextView>()
 
     private val amber = Color.rgb(255, 178, 55)
@@ -431,6 +432,10 @@ class OverlayService : Service() {
         // Before anything reads a setting. The overlay can be started by BootReceiver with no
         // Activity ever having run, so it cannot assume the launcher attached the store first.
         StrideSettings.attach(this)
+        // Android drops enabled_accessibility_services on reinstall, which silently kills Back and
+        // Recents. If Stride holds WRITE_SECURE_SETTINGS it just puts them back here, before the
+        // rider ever finds out. Without that grant this is a no-op and the setup card asks instead.
+        StridePermissions.repair(this)
         trackFloorChosen = StrideSettings.trackFloor
         windowManager = getSystemService(Context.WINDOW_SERVICE) as WindowManager
         systemAudio = SystemAudio(this)
@@ -508,6 +513,8 @@ class OverlayService : Service() {
 
     private fun hideOverlays() {
         removeChromeViews()
+        dismissMoreMenu()
+        dismissFixIt()
         handleView?.let { safeRemove(it) }
         handleView = null
         edgeViews.forEach { safeRemove(it) }
@@ -711,6 +718,138 @@ class OverlayService : Service() {
     private fun showMachineControlUnavailable() {
         lastGesture = "machine command blocked: disconnected"
         Toast.makeText(this, MachineLink.CONTROL_LOCKED_NOTICE, Toast.LENGTH_SHORT).show()
+    }
+
+    /**
+     * Back and Recents, or an explanation of why they did nothing.
+     *
+     * Android clears `enabled_accessibility_services` on its own — reinstalling Stride does it,
+     * and so did uninstalling an unrelated app. Before this, Back simply stopped working: no
+     * error, no log the rider can see, just a dead button on a console with no physical buttons.
+     * That is how someone ends up stranded inside Netflix.
+     *
+     * So a failure is never silent. It says what broke and opens the page that fixes it.
+     */
+    private fun navigateOrExplain(label: String, action: (StrideAccessibilityService) -> Boolean) {
+        val svc = StrideAccessibilityService.instance
+        if (svc != null && action(svc)) {
+            lastGesture = "$label ok"
+            return
+        }
+        // Try to fix it outright before bothering the rider. When Stride holds WRITE_SECURE_SETTINGS
+        // this turns a dead button into a working one with no dialog at all — though the service
+        // still has to be bound by the system, so this press may be the one that pays for it.
+        if (StridePermissions.repair(this).isNotEmpty()) {
+            lastGesture = "$label restored the accessibility grant"
+            StrideAccessibilityService.instance?.let {
+                if (action(it)) return
+            }
+        }
+        lastGesture = "$label failed: accessibility service not connected"
+        showFixIt(
+            title = "$label isn't working",
+            body = "Android switched Stride's accessibility service off, and it is the only way to " +
+                "send $label to another app. Turn it back on and this button works again.",
+            where = "Find Stride Spikes in the list and switch it on.",
+            actionLabel = "Open settings",
+        ) {
+            StridePermissions.openSettingsFor(this, StridePermissions.ACCESSIBILITY)
+        }
+    }
+
+    /**
+     * A modal the rider can act on, over whatever app is running.
+     *
+     * A Toast would be wrong here: it is unreadable at arm's length on a moving treadmill, and it
+     * cannot carry the button that actually fixes the problem. Telling someone a permission is
+     * missing without taking them to it is the same as not telling them.
+     */
+    private fun showFixIt(
+        title: String,
+        body: String,
+        where: String?,
+        actionLabel: String,
+        onAction: () -> Unit,
+    ) {
+        dismissFixIt()
+        val scrim = FrameLayout(this).apply {
+            setBackgroundColor(Color.argb(196, 2, 5, 11))
+            isClickable = true
+            setOnClickListener { dismissFixIt() }
+        }
+        val card = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            background = roundedRect(Color.rgb(9, 14, 24), 30f, Color.argb(180, 214, 158, 62))
+            setPadding(dp(34f), dp(28f), dp(34f), dp(28f))
+            isClickable = true
+            layoutParams = FrameLayout.LayoutParams(
+                dp(720f),
+                FrameLayout.LayoutParams.WRAP_CONTENT,
+                Gravity.CENTER,
+            )
+        }
+        card.addView(textView(title, 30f, Color.rgb(236, 242, 255), bold = true))
+        card.addView(
+            textView(body, 19f, Color.rgb(178, 192, 216)).apply {
+                layoutParams = LinearLayout.LayoutParams(
+                    LinearLayout.LayoutParams.MATCH_PARENT,
+                    LinearLayout.LayoutParams.WRAP_CONTENT,
+                ).apply { topMargin = dp(12f) }
+            },
+        )
+        if (where != null) {
+            card.addView(
+                textView(where, 19f, Color.rgb(214, 158, 62), bold = true).apply {
+                    layoutParams = LinearLayout.LayoutParams(
+                        LinearLayout.LayoutParams.MATCH_PARENT,
+                        LinearLayout.LayoutParams.WRAP_CONTENT,
+                    ).apply { topMargin = dp(10f) }
+                },
+            )
+        }
+        card.addView(
+            LinearLayout(this).apply {
+                orientation = LinearLayout.HORIZONTAL
+                gravity = Gravity.END
+                layoutParams = LinearLayout.LayoutParams(
+                    LinearLayout.LayoutParams.MATCH_PARENT,
+                    LinearLayout.LayoutParams.WRAP_CONTENT,
+                ).apply { topMargin = dp(24f) }
+                addView(menuAction("Not now") { dismissFixIt() })
+                addView(
+                    menuAction(actionLabel) {
+                        dismissFixIt()
+                        onAction()
+                    }.apply {
+                        setTextColor(Color.rgb(5, 10, 18))
+                        background = rippleRounded(
+                            color = Color.rgb(214, 158, 62),
+                            radius = 22f,
+                            strokeColor = Color.rgb(214, 158, 62),
+                        )
+                    },
+                )
+            },
+        )
+        scrim.addView(card)
+        try {
+            windowManager.addView(
+                scrim,
+                baseParams(
+                    WindowManager.LayoutParams.MATCH_PARENT,
+                    WindowManager.LayoutParams.MATCH_PARENT,
+                    Gravity.TOP or Gravity.START,
+                ),
+            )
+            fixItView = scrim
+        } catch (_: Exception) {
+            fixItView = null
+        }
+    }
+
+    private fun dismissFixIt() {
+        fixItView?.let { safeRemove(it) }
+        fixItView = null
     }
 
     private fun distanceText(): String =
@@ -1631,10 +1770,7 @@ class OverlayService : Service() {
             )
             addView(menuAction("‹  Back") {
                 dismissMoreMenu()
-                val svc = StrideAccessibilityService.instance
-                lastGesture = if (svc == null) {
-                    "BACK failed: accessibility service not connected"
-                } else if (svc.goBack()) "BACK ok" else "BACK rejected"
+                navigateOrExplain("Back") { it.goBack() }
             })
             addView(menuAction("⌂  Home") {
                 dismissMoreMenu()
@@ -1643,10 +1779,7 @@ class OverlayService : Service() {
             })
             addView(menuAction("▣  Recents") {
                 dismissMoreMenu()
-                val svc = StrideAccessibilityService.instance
-                lastGesture = if (svc == null) {
-                    "RECENTS failed: accessibility service not connected"
-                } else if (svc.goRecents()) "RECENTS ok" else "RECENTS rejected"
+                navigateOrExplain("Recents") { it.goRecents() }
             })
         })
 
@@ -1839,28 +1972,67 @@ class OverlayService : Service() {
                 if (laidOutHeight > 0) publishBottomInset(laidOutHeight) else publishInsetFromLayout(view, top = false)
             }
         }
-        val row = LinearLayout(this).apply {
-            orientation = LinearLayout.HORIZONTAL
-            gravity = Gravity.CENTER_VERTICAL
+        // A frame rather than a row: the workout controls are centred against the whole bar, so
+        // they sit under the rider's eye rather than off in one corner, and they stay put as the
+        // transport changes width. The menu and the hide control ride the far edge independently,
+        // which a single row could not do without the centre drifting whenever they resized.
+        val row = FrameLayout(this).apply {
             layoutParams = LinearLayout.LayoutParams(
                 LinearLayout.LayoutParams.MATCH_PARENT,
                 LinearLayout.LayoutParams.WRAP_CONTENT,
             )
         }
-        row.addView(timerCluster())
-        // Three controls, and two of them are the workout. Back, Home and Recents moved into the
+        row.addView(
+            timerCluster(),
+            FrameLayout.LayoutParams(
+                FrameLayout.LayoutParams.WRAP_CONTENT,
+                FrameLayout.LayoutParams.WRAP_CONTENT,
+                Gravity.CENTER,
+            ),
+        )
+        // Three controls, and one of them is the workout. Back, Home and Recents moved into the
         // menu: they are reachable there and by the edge swipe, and keeping them on the bar meant
         // the belt controls shared a row with navigation for a machine that is mostly not being
         // navigated.
-        // Pushes the menu and the hide control to the far edge, so the workout controls own the
-        // left of the bar and never trade places with them as the transport changes width.
-        row.addView(View(this).apply {
-            layoutParams = LinearLayout.LayoutParams(0, dp(1f), 1f)
+        // Back and Home ride the near edge. This console has no physical buttons at all, so these
+        // are not conveniences -- they are the only way out of an app that has taken the screen.
+        // They were briefly menu-only, which put the most-pressed control on the machine two taps
+        // deep. Recents stays in the menu; it is the one a rider genuinely reaches for rarely.
+        val navCluster = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+        }
+        navCluster.addView(bottomNavButton("Back", "‹", width = dp(104f)) {
+            navigateOrExplain("Back") { it.goBack() }
         })
-        row.addView(bottomNavButton("Menu", "⋯", width = dp(104f)) { showMoreMenu() })
-        row.addView(bottomNavButton("Hide overlay", "⌄", width = dp(150f)) { hideChrome() }.apply {
+        navCluster.addView(bottomNavButton("Home", "⌂", width = dp(104f)) {
+            goHomeFromService()
+            lastGesture = "HOME ok"
+        })
+        row.addView(
+            navCluster,
+            FrameLayout.LayoutParams(
+                FrameLayout.LayoutParams.WRAP_CONTENT,
+                FrameLayout.LayoutParams.WRAP_CONTENT,
+                Gravity.START or Gravity.CENTER_VERTICAL,
+            ),
+        )
+        val edgeCluster = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+        }
+        edgeCluster.addView(bottomNavButton("Menu", "⋯", width = dp(104f)) { showMoreMenu() })
+        edgeCluster.addView(bottomNavButton("Hide overlay", "⌄", width = dp(150f)) { hideChrome() }.apply {
             (layoutParams as LinearLayout.LayoutParams).marginEnd = 0
         })
+        row.addView(
+            edgeCluster,
+            FrameLayout.LayoutParams(
+                FrameLayout.LayoutParams.WRAP_CONTENT,
+                FrameLayout.LayoutParams.WRAP_CONTENT,
+                Gravity.END or Gravity.CENTER_VERTICAL,
+            ),
+        )
         root.addView(row)
         // Bound to machineNoticeView so the 1s ticker can keep it honest. Built from a constant it
         // froze at "doesn't control" and printed that beside a full row of "Not measured", which
@@ -1917,7 +2089,7 @@ class OverlayService : Service() {
         // read as a banner rather than something to press, and a button that wide gives a rider no
         // target to aim at — every part of it is equally the middle of nowhere.
         val lp = LinearLayout.LayoutParams(LinearLayout.LayoutParams.WRAP_CONTENT, dp(88f))
-        lp.marginStart = dp(6f)
+        lp.marginStart = dp(12f)
         lp.marginEnd = dp(12f)
         layoutParams = lp
         primaryTransportButton = textView("", 22f, Color.WHITE, bold = true, gravity = Gravity.CENTER).apply {

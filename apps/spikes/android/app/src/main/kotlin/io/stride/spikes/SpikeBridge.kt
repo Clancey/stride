@@ -114,8 +114,17 @@ class SpikeBridge(private val context: Context) : MethodChannel.MethodCallHandle
                 "settingsGet" -> result.success(settingsGet())
                 "transportSet" -> result.success(transportSet(call))
                 "grantsGet" -> result.success(grantsGet())
+                "grantsRepair" -> result.success(StridePermissions.repair(context))
                 "grantOpenSettings" -> result.success(
-                    StridePermissions.openSettingsFor(context, call.argument<String>("id").orEmpty()),
+                    // Repair first. When Stride can restore the grant itself there is no reason to
+                    // send the rider into a Settings list to do it by hand — and on this console
+                    // Android hides our overlay over those pages, so they arrive with no Back or
+                    // Home button of ours to get out with.
+                    StridePermissions.repair(context).contains(call.argument<String>("id")) ||
+                        StridePermissions.openSettingsFor(
+                            context,
+                            call.argument<String>("id").orEmpty(),
+                        ),
                 )
 
                 // --- S10: navigation ---
@@ -181,6 +190,10 @@ class SpikeBridge(private val context: Context) : MethodChannel.MethodCallHandle
     }
 
     private fun openHomeSettings(): Boolean {
+        // The system role dialog is the right answer when Stride is on screen: one tap, no
+        // hunting through Settings. It is only available from an Activity, so fall back to the
+        // Settings deep link when the request comes from anywhere else.
+        if (MainActivity.current?.requestHomeRole() == true) return true
         val candidates = listOf(
             Settings.ACTION_HOME_SETTINGS,
             Settings.ACTION_MANAGE_DEFAULT_APPS_SETTINGS,

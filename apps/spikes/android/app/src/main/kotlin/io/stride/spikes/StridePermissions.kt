@@ -3,6 +3,7 @@ package io.stride.spikes
 import android.content.ComponentName
 import android.content.Context
 import android.content.Intent
+import android.content.pm.PackageManager
 import android.net.Uri
 import android.os.Build
 import android.provider.Settings
@@ -106,6 +107,85 @@ object StridePermissions {
      * open a list the rider has to find Stride in — which is why the UI must name the row to look
      * for rather than just saying "open settings".
      */
+    // ------------------------------------------------------------------ self-repair
+
+    /**
+     * True when Stride can put its own grants back without involving the rider.
+     *
+     * WRITE_SECURE_SETTINGS is development-tier: no dialog can ever grant it, only a one-time adb
+     * command. It then survives reinstalls, which is the whole point — the thing that keeps
+     * clearing these grants is the reinstall itself.
+     */
+    fun canRepair(context: Context): Boolean =
+        context.checkSelfPermission(android.Manifest.permission.WRITE_SECURE_SETTINGS) ==
+            PackageManager.PERMISSION_GRANTED
+
+    /**
+     * Put back whatever Android dropped, and report what was actually restored.
+     *
+     * Reinstalling Stride clears `enabled_accessibility_services`. Back and Recents then stop
+     * working with no error and no visible sign, on a console with no physical buttons — so the
+     * rider discovers it while stuck inside a full-screen video app. Asking them to walk through
+     * Settings every time is a workaround for a problem the app can simply fix.
+     *
+     * This only ever *adds* Stride's own component to the two lists. It never removes another app's
+     * entry and never touches anything else, because a launcher quietly rewriting system settings
+     * beyond its own row is exactly the behaviour that makes this permission dangerous.
+     *
+     * Returns the ids repaired, empty when there was nothing to do or no permission to do it.
+     */
+    fun repair(context: Context): List<String> {
+        if (!canRepair(context)) return emptyList()
+        val repaired = mutableListOf<String>()
+        if (!hasAccessibility(context)) {
+            val self = ComponentName(context, StrideAccessibilityService::class.java)
+                .flattenToString()
+            if (addToSecureList(context, Settings.Secure.ENABLED_ACCESSIBILITY_SERVICES, self)) {
+                // The list alone is not enough: the master switch gates whether any of it runs.
+                writeSecure(context, Settings.Secure.ACCESSIBILITY_ENABLED, "1")
+                repaired += ACCESSIBILITY
+            }
+        }
+        if (!hasNotificationListener(context)) {
+            val self = ComponentName(context, StrideNotificationListener::class.java)
+                .flattenToString()
+            if (addToSecureList(context, "enabled_notification_listeners", self)) {
+                repaired += NOTIFICATIONS
+            }
+        }
+        return repaired
+    }
+
+    /** Append [entry] to a colon-separated secure list, preserving every other app's entries. */
+    private fun addToSecureList(context: Context, key: String, entry: String): Boolean {
+        val current = Settings.Secure.getString(context.contentResolver, key)
+        val merged = mergeSecureList(current, entry) ?: return true
+        return writeSecure(context, key, merged)
+    }
+
+    /**
+     * The new value for a colon-separated secure list, or null when [entry] is already present.
+     *
+     * Kept pure and separate because this is the dangerous line in the whole class: these lists are
+     * shared with every other app on the device, and dropping someone else's accessibility service
+     * because we rewrote the key carelessly would be a far worse bug than the one we are fixing.
+     * Blank segments are dropped — Android leaves trailing colons behind, and re-appending them
+     * grows the value without bound across repairs.
+     */
+    internal fun mergeSecureList(current: String?, entry: String): String? {
+        val entries = current.orEmpty().split(':').filter { it.isNotBlank() }
+        if (entries.contains(entry)) return null
+        return (entries + entry).joinToString(":")
+    }
+
+    private fun writeSecure(context: Context, key: String, value: String): Boolean = try {
+        Settings.Secure.putString(context.contentResolver, key, value)
+    } catch (_: SecurityException) {
+        // Racing a revoked grant is not worth crashing the launcher over; the setup card is still
+        // watching and will ask the rider instead.
+        false
+    }
+
     fun openSettingsFor(context: Context, id: String): Boolean {
         val intent = when (id) {
             OVERLAY -> Intent(

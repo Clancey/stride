@@ -1,11 +1,12 @@
 import 'package:flutter/material.dart';
 
 import '../bridge.dart';
-import '../model/overlay_prefs.dart';
 import '../theme/stride_tokens.dart';
 import '../widgets/stride_sheet.dart';
 import '../widgets/app_models.dart';
 import '../widgets/app_tile.dart';
+import '../widgets/setup_card.dart';
+import 'settings_screen.dart';
 import '../model/profile_store.dart';
 import '../model/workout_controller.dart';
 import '../model/workout_goal.dart';
@@ -23,13 +24,11 @@ class LauncherHome extends StatefulWidget {
 class LauncherHomeState extends State<LauncherHome> {
   final ProfileStore _profiles = ProfileStore();
   final WorkoutController _workout = WorkoutController();
-  final OverlayPrefs _overlayPrefs = OverlayPrefs();
   final AppIconCache _iconCache = AppIconCache();
   final ScrollController _pinnedScroll = ScrollController();
 
   List<LaunchableApp> _apps = const <LaunchableApp>[];
   bool _loading = true;
-  bool _overlayLoading = true;
   bool _overlayRunning = false;
   String? _error;
   String? _overlayStatus;
@@ -41,7 +40,7 @@ class LauncherHomeState extends State<LauncherHome> {
     _loadApps();
     _workout.load();
     _loadGoal();
-    _loadOverlayPreference();
+    _ensureOverlay();
     _workout.addListener(_syncGoalWithSession);
   }
 
@@ -58,6 +57,7 @@ class LauncherHomeState extends State<LauncherHome> {
     _profiles.dispose();
     _workout.dispose();
     _pinnedScroll.dispose();
+    _setup.dispose();
     super.dispose();
   }
 
@@ -70,6 +70,8 @@ class LauncherHomeState extends State<LauncherHome> {
       );
     }
   }
+
+  final SetupStatus _setup = SetupStatus();
 
   Future<void> _loadApps() async {
     try {
@@ -158,15 +160,13 @@ class LauncherHomeState extends State<LauncherHome> {
                 return Column(
                   crossAxisAlignment: CrossAxisAlignment.start,
                   children: [
+                    SetupCard(status: _setup),
                     _LauncherHeader(
                       onAllApps: _openAllApps,
                       onDiagnostics: _openDiagnostics,
+                      onSettings: _openSettings,
                       onGoal: _startWorkoutFlow,
                       goal: _goal,
-                      overlayRunning: _overlayRunning,
-                      overlayLoading: _overlayLoading,
-                      onEnableOverlay: _enableOverlay,
-                      onDisableOverlay: _confirmDisableOverlay,
                     ),
                     const SizedBox(height: StrideSpace.lg),
                     Expanded(
@@ -256,6 +256,16 @@ class LauncherHomeState extends State<LauncherHome> {
     );
   }
 
+  void _openSettings() {
+    Navigator.of(context)
+        .push(
+          MaterialPageRoute<void>(builder: (context) => const SettingsScreen()),
+        )
+        // Grants can change while that screen is open, and the setup card is the thing that has to
+        // notice.
+        .then((_) => _setup.refresh());
+  }
+
   void _openDiagnostics() {
     Navigator.of(context).push(
       MaterialPageRoute<void>(builder: (context) => const DiagnosticsHome()),
@@ -299,127 +309,35 @@ class LauncherHomeState extends State<LauncherHome> {
     );
   }
 
-  Future<void> _loadOverlayPreference() async {
+  /// Make sure the overlay is up. There is no switch for this, by design.
+  ///
+  /// The overlay is not a feature a rider opts into — it carries Back and Home on a console with
+  /// no physical buttons, and it is the only place the workout can be paused once an app is
+  /// full-screen. Turning it off strands you inside Netflix. This used to be a saved preference
+  /// with an on/off button in the header, which meant one stray tap could take the way out away.
+  ///
+  /// So: start it if it isn't running, every time the launcher comes up. If it won't start, the
+  /// cause is the "Draw over other apps" grant, and the setup card already names that and fixes it.
+  Future<void> _ensureOverlay() async {
     bool running = false;
     String? message;
     try {
       final status = await SpikeBridge.overlayStatus();
       running = status['running'] == true;
+      if (!running) running = await SpikeBridge.startOverlay();
+      if (!running) {
+        message = "Stride's controls can't appear over other apps yet. "
+            'Grant "Draw over other apps" above.';
+      }
     } catch (_) {
       message = 'Overlay bridge unavailable in this environment.';
-    }
-
-    final desired = await _overlayPrefs.readEnabled();
-    if (desired == true && !running) {
-      try {
-        running = await SpikeBridge.startOverlay();
-        message = running
-            ? 'Overlay navigation restored from your saved preference.'
-            : 'Overlay navigation is saved on, but could not start.';
-      } catch (_) {
-        message =
-            'Overlay navigation is saved on, but the bridge is unavailable.';
-      }
-    } else if (desired == null && running) {
-      try {
-        await _overlayPrefs.writeEnabled(true);
-      } catch (_) {
-        message = 'Overlay is running; preference could not be saved.';
-      }
     }
 
     if (!mounted) return;
     setState(() {
       _overlayRunning = running;
-      _overlayLoading = false;
       _overlayStatus = message;
     });
-  }
-
-  Future<void> _enableOverlay() async {
-    setState(() => _overlayLoading = true);
-    try {
-      final ok = await SpikeBridge.startOverlay();
-      if (ok) await _overlayPrefs.writeEnabled(true);
-      if (!mounted) return;
-      setState(() {
-        _overlayRunning = ok;
-        _overlayStatus = ok
-            ? 'Overlay on: Back and Home controls stay visible over apps.'
-            : 'Could not turn overlay on. Check overlay permission in diagnostics.';
-      });
-    } catch (_) {
-      if (!mounted) return;
-      setState(() {
-        _overlayStatus = 'Could not turn overlay on from this environment.';
-      });
-    } finally {
-      if (mounted) setState(() => _overlayLoading = false);
-    }
-  }
-
-  Future<void> _confirmDisableOverlay() async {
-    final confirmed = await showStrideSheet<bool>(
-      context: context,
-      builder: (context) {
-        return Padding(
-          padding: const EdgeInsets.all(StrideSpace.lg),
-          child: Column(
-            mainAxisSize: MainAxisSize.min,
-            crossAxisAlignment: CrossAxisAlignment.stretch,
-            children: [
-              Text(
-                'Turn off overlay navigation?',
-                style: Theme.of(context).textTheme.headlineMedium,
-              ),
-              const SizedBox(height: StrideSpace.md),
-              Text(
-                'Turning off the overlay removes Stride’s on-screen Back and Home controls. '
-                'While you are inside Netflix or another app, you lose the way back to the '
-                'launcher from the treadmill console. The physical safety key remains the '
-                'only true emergency stop.',
-                style: Theme.of(context).textTheme.bodyLarge,
-              ),
-              const SizedBox(height: StrideSpace.lg),
-              FilledButton.icon(
-                style: FilledButton.styleFrom(
-                  backgroundColor: StrideColors.warning,
-                  foregroundColor: StrideColors.ink,
-                ),
-                onPressed: () => Navigator.of(context).pop(true),
-                icon: const Icon(Icons.visibility_off_outlined),
-                label: const Text('Turn overlay off'),
-              ),
-              const SizedBox(height: StrideSpace.sm),
-              OutlinedButton(
-                onPressed: () => Navigator.of(context).pop(false),
-                child: const Text('Keep overlay on'),
-              ),
-            ],
-          ),
-        );
-      },
-    );
-    if (confirmed == true) await _disableOverlay();
-  }
-
-  Future<void> _disableOverlay() async {
-    setState(() => _overlayLoading = true);
-    try {
-      await SpikeBridge.stopOverlay();
-      await _overlayPrefs.writeEnabled(false);
-      if (!mounted) return;
-      setState(() {
-        _overlayRunning = false;
-        _overlayStatus =
-            'Overlay off: Back and Home controls are no longer on screen.';
-      });
-    } catch (_) {
-      if (!mounted) return;
-      setState(() => _overlayStatus = 'Could not turn overlay off.');
-    } finally {
-      if (mounted) setState(() => _overlayLoading = false);
-    }
   }
 
   Future<void> _renameProfile(String id, String name) async {
@@ -525,22 +443,16 @@ class _LauncherHeader extends StatelessWidget {
   const _LauncherHeader({
     required this.onAllApps,
     required this.onDiagnostics,
+    required this.onSettings,
     required this.onGoal,
     required this.goal,
-    required this.overlayRunning,
-    required this.overlayLoading,
-    required this.onEnableOverlay,
-    required this.onDisableOverlay,
   });
 
   final VoidCallback onAllApps;
   final VoidCallback onDiagnostics;
+  final VoidCallback onSettings;
   final VoidCallback onGoal;
   final WorkoutGoal goal;
-  final bool overlayRunning;
-  final bool overlayLoading;
-  final Future<void> Function() onEnableOverlay;
-  final Future<void> Function() onDisableOverlay;
 
   @override
   Widget build(BuildContext context) {
@@ -575,42 +487,17 @@ class _LauncherHeader extends StatelessWidget {
           label: Text(goal.isTrackable ? 'Goal ${goal.label}' : 'Set a goal'),
         ),
         const SizedBox(width: StrideSpace.sm),
-        SizedBox(
-          width: 216,
-          child: FilledButton.icon(
-            style: FilledButton.styleFrom(
-              minimumSize: const Size(0, StrideSpace.minTouch),
-              backgroundColor: overlayRunning
-                  ? StrideColors.panelHigh
-                  : StrideColors.accent,
-              foregroundColor: overlayRunning
-                  ? StrideColors.text
-                  : StrideColors.ink,
-            ),
-            onPressed: overlayLoading
-                ? null
-                : (overlayRunning ? onDisableOverlay : onEnableOverlay),
-            icon: Icon(
-              overlayRunning
-                  ? Icons.visibility_outlined
-                  : Icons.visibility_off_outlined,
-            ),
-            label: Text(
-              overlayLoading
-                  ? 'Overlay...'
-                  : overlayRunning
-                  ? 'Overlay on'
-                  : 'Turn overlay on',
-            ),
-          ),
-        ),
-        const SizedBox(width: StrideSpace.sm),
         FilledButton.icon(
           onPressed: onAllApps,
           icon: const Icon(Icons.apps_outlined),
           label: const Text('All apps'),
         ),
         const SizedBox(width: StrideSpace.sm),
+        IconButton(
+          tooltip: 'Settings',
+          onPressed: onSettings,
+          icon: const Icon(Icons.settings_outlined),
+        ),
         IconButton(
           tooltip: 'Diagnostics',
           onPressed: onDiagnostics,
@@ -894,8 +781,6 @@ class _WorkoutPanel extends StatelessWidget {
                 ),
                 const SizedBox(height: StrideSpace.sm),
                 _MetricsGrid(machine: controller.machine),
-                const SizedBox(height: StrideSpace.sm),
-                _LockedMachineControls(machine: controller.machine),
                 if (overlayStatus != null) ...[
                   const SizedBox(height: StrideSpace.md),
                   Text(
@@ -1367,143 +1252,6 @@ class _InlineVolumeControl extends StatelessWidget {
             onPressed: () => controller.setVolume(volume.level + 1),
           ),
         ],
-      ),
-    );
-  }
-}
-
-class _LockedMachineControls extends StatelessWidget {
-  const _LockedMachineControls({required this.machine});
-
-  final MachineSnapshot machine;
-
-  @override
-  Widget build(BuildContext context) {
-    return Container(
-      width: double.infinity,
-      padding: const EdgeInsets.all(StrideSpace.sm),
-      decoration: BoxDecoration(
-        color: StrideColors.panel.withValues(alpha: 0.9),
-        borderRadius: BorderRadius.circular(StrideRadius.lg),
-        border: Border.all(color: StrideColors.line),
-      ),
-      child: Column(
-        children: [
-          Row(
-            crossAxisAlignment: CrossAxisAlignment.center,
-            children: [
-              SizedBox(
-                width: 120,
-                child: Text(
-                  'Controls locked',
-                  style: Theme.of(context).textTheme.titleMedium,
-                ),
-              ),
-              const SizedBox(width: StrideSpace.xs),
-              Expanded(
-                child: _LockedMiniControl(
-                  label: 'Speed',
-                  unit: 'mph',
-                  noReadingLabel: machine.noReadingLabel,
-                ),
-              ),
-              const SizedBox(width: 6),
-              Expanded(
-                child: _LockedMiniControl(
-                  label: 'Incline',
-                  unit: '%',
-                  noReadingLabel: machine.noReadingLabel,
-                ),
-              ),
-              const SizedBox(width: 6),
-              Expanded(
-                child: _LockedMiniControl(
-                  label: 'Fan',
-                  unit: 'level',
-                  noReadingLabel: machine.noReadingLabel,
-                ),
-              ),
-            ],
-          ),
-          const SizedBox(height: StrideSpace.xs),
-          // Full width, and never ellipsized. This line explains *why* Stride will not touch the
-          // machine; a safety explanation clipped mid-word is worse than no explanation, because
-          // the rider is left guessing at the half they cannot read.
-          Align(
-            alignment: Alignment.centerLeft,
-            child: Text(
-              machine.reason,
-              style: Theme.of(context).textTheme.bodySmall,
-            ),
-          ),
-        ],
-      ),
-    );
-  }
-}
-
-class _LockedMiniControl extends StatelessWidget {
-  const _LockedMiniControl({
-    required this.label,
-    required this.unit,
-    required this.noReadingLabel,
-  });
-
-  final String label;
-  final String unit;
-  final String noReadingLabel;
-
-  @override
-  Widget build(BuildContext context) {
-    return Material(
-      color: const Color(0xFF151A1E),
-      borderRadius: BorderRadius.circular(StrideRadius.md),
-      child: InkWell(
-        borderRadius: BorderRadius.circular(StrideRadius.md),
-        onTap: () => _showPanelMessage(
-          context,
-          "Stride can't control the belt yet. Use the console's own controls.",
-        ),
-        child: Container(
-          height: 72,
-          padding: const EdgeInsets.all(StrideSpace.xs),
-          decoration: BoxDecoration(
-            borderRadius: BorderRadius.circular(StrideRadius.md),
-            border: Border.all(color: StrideColors.warning, width: 1.6),
-          ),
-          child: Row(
-            children: [
-              const Icon(
-                Icons.lock_outline,
-                color: StrideColors.warning,
-                size: 18,
-              ),
-              const SizedBox(width: StrideSpace.xxs),
-              Expanded(
-                child: FittedBox(
-                  fit: BoxFit.scaleDown,
-                  alignment: Alignment.centerLeft,
-                  child: Column(
-                    crossAxisAlignment: CrossAxisAlignment.start,
-                    children: [
-                      Text(label, style: Theme.of(context).textTheme.bodySmall),
-                      Text(
-                        '$noReadingLabel $unit',
-                        style: Theme.of(context).textTheme.titleMedium
-                            ?.copyWith(color: StrideColors.textMuted),
-                      ),
-                    ],
-                  ),
-                ),
-              ),
-              const Icon(
-                Icons.touch_app_outlined,
-                color: StrideColors.warning,
-                size: 18,
-              ),
-            ],
-          ),
-        ),
       ),
     );
   }
