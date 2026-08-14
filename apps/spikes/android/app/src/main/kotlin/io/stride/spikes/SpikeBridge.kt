@@ -194,6 +194,10 @@ class SpikeBridge(private val context: Context) : MethodChannel.MethodCallHandle
                     appstore.install(call.argument<String>("package")!!)
                 )
                 "appstoreCancel" -> result.success(appstore.cancel(call.argument<String>("package")!!))
+                "appstoreInstallBundle" -> result.success(
+                    appstore.installBundle(call.argument<String>("bundle")!!)
+                )
+                "appstoreClearBundle" -> result.success(appstore.clearBundle())
                 "appstoreSetupChecklist" -> result.success(appstore.setupChecklist())
                 "appstoreCanRequestInstalls" -> result.success(appstore.canRequestInstalls())
                 "appstoreOpenInstallPermission" -> result.success(appstore.openInstallPermission())

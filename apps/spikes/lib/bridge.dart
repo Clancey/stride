@@ -171,6 +171,14 @@ class SpikeBridge {
       _boolSafe('appstoreInstall', {'package': package});
   static Future<bool> appstoreCancel(String package) =>
       _boolSafe('appstoreCancel', {'package': package});
+
+  /// Install every member of a bundle in the catalog's order, from one tap.
+  /// Each member still raises its own system confirmation.
+  static Future<bool> appstoreInstallBundle(String bundle) =>
+      _boolSafe('appstoreInstallBundle', {'bundle': bundle});
+
+  /// Dismiss a finished or failed bundle run so its message stops occupying the sheet.
+  static Future<bool> appstoreClearBundle() => _boolSafe('appstoreClearBundle');
   static Future<List<Map<String, dynamic>>> appstoreSetupChecklist() =>
       _listSafe('appstoreSetupChecklist');
   static Future<bool> appstoreCanRequestInstalls() =>

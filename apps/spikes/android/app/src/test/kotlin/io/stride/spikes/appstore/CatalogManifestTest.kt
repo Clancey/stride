@@ -280,4 +280,112 @@ class CatalogManifestTest {
         val bad = entryJson(pkg = "com.example.bad", extra = splitsJson(sha = "short"))
         assertThrows(CatalogFormatException::class.java) { CatalogManifest.parse(catalog(good, bad)) }
     }
+
+    // ------------------------------------------------------------------ bundles
+
+    private fun catalogWithBundles(apps: String, bundles: String): String =
+        """{"schema":1,"apps":[$apps],"bundles":[$bundles]}"""
+
+    private val twoApps =
+        entryJson(pkg = "com.google.android.gsf") + "," + entryJson(pkg = "com.android.vending")
+
+    @Test
+    fun `parses a bundle and keeps the catalog's install order`() {
+        val manifest = CatalogManifest.parse(
+            catalogWithBundles(
+                twoApps,
+                """{"id":"google-play","name":"Google Play","detail":"Play and services",
+                   "restartRequired":true,
+                   "packages":["com.google.android.gsf","com.android.vending"]}""",
+            )
+        )
+        val bundle = manifest.bundleFor("google-play")!!
+        assertEquals("Google Play", bundle.name)
+        assertTrue(bundle.restartRequired)
+        assertEquals(
+            listOf("com.google.android.gsf", "com.android.vending"),
+            bundle.packages,
+        )
+        assertEquals(bundle.packages.toSet(), manifest.bundledPackages)
+    }
+
+    @Test
+    fun `a catalog without bundles simply has none`() {
+        val manifest = CatalogManifest.parse(catalog(entryJson()))
+        assertTrue(manifest.bundles.isEmpty())
+        assertTrue(manifest.bundledPackages.isEmpty())
+        assertNull(manifest.bundleFor("google-play"))
+    }
+
+    @Test
+    fun `rejects a bundle naming a package the catalog does not carry`() {
+        // The runner installs bundle members by looking them up in the catalog. An unresolvable
+        // name would strand a run halfway through, which for Play means a sign-in loop.
+        val e = assertThrows(CatalogFormatException::class.java) {
+            CatalogManifest.parse(
+                catalogWithBundles(
+                    twoApps,
+                    """{"id":"google-play","packages":["com.google.android.gsf","com.nope"]}""",
+                )
+            )
+        }
+        assertTrue(e.message!!.contains("com.nope"))
+    }
+
+    @Test
+    fun `rejects a bundle that lists the same package twice`() {
+        assertThrows(CatalogFormatException::class.java) {
+            CatalogManifest.parse(
+                catalogWithBundles(
+                    twoApps,
+                    """{"id":"x","packages":["com.android.vending","com.android.vending"]}""",
+                )
+            )
+        }
+    }
+
+    @Test
+    fun `rejects an empty bundle`() {
+        assertThrows(CatalogFormatException::class.java) {
+            CatalogManifest.parse(catalogWithBundles(twoApps, """{"id":"x","packages":[]}"""))
+        }
+    }
+
+    @Test
+    fun `rejects a bundle with no id`() {
+        assertThrows(CatalogFormatException::class.java) {
+            CatalogManifest.parse(
+                catalogWithBundles(twoApps, """{"packages":["com.android.vending"]}""")
+            )
+        }
+    }
+
+    @Test
+    fun `rejects two bundles sharing an id`() {
+        assertThrows(CatalogFormatException::class.java) {
+            CatalogManifest.parse(
+                catalogWithBundles(
+                    twoApps,
+                    """{"id":"x","packages":["com.android.vending"]},""" +
+                        """{"id":"x","packages":["com.google.android.gsf"]}""",
+                )
+            )
+        }
+    }
+
+    @Test
+    fun `rejects a package claimed by two bundles`() {
+        // Which bundle a package belongs to decides whether it is hidden from the store list, so
+        // "both" has no sensible answer.
+        val e = assertThrows(CatalogFormatException::class.java) {
+            CatalogManifest.parse(
+                catalogWithBundles(
+                    twoApps,
+                    """{"id":"a","packages":["com.android.vending"]},""" +
+                        """{"id":"b","packages":["com.android.vending"]}""",
+                )
+            )
+        }
+        assertTrue(e.message!!.contains("more than one bundle"))
+    }
 }

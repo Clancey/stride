@@ -88,9 +88,28 @@ class ApkInstaller(private val context: Context) {
     /** Single-artifact convenience for the common, non-bundle case. */
     fun install(entry: CatalogEntry, file: File): Int = install(entry, mapOf("base" to file))
 
+    /**
+     * The status callback deliberately does *not* name [InstallResultReceiver] as an explicit
+     * component.
+     *
+     * On this console's firmware a component-targeted broadcast is still routed as a manifest
+     * ("static") receiver, and the platform refuses to deliver it:
+     *
+     * ```
+     * I/ActivityManager: App 10139/io.stride.spikes targets O+, restricted
+     * D/BroadcastQueue: suppress to start process of staticReceiver for package:io.stride.spikes
+     * V/BroadcastQueue: Skipping delivery of ordered broadcast ...INSTALL_STATUS
+     * ```
+     *
+     * The result was invisible and total: `STATUS_PENDING_USER_ACTION` never arrived, so the
+     * confirmation dialog was never started and the install sat "in progress" forever with no
+     * error anywhere. Addressing the intent by *action* instead lets it reach the receiver
+     * [StrideAppstoreService] registers at runtime, which is not subject to that restriction.
+     * [setPackage] keeps it targeted at us so it is not a broadcast to the world.
+     */
     private fun statusSender(entry: CatalogEntry, sessionId: Int): PendingIntent {
-        val intent = Intent(context, InstallResultReceiver::class.java)
-            .setAction(ACTION_INSTALL_STATUS)
+        val intent = Intent(ACTION_INSTALL_STATUS)
+            .setPackage(context.packageName)
             .putExtra(EXTRA_PACKAGE, entry.packageName)
             .putExtra(EXTRA_LABEL, entry.name)
             .putExtra(EXTRA_SELF, entry.role == CatalogRole.STRIDE)
@@ -120,6 +139,9 @@ class ApkInstaller(private val context: Context) {
  * `STATUS_PENDING_USER_ACTION` is the normal path for an unprivileged installer: the platform hands
  * back an Intent that must be started to show the confirmation dialog. Starting it needs
  * `FLAG_ACTIVITY_NEW_TASK` because a receiver has no task of its own.
+ *
+ * This is registered at *runtime* by [StrideAppstoreService], not in the manifest — see
+ * [ApkInstaller.statusSender] for the firmware behaviour that forces it.
  *
  * SAFETY: that dialog is full-screen and covers the overlay, including the stop control. The service
  * is responsible for never reaching this point while the belt is moving
@@ -159,7 +181,7 @@ class InstallResultReceiver : BroadcastReceiver() {
             PackageInstaller.STATUS_SUCCESS -> {
                 AppstoreState.update(packageName, AppstoreState.Stage.INSTALLED)
                 Confirmations.settled(context, packageName)
-                StrideAppstoreService.onInstallSettled(context, packageName)
+                StrideAppstoreService.onInstallSettled(context, packageName, success = true)
             }
 
             else -> {
@@ -169,7 +191,7 @@ class InstallResultReceiver : BroadcastReceiver() {
                     message = describe(status, message),
                 )
                 Confirmations.settled(context, packageName)
-                StrideAppstoreService.onInstallSettled(context, packageName)
+                StrideAppstoreService.onInstallSettled(context, packageName, success = false)
             }
         }
     }

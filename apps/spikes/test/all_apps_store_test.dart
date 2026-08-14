@@ -151,7 +151,7 @@ void main() {
 
     expect(find.text('Needs GMS'), findsOneWidget);
     expect(
-      find.text('Needs Google Play Services, which this console cannot run'),
+      find.text('Needs Google Play, which is not installed yet'),
       findsOneWidget,
     );
     // Ineligible rows get no button at all - there is nothing to press.
