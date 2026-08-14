@@ -71,6 +71,17 @@ android {
 
     buildTypes {
         release {
+            // Explicit rather than relying on Flutter's implicit default, because the shrinker
+            // silently broke this app once already: R8 stripped Room's reflectively-loaded
+            // WorkDatabase_Impl and every release build crashed before reaching Dart. Naming the
+            // rules file here is what makes that fixable and reviewable. See proguard-rules.pro.
+            isMinifyEnabled = true
+            isShrinkResources = true
+            proguardFiles(
+                getDefaultProguardFile("proguard-android-optimize.txt"),
+                "proguard-rules.pro",
+            )
+
             // Signed with the real Stride release key when it has been unlocked
             // (`tools/keystore.sh unlock`), and with the debug key otherwise so that a fresh
             // clone, CI, and `flutter run --release` all still work without the secret.
