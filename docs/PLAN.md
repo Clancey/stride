@@ -407,6 +407,35 @@ late firmware discovery could have invalidated a lot of work. Reordered:
 Note the deliberate inversion: **the abstraction is extracted in Phase 6, after two concrete
 implementations exist**, rather than designed in the abstract early.
 
+### Deviation: the launcher shell moved earlier (and why that is safe)
+
+Phases 2 and 4 put the overlay and the launcher shell *after* Phase 1's real motor control. In
+practice the launcher UI is being built during Phase 0, ahead of its gate. This is a deliberate
+change, not drift, so it is recorded here rather than quietly done.
+
+Why it is safe: the gates on phases 1-3 exist because those phases **command the machine**. The
+launcher shell does not. It has no Coordinator, no GlassOS client, and no motor path, and none may
+be added to it — the same constraint the spike harness already lives under (§5). Building a
+launcher cannot hurt anybody, so gating it behind a treadmill test buys nothing.
+
+Why it is useful now:
+
+- **The hardware spikes are blocked and will stay blocked** until someone is physically at the
+  console. Serialising all UI work behind them wastes the entire interval.
+- **UI questions do not get answered by hardware.** Whether the app grid is usable at arm's length
+  while running is a design question, and the only way to answer it is to look at it and use it.
+  Waiting for S2-B tells us nothing about it.
+- **It surfaces integration bugs early.** Running the app as a real launcher on a matching API 28
+  device immediately exposed two defects that no unit test could see: pressing HOME did nothing at
+  all (`singleTask` delivers `onNewIntent`, and Flutter kept its old route), and the overlay drew
+  over the app's own title bar and back button on every screen. Both are Phase 2/4 problems found
+  during Phase 0, for free.
+
+What has **not** moved: nothing about control, safety, or the Coordinator. Phase 1 still gates on
+S2-B, and no command path exists in the launcher. The Phase 0 exit gate (S1, S2-A, S6) is unchanged
+— a pretty launcher does not retire a single hardware unknown, and must not be mistaken for progress
+against them.
+
 ## 5. Safety
 
 A treadmill is the one component here that can physically hurt someone.

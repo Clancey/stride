@@ -6,6 +6,26 @@ import 'package:flutter/services.dart';
 class SpikeBridge {
   static const MethodChannel _channel = MethodChannel('io.stride.spikes/bridge');
 
+  /// Callbacks the *host* pushes to us, rather than us polling it.
+  static void Function()? onHomePressed;
+
+  /// Wire the host->Flutter direction. Call once at startup.
+  ///
+  /// The HOME button is the reason this exists. MainActivity is `singleTask`, so pressing Home
+  /// delivers `onNewIntent` to the already-running activity instead of recreating it. Without this,
+  /// Flutter keeps whatever route it was on and Home appears completely dead - which it was.
+  static void install() {
+    _channel.setMethodCallHandler((call) async {
+      switch (call.method) {
+        case 'onHomePressed':
+          onHomePressed?.call();
+          return null;
+        default:
+          return null;
+      }
+    });
+  }
+
   static Future<Map<String, dynamic>> environment() => _map('environment');
 
   // S1 - launcher
@@ -21,10 +41,27 @@ class SpikeBridge {
   static Future<Map<String, dynamic>> overlayStatus() => _map('overlayStatus');
   static Future<bool> resetOverlayCounters() => _bool('resetOverlayCounters');
 
+  /// Height in **physical pixels** of the always-on HUD strip along the top edge.
+  ///
+  /// The HUD is a separate system window drawn over everything, so Flutter has no idea it is there
+  /// and happily renders its app bar underneath it. Content must be inset by this much.
+  static Future<double> hudHeightPx() async =>
+      (await _channel.invokeMethod<num>('hudHeightPx'))?.toDouble() ?? 0;
+
   // S4 - app inventory
   static Future<List<Map<String, dynamic>>> listApps() => _list('listApps');
   static Future<bool> launchApp(String package) =>
       _bool('launchApp', {'package': package});
+
+  /// PNG bytes for an app's launcher icon, or null if it cannot be rendered.
+  ///
+  /// Kept out of [listApps] deliberately: icons are large, and inlining ~40 of them turns a cheap
+  /// listing into a multi-megabyte channel payload that janks the first frame.
+  static Future<Uint8List?> appIcon(String package, {int sizePx = 192}) =>
+      _channel.invokeMethod<Uint8List>('appIcon', {
+        'package': package,
+        'sizePx': sizePx,
+      });
 
   // S5 - media sessions
   static Future<bool> notificationListenerEnabled() => _bool('notificationListenerEnabled');

@@ -6,8 +6,12 @@ import android.app.NotificationManager
 import android.app.Service
 import android.content.Context
 import android.content.Intent
+import android.content.res.ColorStateList
 import android.graphics.Color
 import android.graphics.PixelFormat
+import android.graphics.Typeface
+import android.graphics.drawable.GradientDrawable
+import android.graphics.drawable.RippleDrawable
 import android.os.Build
 import android.os.IBinder
 import android.util.TypedValue
@@ -15,10 +19,11 @@ import android.view.Gravity
 import android.view.MotionEvent
 import android.view.View
 import android.view.WindowManager
-import android.widget.Button
 import android.widget.FrameLayout
 import android.widget.LinearLayout
 import android.widget.TextView
+import android.view.animation.AccelerateInterpolator
+import android.view.animation.DecelerateInterpolator
 import kotlin.math.abs
 
 /**
@@ -56,6 +61,9 @@ class OverlayService : Service() {
         /** Width of the always-present touchable edge strips. */
         private const val EDGE_STRIP_WIDTH_DP = 20f
 
+        /** Non-zero first-frame inset until the HUD reports its real laid-out height. */
+        private const val HUD_HEIGHT_ESTIMATE_DP = 89f
+
         /** Fraction of the screen height the edge strips span, centred vertically. */
         private const val EDGE_STRIP_SPAN = 0.5f
 
@@ -77,6 +85,11 @@ class OverlayService : Service() {
 
         @Volatile
         var isRunning: Boolean = false
+            private set
+
+        /** Last measured HUD height. The bridge uses this to inset Flutter below the overlay. */
+        @Volatile
+        var hudHeightPx: Int = 0
             private set
 
         /** Diagnostics for the spike harness. */
@@ -133,6 +146,7 @@ class OverlayService : Service() {
     private lateinit var windowManager: WindowManager
     private var hudView: View? = null
     private var navPanelView: View? = null
+    private var navPanelFromStart: Boolean = true
     private val edgeViews = mutableListOf<View>()
 
     private val overlayType: Int
@@ -211,6 +225,7 @@ class OverlayService : Service() {
         edgeViews.clear()
         hudView = null
         navPanelView = null
+        hudHeightPx = 0
     }
 
     private fun safeRemove(v: View) {
@@ -224,6 +239,29 @@ class OverlayService : Service() {
     private fun dp(value: Float): Int = TypedValue.applyDimension(
         TypedValue.COMPLEX_UNIT_DIP, value, resources.displayMetrics,
     ).toInt()
+
+    private fun roundedRect(color: Int, radius: Float, strokeColor: Int? = null): GradientDrawable =
+        GradientDrawable().apply {
+            shape = GradientDrawable.RECTANGLE
+            setColor(color)
+            cornerRadius = dp(radius).toFloat()
+            if (strokeColor != null) {
+                setStroke(dp(1f), strokeColor)
+            }
+        }
+
+    private fun oval(color: Int): GradientDrawable =
+        GradientDrawable().apply {
+            shape = GradientDrawable.OVAL
+            setColor(color)
+        }
+
+    private fun rippleRounded(color: Int, radius: Float, strokeColor: Int? = null): RippleDrawable =
+        RippleDrawable(
+            ColorStateList.valueOf(Color.argb(90, 255, 255, 255)),
+            roundedRect(color, radius, strokeColor),
+            roundedRect(Color.WHITE, radius),
+        )
 
     private fun baseParams(width: Int, height: Int, gravity: Int): WindowManager.LayoutParams {
         val params = WindowManager.LayoutParams(
@@ -239,50 +277,119 @@ class OverlayService : Service() {
         return params
     }
 
+    private fun updateHudHeight(view: View) {
+        val measuredHeight = view.height
+        if (measuredHeight > 0) {
+            hudHeightPx = measuredHeight
+        }
+    }
+
     /**
      * The always-visible strip.
      *
      * SAFETY (plan section 5): this is an inert diagnostic surface. It carries NO telemetry value
      * (showing "0.0 mph" would imply the belt is stopped) and NO control labelled "STOP" (a button
      * that does not actually stop the belt is worse than none on a machine that can injure someone).
-     * The banner states plainly that there is no telemetry, that no stop is available here, and that
-     * the physical safety key is the real stop. The BACK/HOME/RECENTS buttons are the only live
-     * controls, and none of them can move the belt.
+     * The calm chrome treatment is deliberate product UI, but the copy remains explicit: navigation
+     * only, no motor control, and the physical safety key is the real stop.
      */
     private fun addHud() {
+        // The bridge needs an inset immediately, before the first layout pass completes.
+        hudHeightPx = dp(HUD_HEIGHT_ESTIMATE_DP)
+
+        val root = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            background = roundedRect(Color.argb(238, 6, 10, 15), 0f)
+            addOnLayoutChangeListener { view, _, top, _, bottom, _, _, _, _ ->
+                val laidOutHeight = bottom - top
+                if (laidOutHeight > 0) {
+                    hudHeightPx = laidOutHeight
+                } else {
+                    updateHudHeight(view)
+                }
+            }
+        }
+
         val row = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
-            // High-visibility warning colour, not the calm dark of a working readout, so nobody
-            // mistakes this for live instrumentation.
-            setBackgroundColor(Color.rgb(160, 40, 0))
-            setPadding(dp(8f), dp(6f), dp(8f), dp(6f))
+            minimumHeight = dp(88f)
+            setPadding(dp(20f), dp(8f), dp(18f), dp(8f))
             gravity = Gravity.CENTER_VERTICAL
+            layoutParams = LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT,
+                dp(88f),
+            )
         }
 
-        val banner = TextView(this).apply {
-            text = "STRIDE SPIKE HARNESS  \u00b7  NO TELEMETRY  \u00b7  STOP INACTIVE  \u00b7  USE SAFETY KEY"
-            setTextColor(Color.WHITE)
-            textSize = 13f
-            typeface = android.graphics.Typeface.DEFAULT_BOLD
+        val statusBlock = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            gravity = Gravity.CENTER_VERTICAL
             layoutParams = LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f)
         }
-        row.addView(banner)
+        val statusLine = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+        }
+        statusLine.addView(TextView(this).apply {
+            text = "Stride overlay"
+            setTextColor(Color.WHITE)
+            textSize = 20f
+            typeface = Typeface.create(Typeface.DEFAULT, Typeface.BOLD)
+            includeFontPadding = false
+        })
+        statusLine.addView(View(this).apply {
+            background = oval(Color.rgb(255, 190, 92))
+            val lp = LinearLayout.LayoutParams(dp(10f), dp(10f))
+            lp.marginStart = dp(18f)
+            lp.marginEnd = dp(8f)
+            layoutParams = lp
+        })
+        statusLine.addView(TextView(this).apply {
+            text = "Not connected"
+            setTextColor(Color.rgb(255, 232, 198))
+            textSize = 16f
+            typeface = Typeface.create(Typeface.DEFAULT, Typeface.BOLD)
+            includeFontPadding = false
+        })
+        statusBlock.addView(statusLine)
+        statusBlock.addView(TextView(this).apply {
+            text = "Navigation only — no telemetry, no motor control. Use the safety key to stop the treadmill."
+            setTextColor(Color.rgb(216, 226, 239))
+            textSize = 14f
+            includeFontPadding = false
+            val lp = LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT,
+                LinearLayout.LayoutParams.WRAP_CONTENT,
+            )
+            lp.topMargin = dp(6f)
+            layoutParams = lp
+        })
+        row.addView(statusBlock)
 
-        row.addView(navButton("BACK") {
+        row.addView(hudNavButton("Back", "‹") {
             val svc = StrideAccessibilityService.instance
             lastGesture = if (svc == null) {
                 "BACK failed: accessibility service not connected"
             } else if (svc.goBack()) "BACK ok" else "BACK rejected"
         })
-        row.addView(navButton("HOME") {
+        row.addView(hudNavButton("Home", "⌂") {
             goHomeFromService()
             lastGesture = "HOME ok"
         })
-        row.addView(navButton("RECENTS") {
+        row.addView(hudNavButton("Recents", "▣") {
             val svc = StrideAccessibilityService.instance
             lastGesture = if (svc == null) {
                 "RECENTS failed: accessibility service not connected"
             } else if (svc.goRecents()) "RECENTS ok" else "RECENTS rejected"
+        })
+
+        root.addView(row)
+        root.addView(View(this).apply {
+            setBackgroundColor(Color.argb(150, 118, 140, 170))
+            layoutParams = LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT,
+                dp(1f),
+            )
         })
 
         val params = baseParams(
@@ -291,26 +398,122 @@ class OverlayService : Service() {
             Gravity.TOP,
         )
         try {
-            windowManager.addView(row, params)
-            hudView = row
+            windowManager.addView(root, params)
+            hudView = root
+            root.post { updateHudHeight(root) }
         } catch (_: Exception) {
             // If SYSTEM_ALERT_WINDOW is not granted, addView throws. Fail soft rather than crash the
             // service; overlayStatus/canDrawOverlays already surfaces the permission problem.
             hudView = null
+            hudHeightPx = 0
         }
     }
 
-    private fun navButton(label: String, onClick: () -> Unit): Button = Button(this).apply {
-        text = label
-        textSize = 12f
-        setTextColor(Color.WHITE)
-        setBackgroundColor(Color.rgb(40, 44, 52))
-        val lp = LinearLayout.LayoutParams(
-            LinearLayout.LayoutParams.WRAP_CONTENT,
-            LinearLayout.LayoutParams.WRAP_CONTENT,
+    private fun hudNavButton(label: String, icon: String, onClick: () -> Unit): View =
+        navSurfaceButton(
+            label = label,
+            icon = icon,
+            subtitle = null,
+            width = dp(108f),
+            height = dp(72f),
+            compact = true,
+            onClick = onClick,
+        ).apply {
+            val lp = LinearLayout.LayoutParams(dp(108f), dp(72f))
+            lp.marginStart = dp(12f)
+            layoutParams = lp
+        }
+
+    private fun panelNavButton(label: String, icon: String, subtitle: String, onClick: () -> Unit): View =
+        navSurfaceButton(
+            label = label,
+            icon = icon,
+            subtitle = subtitle,
+            width = LinearLayout.LayoutParams.MATCH_PARENT,
+            height = dp(84f),
+            compact = false,
+            onClick = onClick,
+        ).apply {
+            val lp = LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT,
+                dp(84f),
+            )
+            lp.topMargin = dp(12f)
+            layoutParams = lp
+        }
+
+    private fun navSurfaceButton(
+        label: String,
+        icon: String,
+        subtitle: String?,
+        width: Int,
+        height: Int,
+        compact: Boolean,
+        onClick: () -> Unit,
+    ): LinearLayout = LinearLayout(this).apply {
+        orientation = if (compact) LinearLayout.VERTICAL else LinearLayout.HORIZONTAL
+        gravity = Gravity.CENTER
+        minimumWidth = if (width > 0) width else dp(72f)
+        minimumHeight = dp(72f)
+        isClickable = true
+        isFocusable = true
+        contentDescription = label
+        background = rippleRounded(
+            color = Color.rgb(18, 25, 34),
+            radius = 18f,
+            strokeColor = Color.argb(120, 126, 148, 176),
         )
-        lp.marginStart = dp(6f)
+        elevation = dp(if (compact) 2f else 4f).toFloat()
+        setPadding(dp(if (compact) 8f else 18f), dp(8f), dp(if (compact) 8f else 18f), dp(8f))
+        val lp = LinearLayout.LayoutParams(
+            width,
+            height,
+        )
         layoutParams = lp
+        addView(TextView(context).apply {
+            text = icon
+            setTextColor(Color.WHITE)
+            textSize = if (compact) 27f else 30f
+            typeface = Typeface.create(Typeface.DEFAULT, Typeface.BOLD)
+            gravity = Gravity.CENTER
+            includeFontPadding = false
+            layoutParams = LinearLayout.LayoutParams(
+                if (compact) LinearLayout.LayoutParams.MATCH_PARENT else dp(44f),
+                if (compact) dp(30f) else LinearLayout.LayoutParams.MATCH_PARENT,
+            )
+        })
+        val labelBlock = LinearLayout(context).apply {
+            orientation = LinearLayout.VERTICAL
+            gravity = if (compact) Gravity.CENTER else Gravity.CENTER_VERTICAL
+            layoutParams = LinearLayout.LayoutParams(
+                if (compact) LinearLayout.LayoutParams.MATCH_PARENT else 0,
+                LinearLayout.LayoutParams.MATCH_PARENT,
+                if (compact) 0f else 1f,
+            )
+        }
+        labelBlock.addView(TextView(context).apply {
+            text = label
+            setTextColor(Color.WHITE)
+            textSize = if (compact) 14f else 18f
+            typeface = Typeface.create(Typeface.DEFAULT, Typeface.BOLD)
+            gravity = if (compact) Gravity.CENTER else Gravity.START
+            includeFontPadding = false
+        })
+        if (subtitle != null) {
+            labelBlock.addView(TextView(context).apply {
+                text = subtitle
+                setTextColor(Color.rgb(202, 216, 234))
+                textSize = 14f
+                includeFontPadding = false
+                val subtitleLp = LinearLayout.LayoutParams(
+                    LinearLayout.LayoutParams.MATCH_PARENT,
+                    LinearLayout.LayoutParams.WRAP_CONTENT,
+                )
+                subtitleLp.topMargin = dp(4f)
+                layoutParams = subtitleLp
+            })
+        }
+        addView(labelBlock)
         setOnClickListener { onClick() }
     }
 
@@ -357,7 +560,7 @@ class OverlayService : Service() {
 
         val container = FrameLayout(this).apply {
             // Faintly visible during the spike so the interference cost is obvious to the tester.
-            setBackgroundColor(Color.argb(40, 90, 200, 255))
+            setBackgroundColor(Color.argb(26, 90, 176, 255))
         }
 
         val params = baseParams(stripWidth, stripHeight, gravity or Gravity.CENTER_VERTICAL)
@@ -420,6 +623,7 @@ class OverlayService : Service() {
                 navGestureCount++
                 lastGesture = "edge swipe from ${if (fromStart) "left" else "right"} " +
                     "(fg=${lastTouchForegroundPackage ?: "?"})"
+                navPanelFromStart = fromStart
                 toggleNavPanel()
             } else {
                 stolenTouchCount++
@@ -511,46 +715,96 @@ class OverlayService : Service() {
     }
 
     private fun toggleNavPanel() {
-        navPanelView?.let {
-            safeRemove(it)
-            navPanelView = null
+        if (navPanelView != null) {
+            hideNavPanel()
             return
         }
 
         val panel = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
-            setBackgroundColor(Color.argb(240, 18, 20, 26))
-            setPadding(dp(16f), dp(16f), dp(16f), dp(16f))
+            background = roundedRect(Color.argb(246, 10, 16, 23), 28f, Color.argb(150, 120, 146, 176))
+            elevation = dp(14f).toFloat()
+            setPadding(dp(22f), dp(22f), dp(22f), dp(22f))
         }
-        panel.addView(TextView(this).apply {
-            text = "Stride navigation"
-            setTextColor(Color.WHITE)
-            textSize = 16f
+        panel.addView(LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            addView(TextView(context).apply {
+                text = "System navigation"
+                setTextColor(Color.WHITE)
+                textSize = 22f
+                typeface = Typeface.create(Typeface.DEFAULT, Typeface.BOLD)
+                includeFontPadding = false
+            })
+            addView(TextView(context).apply {
+                text = "Overlay controls only. Machine state is not connected."
+                setTextColor(Color.rgb(206, 220, 238))
+                textSize = 14f
+                includeFontPadding = false
+                val lp = LinearLayout.LayoutParams(
+                    LinearLayout.LayoutParams.MATCH_PARENT,
+                    LinearLayout.LayoutParams.WRAP_CONTENT,
+                )
+                lp.topMargin = dp(8f)
+                layoutParams = lp
+            })
         })
-        panel.addView(navButton("BACK") {
-            StrideAccessibilityService.instance?.goBack()
-            toggleNavPanel()
+        panel.addView(panelNavButton("Back", "‹", "Return to the previous screen") {
+            val svc = StrideAccessibilityService.instance
+            lastGesture = if (svc == null) {
+                "BACK failed: accessibility service not connected"
+            } else if (svc.goBack()) "BACK ok" else "BACK rejected"
+            hideNavPanel()
         })
-        panel.addView(navButton("HOME") {
+        panel.addView(panelNavButton("Home", "⌂", "Open the Stride launcher") {
             goHomeFromService()
-            toggleNavPanel()
+            lastGesture = "HOME ok"
+            hideNavPanel()
         })
-        panel.addView(navButton("RECENTS") {
-            StrideAccessibilityService.instance?.goRecents()
-            toggleNavPanel()
+        panel.addView(panelNavButton("Recents", "▣", "Show Android recent apps") {
+            val svc = StrideAccessibilityService.instance
+            lastGesture = if (svc == null) {
+                "RECENTS failed: accessibility service not connected"
+            } else if (svc.goRecents()) "RECENTS ok" else "RECENTS rejected"
+            hideNavPanel()
         })
-        panel.addView(navButton("CLOSE") { toggleNavPanel() })
+        panel.addView(panelNavButton("Close panel", "×", "Hide these navigation controls") {
+            hideNavPanel()
+        })
 
         val params = baseParams(
+            dp(408f),
             WindowManager.LayoutParams.WRAP_CONTENT,
-            WindowManager.LayoutParams.WRAP_CONTENT,
-            Gravity.CENTER,
+            (if (navPanelFromStart) Gravity.START else Gravity.END) or Gravity.CENTER_VERTICAL,
         )
+        params.x = dp(28f)
+        panel.alpha = 0f
+        panel.translationX = if (navPanelFromStart) -dp(48f).toFloat() else dp(48f).toFloat()
         try {
             windowManager.addView(panel, params)
             navPanelView = panel
+            panel.post {
+                panel.animate()
+                    .alpha(1f)
+                    .translationX(0f)
+                    .setDuration(180L)
+                    .setInterpolator(DecelerateInterpolator())
+                    .start()
+            }
         } catch (_: Exception) {
             navPanelView = null
         }
+    }
+
+    private fun hideNavPanel() {
+        val panel = navPanelView ?: return
+        navPanelView = null
+        val exitX = if (navPanelFromStart) -dp(40f).toFloat() else dp(40f).toFloat()
+        panel.animate()
+            .alpha(0f)
+            .translationX(exitX)
+            .setDuration(150L)
+            .setInterpolator(AccelerateInterpolator())
+            .withEndAction { safeRemove(panel) }
+            .start()
     }
 }
