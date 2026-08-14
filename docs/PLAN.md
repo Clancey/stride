@@ -606,6 +606,43 @@ standing safety work in §3.1 exists to sit in front of it. The in-frame byte or
 still unverified, and the endianness is genuinely mixed — speed big-endian, incline and distance
 little-endian — so this is documentation with tests, not a driver.
 
+### 3.11 Updates — how anything ever reaches a console again
+
+`docs/APPSTORE.md`, `io.stride.spikes.appstore`.
+
+Once Stride is the default HOME on a sideload-only, non-GMS console, the only route for a fixed
+build is a laptop and a USB cable. That is tolerable for the person who wrote it and disqualifying
+for anyone else — and it means a bug in the *overlay*, which supplies the only Back and Home this
+hardware has, is a physical trip to the machine. So the update path is not a convenience feature;
+it is the precondition for shipping to this hardware at all.
+
+`StrideAppstoreService` polls a JSON catalog over HTTPS (~6h via WorkManager, plus on boot and on
+demand), compares it against what is installed, downloads what is stale, and drives
+`PackageInstaller`. Stride surfaces the result in its own launcher behind a single "Updates"
+badge — there is no second store app to sideload.
+
+The catalog and its APKs are a **public repository read as raw files**:
+[`Clancey/stride-catalog`](https://github.com/Clancey/stride-catalog). A static file in a public
+repo is the entire backend — nothing to run, nothing to bill, nothing to fall over, and every
+change to what a console will install is a reviewable commit.
+
+Two rules carry the safety weight, both enforced in `UpdatePlan` and both unit-tested:
+
+1. **No install prompt while the belt is not idle.** The `PackageInstaller` confirmation is a
+   full-screen system activity; raising it mid-workout covers the stop control that §3.9 requires be
+   permanently reachable. Downloads run freely, installs wait for idle and resume automatically.
+2. **Stride never auto-updates itself.** A self-install kills the process and takes the overlay —
+   and therefore Back and Home — with it. It is always an explicit tap behind a dialog that says so.
+
+Artifacts are verified twice before a session opens: SHA-256 over the bytes, then package name,
+versionCode and **signer certificate** read back out of the archive. The signer check is not
+redundant with the platform's: Android refuses a differently-signed *update*, but a *first* install
+is unprotected, and that is precisely where a compromised catalog would hand the console an impostor
+"Spotify".
+
+Like every other Phase 0 component, it holds no reference to `MachineLink` or `GlassOsClient`. It
+reads workout state to decide when to stay quiet; it cannot move anything.
+
 ## 4. Phasing — vertical slice first
 
 Rev 1 built profiles and generic device abstractions before proving the primary hardware path, so a

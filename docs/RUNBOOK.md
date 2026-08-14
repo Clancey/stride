@@ -427,6 +427,32 @@ while something is actually playing.
 adb shell cmd package set-home-activity io.stride.spikes/io.stride.spikes.MainActivity
 ```
 
+### The app store — permission to install other apps
+
+`StrideAppstoreService` (`docs/APPSTORE.md`) needs `REQUEST_INSTALL_PACKAGES`. API 26 replaced the
+global "unknown sources" toggle with this per-app one; it grants the right to *ask*, not to install
+silently, so every install still shows the system confirmation.
+
+```bash
+adb shell appops set io.stride.spikes REQUEST_INSTALL_PACKAGES allow
+adb shell appops get io.stride.spikes REQUEST_INSTALL_PACKAGES   # expect: allow
+```
+
+Unlike the listener grant above, this one **fails loudly**: the updates sheet shows the permission
+as missing and offers a Fix button, because `ACTION_MANAGE_UNKNOWN_APP_SOURCES` is one of the few
+grants a rider can actually complete on the console itself.
+
+If updates are the problem rather than the permission, the catalog is a plain file you can read from
+the host — the device parses exactly what you see here, so a bad publish is visible without a device:
+
+```bash
+curl -sS https://raw.githubusercontent.com/Clancey/stride-catalog/main/catalog.json | head -40
+```
+
+The service refuses a non-https catalog URL in code, so a redirect off TLS reads as "check failed",
+not as a silent downgrade. To recover from a bad Stride build, the ordinary escalation in §8 still
+applies — the app store cannot roll back, by design.
+
 ---
 
 ## 7. An APK will not install

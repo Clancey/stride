@@ -90,10 +90,22 @@ dependencies {
     // decodes them directly. See protocol/glassos/README.md.
     implementation("com.squareup.okhttp3:okhttp:4.12.0")
 
+    // WorkManager drives the app store's periodic update check (see appstore/AppstoreWorker.kt). It
+    // is the only scheduler that survives Doze, app-standby, and process death on the Android 8/9
+    // this console runs without asking for a battery-optimisation exemption. 2.9.x is the last line
+    // that still supports minSdk 21-26 comfortably and needs no androidx.startup opt-in beyond the
+    // default initializer.
+    implementation("androidx.work:work-runtime-ktx:2.9.1")
+
     // The wire decoder is the one place where a silent, single-digit mistake turns into a wrong
     // number on a screen someone is running in front of. It is pure logic with no Android
     // dependency, so it is testable on the JVM against messages actually captured from the machine.
     testImplementation("junit:junit:4.13.2")
+
+    // android.jar's org.json is a stub that throws on every method in unit tests. The catalog parser
+    // (appstore/CatalogManifest.kt) is exactly the code whose rejection cases must be tested, so the
+    // real implementation is supplied for the JVM test classpath only.
+    testImplementation("org.json:json:20240303")
 }
 
 flutter {

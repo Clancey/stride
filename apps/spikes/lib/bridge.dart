@@ -150,6 +150,25 @@ class SpikeBridge {
   static Future<bool> trackFloorSet(bool? chosen) =>
       _bool('trackFloorSet', <String, dynamic>{'chosen': chosen});
 
+  // App store - catalog, updates, installs
+  //
+  // Every one of these is a *Safe variant: the app store is the one surface that must never take
+  // the launcher down with it. A console that cannot reach its catalog still has to boot, run a
+  // workout, and launch Spotify.
+  static Future<Map<String, dynamic>> appstoreStatus() =>
+      _mapSafe('appstoreStatus');
+  static Future<bool> appstoreCheckNow() => _boolSafe('appstoreCheckNow');
+  static Future<bool> appstoreInstall(String package) =>
+      _boolSafe('appstoreInstall', {'package': package});
+  static Future<bool> appstoreCancel(String package) =>
+      _boolSafe('appstoreCancel', {'package': package});
+  static Future<List<Map<String, dynamic>>> appstoreSetupChecklist() =>
+      _listSafe('appstoreSetupChecklist');
+  static Future<bool> appstoreCanRequestInstalls() =>
+      _boolSafe('appstoreCanRequestInstalls');
+  static Future<bool> appstoreOpenInstallPermission() =>
+      _boolSafe('appstoreOpenInstallPermission');
+
   // ---------------------------------------------------------------- helpers
 
   static Future<bool> _bool(
@@ -201,6 +220,20 @@ class SpikeBridge {
     return (result ?? const [])
         .map((e) => Map<String, dynamic>.from(e as Map))
         .toList();
+  }
+
+  /// Like [_list] but degrades to an empty list rather than letting a missing
+  /// platform method reach the UI.
+  static Future<List<Map<String, dynamic>>> _listSafe(String method) async {
+    try {
+      return await _list(method);
+    } on MissingPluginException {
+      return const [];
+    } on PlatformException {
+      return const [];
+    } on Object {
+      return const [];
+    }
   }
 
   static Future<List<String>> _strings(String method) async {
