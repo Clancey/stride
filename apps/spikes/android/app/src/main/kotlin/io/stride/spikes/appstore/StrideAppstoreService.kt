@@ -171,15 +171,19 @@ class StrideAppstoreService : Service() {
 
     /** Download (if needed), verify, then install or park. */
     private fun stageAndInstall(entry: CatalogEntry) {
-        val staged = downloader.stagingFile(entry)
-        if (!staged.exists()) {
+        // A bundle is only staged if *every* part is present. A surviving subset from an
+        // interrupted run would otherwise be treated as a complete download and installed without
+        // its native-code split.
+        val expected = entry.allArtifacts.associate { it.name to downloader.stagingFile(entry, it) }
+        var staged: Map<String, File> = expected
+        if (expected.values.any { !it.exists() }) {
             AppstoreState.update(
                 entry.packageName,
                 AppstoreState.Stage.DOWNLOADING,
-                totalBytes = entry.sizeBytes,
+                totalBytes = entry.totalBytes,
             )
             try {
-                downloader.download(entry) { progress ->
+                staged = downloader.downloadAll(entry) { progress ->
                     AppstoreState.progress(entry.packageName, progress.bytes, progress.totalBytes)
                 }
             } catch (e: DownloadException) {
@@ -192,11 +196,14 @@ class StrideAppstoreService : Service() {
             }
         }
 
-        when (val verdict = ApkVerifier.verify(entry, ApkVerifier.inspect(this, staged))) {
+        val base = staged.getValue("base")
+        // Verification inspects the base APK: package, versionCode and signer all live there, and
+        // Android will reject splits signed by anyone else at commit time.
+        when (val verdict = ApkVerifier.verify(entry, ApkVerifier.inspect(this, base))) {
             is VerificationResult.Rejected -> {
                 // Fail closed and destroy the evidence: a file that failed verification must never
                 // be reachable by a later retry that happens to skip the check.
-                staged.delete()
+                staged.values.forEach { it.delete() }
                 AppstoreState.update(
                     entry.packageName,
                     AppstoreState.Stage.FAILED,

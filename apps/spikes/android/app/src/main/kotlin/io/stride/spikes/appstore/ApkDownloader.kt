@@ -53,24 +53,63 @@ class ApkDownloader(
      * @throws DownloadException if the transport fails, the size disagrees with the catalog, or the
      *   SHA-256 does not match. The partial file is always removed first.
      */
-    fun download(entry: CatalogEntry, onProgress: (DownloadProgress) -> Unit = {}): File {
-        if (!entry.url.startsWith("https://")) {
-            // CatalogManifest already rejects these; re-checked here because this class is the last
-            // thing standing between a URL and a file we will ask the user to install.
-            throw DownloadException("refusing non-https artifact url for ${entry.packageName}")
-        }
+    fun download(entry: CatalogEntry, onProgress: (DownloadProgress) -> Unit = {}): File =
+        downloadAll(entry, onProgress).getValue("base")
 
+    /**
+     * Downloads every artifact for [entry] — the base APK and any config splits — and returns them
+     * keyed by artifact name, ready for [ApkInstaller.install].
+     *
+     * Progress is reported against the *total* size across all parts, because from the rider's
+     * point of view a bundle is one download. Any failure removes everything staged for this entry:
+     * a surviving subset would be indistinguishable from a complete one on the next attempt, and
+     * installing a bundle without its native-code split yields an app that crashes on launch.
+     */
+    fun downloadAll(
+        entry: CatalogEntry,
+        onProgress: (DownloadProgress) -> Unit = {},
+    ): Map<String, File> {
         if (!cacheDir.exists() && !cacheDir.mkdirs()) {
             throw DownloadException("cannot create staging directory ${cacheDir.absolutePath}")
         }
 
-        val target = stagingFile(entry)
+        val total = entry.totalBytes
+        var completed = 0L
+        val staged = LinkedHashMap<String, File>()
+        try {
+            entry.allArtifacts.forEach { artifact ->
+                val target = stagingFile(entry, artifact)
+                downloadArtifact(entry.packageName, artifact, target) { bytesInThisPart ->
+                    onProgress(DownloadProgress(completed + bytesInThisPart, total))
+                }
+                completed += artifact.sizeBytes
+                staged[artifact.name] = target
+            }
+        } catch (e: Exception) {
+            staged.values.forEach { it.delete() }
+            throw e
+        }
+        return staged
+    }
+
+    private fun downloadArtifact(
+        packageName: String,
+        artifact: SplitArtifact,
+        target: File,
+        onProgress: (Long) -> Unit,
+    ): File {
+        if (!artifact.url.startsWith("https://")) {
+            // CatalogManifest already rejects these; re-checked here because this class is the last
+            // thing standing between a URL and a file we will ask the user to install.
+            throw DownloadException("refusing non-https artifact url for $packageName")
+        }
+
         target.delete()
 
         val digest = MessageDigest.getInstance("SHA-256")
         var written = 0L
         try {
-            fetcher.open(entry.url).use { input ->
+            fetcher.open(artifact.url).use { input ->
                 target.outputStream().use { output ->
                     val buffer = ByteArray(64 * 1024)
                     while (true) {
@@ -79,13 +118,13 @@ class ApkDownloader(
                         digest.update(buffer, 0, read)
                         output.write(buffer, 0, read)
                         written += read
-                        if (written > entry.sizeBytes) {
+                        if (written > artifact.sizeBytes) {
                             throw DownloadException(
-                                "artifact for ${entry.packageName} is larger than the catalog says " +
-                                    "($written > ${entry.sizeBytes})"
+                                "${artifact.name} for $packageName is larger than the catalog says " +
+                                    "($written > ${artifact.sizeBytes})"
                             )
                         }
-                        onProgress(DownloadProgress(written, entry.sizeBytes))
+                        onProgress(written)
                     }
                 }
             }
@@ -94,21 +133,22 @@ class ApkDownloader(
             throw e
         } catch (e: IOException) {
             target.delete()
-            throw DownloadException("download failed for ${entry.packageName}: ${e.message}", e)
+            throw DownloadException("download failed for $packageName: ${e.message}", e)
         }
 
-        if (written != entry.sizeBytes) {
+        if (written != artifact.sizeBytes) {
             target.delete()
             throw DownloadException(
-                "artifact for ${entry.packageName} is ${written}B, catalog says ${entry.sizeBytes}B"
+                "${artifact.name} for $packageName is ${written}B, catalog says ${artifact.sizeBytes}B"
             )
         }
 
         val actual = digest.digest().toHex()
-        if (actual != entry.sha256) {
+        if (actual != artifact.sha256) {
             target.delete()
             throw DownloadException(
-                "sha256 mismatch for ${entry.packageName}: expected ${entry.sha256}, got $actual"
+                "sha256 mismatch for $packageName ${artifact.name}: " +
+                    "expected ${artifact.sha256}, got $actual"
             )
         }
 
@@ -123,6 +163,14 @@ class ApkDownloader(
     /** Stable, collision-free name so two versions of one package cannot alias. */
     fun stagingFile(entry: CatalogEntry): File =
         File(cacheDir, "${entry.packageName}-${entry.versionCode}.apk")
+
+    /**
+     * Per-artifact staging path. The base keeps the historical single-APK name so an install that
+     * was staged by an older build is still found; splits get a suffix.
+     */
+    fun stagingFile(entry: CatalogEntry, artifact: SplitArtifact): File =
+        if (artifact.name == "base") stagingFile(entry)
+        else File(cacheDir, "${entry.packageName}-${entry.versionCode}-${artifact.name}.apk")
 
     companion object {
         /**

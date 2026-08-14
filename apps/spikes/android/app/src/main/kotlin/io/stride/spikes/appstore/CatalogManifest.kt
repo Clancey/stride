@@ -142,6 +142,39 @@ data class CatalogManifest(
                 }
             }
 
+            // Split APKs (an "XAPK"/app bundle): the base is `url` above, and these are the config
+            // splits that must be installed *in the same session* as it. An app whose native code
+            // lives in a config.<abi> split installs happily without it and then crashes on launch,
+            // so a partial install is worse than no install - hence every split is validated here
+            // and any bad one rejects the whole entry.
+            val splitsJson = obj.optJSONArray("splits")
+            val splits = buildList {
+                if (splitsJson != null) {
+                    for (i in 0 until splitsJson.length()) {
+                        val s = splitsJson.optJSONObject(i)
+                            ?: throw CatalogFormatException("apps[$index] splits[$i] is not an object")
+                        val sUrl = s.optString("url")
+                        if (!sUrl.startsWith("https://")) {
+                            throw CatalogFormatException("apps[$index] splits[$i] url is not https")
+                        }
+                        val sSha = s.optString("sha256").lowercase()
+                        if (!HEX_64.matches(sSha)) {
+                            throw CatalogFormatException(
+                                "apps[$index] splits[$i] sha256 is not a 64-character hex digest"
+                            )
+                        }
+                        val sSize = s.optLong("sizeBytes", -1L)
+                        if (sSize <= 0L) {
+                            throw CatalogFormatException(
+                                "apps[$index] splits[$i] has a non-positive sizeBytes"
+                            )
+                        }
+                        add(SplitArtifact(name = s.optString("name").ifEmpty { "split$i" },
+                            url = sUrl, sha256 = sSha, sizeBytes = sSize))
+                    }
+                }
+            }
+
             return CatalogEntry(
                 packageName = packageName,
                 role = role,
@@ -156,6 +189,7 @@ data class CatalogManifest(
                 signerSha256 = signerSha256,
                 releaseNotesUrl = obj.optString("releaseNotesUrl").takeIf { it.isNotEmpty() },
                 requiresGms = obj.optBoolean("requiresGms", false),
+                splits = splits,
             )
         }
 
@@ -215,6 +249,37 @@ data class CatalogEntry(
      * rather than installing something that will greet the rider with a sign-in loop.
      */
     val requiresGms: Boolean = false,
+    /**
+     * Config splits that must be installed together with [url] in a single session.
+     *
+     * Empty for an ordinary single-APK app. When it is not empty, [url] is the *base* APK and
+     * these carry the native libraries, resources and language assets Android selected for this
+     * device. Installing the base alone produces an app that appears installed and then dies on
+     * launch with a missing-native-library error, which is why [totalBytes] and the installer
+     * treat the set as one indivisible artifact.
+     */
+    val splits: List<SplitArtifact> = emptyList(),
+) {
+    /** Every artifact that has to be downloaded, base first. */
+    val allArtifacts: List<SplitArtifact>
+        get() = buildList {
+            add(SplitArtifact(name = "base", url = url, sha256 = sha256, sizeBytes = sizeBytes))
+            addAll(splits)
+        }
+
+    /** What the rider actually waits for, so progress and size reflect the whole install. */
+    val totalBytes: Long get() = sizeBytes + splits.sumOf { it.sizeBytes }
+}
+
+/**
+ * One part of a split install. [name] is only for logging and progress; Android derives the real
+ * split identity from the APK's own manifest, not from the filename we give it.
+ */
+data class SplitArtifact(
+    val name: String,
+    val url: String,
+    val sha256: String,
+    val sizeBytes: Long,
 )
 
 /** A manifest this client will not act on. Always fatal for the whole document. */

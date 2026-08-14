@@ -25,13 +25,26 @@ import java.io.File
 class ApkInstaller(private val context: Context) {
 
     /**
-     * Opens a session, streams [file] into it, and commits.
+     * Opens a session, streams [files] into it, and commits.
+     *
+     * [files] is keyed by artifact name and must contain the base APK plus every split the entry
+     * declares. All parts go into a *single* session on purpose: that is how Android installs an
+     * app bundle atomically. Committing them separately would either be rejected or leave the app
+     * installed without its native-code split, which looks fine until the rider taps it.
      *
      * Returns the session id on success. The *result* arrives asynchronously at
      * [InstallResultReceiver], which is where status is published — committing only means the
      * platform has taken ownership of the request.
      */
-    fun install(entry: CatalogEntry, file: File): Int {
+    fun install(entry: CatalogEntry, files: Map<String, File>): Int {
+        val artifacts = entry.allArtifacts
+        val missing = artifacts.filter { files[it.name] == null }
+        require(missing.isEmpty()) {
+            // Fail here rather than committing a partial bundle: a split install that silently
+            // drops config.<abi> produces an app that crashes on launch with no clue why.
+            "cannot install ${entry.packageName}: missing ${missing.joinToString { it.name }}"
+        }
+
         val installer = context.packageManager.packageInstaller
         val params = PackageInstaller.SessionParams(
             PackageInstaller.SessionParams.MODE_FULL_INSTALL
@@ -39,15 +52,20 @@ class ApkInstaller(private val context: Context) {
             setAppPackageName(entry.packageName)
             // Lets the platform pre-allocate and fail early on a full disk rather than halfway
             // through writing 60 MB to a console with a small data partition.
-            setSize(entry.sizeBytes)
+            setSize(entry.totalBytes)
         }
 
         val sessionId = installer.createSession(params)
         try {
             installer.openSession(sessionId).use { session ->
-                session.openWrite(WRITE_NAME, 0, entry.sizeBytes).use { output ->
-                    file.inputStream().use { input -> input.copyTo(output) }
-                    session.fsync(output)
+                artifacts.forEach { artifact ->
+                    val file = files.getValue(artifact.name)
+                    // Each part needs a distinct name within the session; Android reads the real
+                    // split identity out of each APK's manifest, not from this name.
+                    session.openWrite(artifact.name, 0, artifact.sizeBytes).use { output ->
+                        file.inputStream().use { input -> input.copyTo(output) }
+                        session.fsync(output)
+                    }
                 }
                 session.commit(statusSender(entry, sessionId).intentSender)
             }
@@ -66,6 +84,9 @@ class ApkInstaller(private val context: Context) {
         AppstoreState.update(entry.packageName, AppstoreState.Stage.INSTALLING)
         return sessionId
     }
+
+    /** Single-artifact convenience for the common, non-bundle case. */
+    fun install(entry: CatalogEntry, file: File): Int = install(entry, mapOf("base" to file))
 
     private fun statusSender(entry: CatalogEntry, sessionId: Int): PendingIntent {
         val intent = Intent(context, InstallResultReceiver::class.java)
