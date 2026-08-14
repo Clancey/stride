@@ -1,6 +1,6 @@
 /// Smoke test: start the mock server in-process over mTLS and make real gRPC
 /// calls against it, using the same identity-codec technique as the on-device
-/// probe (apps/spikes/lib/glassos_probe.dart).
+/// client (apps/spikes/android/app/src/main/kotlin/io/stride/spikes/GlassOsClient.kt).
 ///
 /// Requires certs from tool/gen_certs.sh (run automatically below if missing).
 library;
@@ -188,9 +188,9 @@ void main() {
     expect(host.machine.speedKph >= 0, isTrue);
   });
 
-  test('probe-compatible client (CA-only, no client cert) can GetConsole',
+  test('client-compatible client (CA-only, no client cert) can GetConsole',
       () async {
-    // Replicates apps/spikes/lib/glassos_probe.dart's gRPC channel exactly: it
+    // Replicates apps/spikes/android/app/src/main/kotlin/io/stride/spikes/GlassOsClient.kt's gRPC channel exactly: it
     // trusts the CA, bypasses server-cert checks with onBadCertificate, and
     // does NOT present a client cert. The default server (requestClientCert but
     // not require) must still serve it, or the on-device probe would break.

@@ -12,10 +12,10 @@ This is the "emulator-first" tool from `docs/PLAN.md` section 7.
 
 We do **not** know the real GlassOS protobuf schema. The published `.proto` files
 live in a GPL-3 repo we are deliberately not copying, and the true field numbers
-can only be confirmed by running `apps/spikes/lib/glassos_probe.dart` against real
+can only be confirmed by running `apps/spikes/android/app/src/main/kotlin/io/stride/spikes/GlassOsClient.kt` against real
 hardware. So this mock defines its own *plausible* schema in
 `lib/src/messages.dart` and hand-encodes it with a tiny wire-format codec
-(`lib/src/proto_codec.dart`) that is the inverse of the probe's schema-free
+(`lib/src/proto_codec.dart`) that is the inverse of the client's schema-free
 decoder. When real field numbers arrive, `lib/src/messages.dart` is the only file
 that should need to change.
 
@@ -64,7 +64,7 @@ Flags:
 - `--certs DIR` - certificate directory (default `certs`).
 - `--no-enforce-client-id` - stop rejecting calls without the `client_id` header.
 - `--require-client-cert` - strict mTLS: abort the handshake if the client does
-  not present a certificate. Off by default so the schema-free probe (which does
+  not present a certificate. Off by default so the schema-free client (which does
   not present a client cert on its gRPC channel) can still connect. When a client
   does present a cert, it is always validated against the CA - that is genuine
   mutual TLS, exercised by the smoke test.
@@ -143,14 +143,14 @@ GLASSOS_DROP_ACKS=1 dart run bin/glassos_mock.dart --no-repl
 
 `test/smoke_test.dart` starts the server in-process over real mTLS and makes
 genuine gRPC calls: `GetConsole`, `SetSpeed` (asserting the belt ramps rather than
-jumping), telemetry streaming, the workout lifecycle, a probe-compatible CA-only
+jumping), telemetry streaming, the workout lifecycle, a client-compatible CA-only
 client, strict `requireClientCert` mTLS, and rejection of calls missing the
 `client_id` header. `test/fault_test.dart` covers the physics and every fault.
 
 ## Assumptions most likely to be wrong on real hardware
 
 - **Every protobuf field number.** They are a guess (fields numbered 1..N in
-  declaration order). The probe on real hardware is the source of truth.
+  declaration order). The client on real hardware is the source of truth.
 - **Message shapes.** `SetSpeed` is assumed to carry a `double` kph in field 1 and
   an optional generation id; `ConsoleInfo` field ordering is invented; workout
   enum ordinals are invented.
@@ -161,7 +161,7 @@ client, strict `requireClientCert` mTLS, and rejection of calls missing the
   policy precisely so both answers can be tested.
 - **mTLS strictness and the `client_id` header semantics.** Real GlassOS requires
   the client certificate; the mock defaults to request-and-validate (not require)
-  so the unmodified probe still connects. The exact accepted `client_id` value and
+  so the unmodified client still connects. The exact accepted `client_id` value and
   whether the transport is exclusive-client are unconfirmed.
 - **Ramp rates.** Acceleration and deceleration rates are representative guesses,
   not measured from a 1750.

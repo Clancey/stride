@@ -35,11 +35,6 @@ dependencies:
   # Use with the CupertinoIcons class for iOS style icons.
   cupertino_icons: ^1.0.8
 
-  # S2: read the iFit console APK (a zip) to locate the GlassOS credentials.
-  archive: ^4.0.0
-  # S2: raw gRPC with identity codecs - no generated stubs, no third-party .proto files.
-  grpc: ^4.0.0
-  # App-private storage for extracted credentials. Never /sdcard.
   path_provider: ^2.1.5
 
 dev_dependencies:

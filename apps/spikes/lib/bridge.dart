@@ -150,9 +150,6 @@ class SpikeBridge {
   static Future<bool> trackFloorSet(bool? chosen) =>
       _bool('trackFloorSet', <String, dynamic>{'chosen': chosen});
 
-  // S2 - iFit APK location
-  static Future<Map<String, dynamic>> ifitApkPaths() => _map('ifitApkPaths');
-
   // ---------------------------------------------------------------- helpers
 
   static Future<bool> _bool(

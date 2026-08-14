@@ -79,8 +79,8 @@ class SpikeBridge(private val context: Context) : MethodChannel.MethodCallHandle
             // com.ifit.val_workout_acceptance.view.WorkoutAcceptanceActivity — a factory
             // acceptance-test harness labelled "Workout Player", not the console experience — so
             // this tile never was the escape hatch it was once planned to be. Stride drives the
-            // treadmill itself now, so the tile is gone. IFIT_CONSOLE_PACKAGE is unaffected: cert
-            // extraction reads the APK through getApplicationInfo, not through this list.
+            // treadmill itself now, so the tile is gone. This hides it from the grid; it stays
+            // installed, and nothing here disables or removes it.
             IFIT_CONSOLE_PACKAGE,
             // Android settings is reachable from Stride's own settings screen, which warns first
             // that our overlay is blanked in there. A pinned tile would skip that warning and drop
@@ -177,9 +177,6 @@ class SpikeBridge(private val context: Context) : MethodChannel.MethodCallHandle
                 "goBack" -> result.success(StrideAccessibilityService.instance?.goBack() ?: false)
                 "goRecents" -> result.success(StrideAccessibilityService.instance?.goRecents() ?: false)
                 "foregroundPackage" -> result.success(StrideAccessibilityService.foregroundPackage)
-
-                // --- S2: locate the iFit console APK for cert extraction ---
-                "ifitApkPaths" -> result.success(ifitApkPaths())
 
                 "launchApp" -> result.success(launchApp(call.argument<String>("package")!!))
 
@@ -667,40 +664,4 @@ class SpikeBridge(private val context: Context) : MethodChannel.MethodCallHandle
         return enabled.split(':').any { it.startsWith("${context.packageName}/") }
     }
 
-    // ------------------------------------------------------------------ S2 iFit APK
-
-    /**
-     * Locate the installed iFit console APK so the cert extractor can read it.
-     *
-     * Equivalent of `pm path com.ifit.rivendell`, but via PackageManager so it works without a
-     * shell. Returns base APK plus split APKs.
-     */
-    private fun ifitApkPaths(): Map<String, Any?> {
-        val pm = context.packageManager
-        // Other iFit-family packages, in case this firmware names the console package differently.
-        val related = pm.getInstalledApplications(0)
-            .filter { it.packageName.startsWith("com.ifit") || it.packageName.contains("glassos") }
-            .map { mapOf("package" to it.packageName, "sourceDir" to it.sourceDir) }
-
-        return try {
-            val info = pm.getApplicationInfo(IFIT_CONSOLE_PACKAGE, 0)
-            val paths = mutableListOf(info.sourceDir)
-            info.splitSourceDirs?.let { paths.addAll(it) }
-            mapOf(
-                "installed" to true,
-                "package" to IFIT_CONSOLE_PACKAGE,
-                "paths" to paths,
-                "readable" to paths.map { java.io.File(it).canRead() },
-                "related" to related,
-            )
-        } catch (_: PackageManager.NameNotFoundException) {
-            mapOf(
-                "installed" to false,
-                "package" to IFIT_CONSOLE_PACKAGE,
-                "paths" to emptyList<String>(),
-                "readable" to emptyList<Boolean>(),
-                "related" to related,
-            )
-        }
-    }
 }

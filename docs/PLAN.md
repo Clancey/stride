@@ -161,17 +161,29 @@ non-system app *can* own the machine while iFit's UI is gone.
 1. A `CredentialProvider` reads certs at runtime and imports them into **app-private** storage
    (`getFilesDir()`, Keystore-wrapped where the key format allows) — *not* `/sdcard`, which tHUD uses
    and which is world-readable to other apps. Never logged, never exported.
-2. **On-device extraction as a first-run wizard.** The extraction algorithm is public and purely
-   structural, so Stride can do it itself: `pm path com.ifit.rivendell` → read the APK → scan for
-   DER-encoded ASN.1 in fake-JPEG resources → import. This removes the entire PC + Python + `adb push`
-   dance from the user's path and is a genuine UX win over both existing projects.
-3. **Never bundle a cert in the APK.** NordicFTMS's approach only works if certs are shared, and it
+2. **Never bundle a cert in the APK.** NordicFTMS's approach only works if certs are shared, and it
    puts the maintainer's own key material into every distributed binary. Not doing that.
 
 **Open question (S2b): are the certs per-device or shared across a model/firmware line?** tHUD says
 per-device; NordicFTMS's prebuilt-APK distribution implies shared. Nobody has published a comparison
-across physical machines. Self-extraction (step 2) makes Stride correct under *either* answer, which
-is exactly why it's the chosen design.
+across physical machines. Runtime loading is correct under *either* answer, which is exactly why
+it's the chosen design.
+
+#### The in-app extractor was removed
+
+Revision 3 planned on-device extraction as a first-run wizard: `pm path com.ifit.rivendell` → read
+the APK → scan for DER-encoded ASN.1 in fake-JPEG resources → import. It was built as diagnostic
+spike S2 and has since been **deleted** — it wrote `ca.pem` / `client.pem` / `client.key`, whereas
+the production loader (`GlassOsCredentials`) reads `ca_cert.pem` / `client_cert.pem` /
+`client_key.pem`. The two halves never met, so the extractor only ever fed a probe screen.
+
+**Credentials are provisioned out-of-band today**, into
+`filesDir/glassos/{ca_cert,client_cert,client_key}.pem`. Note the constraint this creates: release
+builds are not debuggable, so `adb shell run-as io.stride.spikes` cannot reach app-private storage
+on a shipping build. **A supported provisioning path is an open item** — either a debug-build step,
+a settings-screen import, or a rebuilt extractor that writes the filenames the loader actually
+reads. Until then, a fresh console has no credentials and MachineLink stays disconnected, which the
+UI reports honestly as "Not measured" rather than pretending to read the machine.
 
 **This still does not make the legal question go away** (see §9). It reduces exposure and keeps our
 distribution clean; it does not transfer risk cleanly to the user.
@@ -581,10 +593,10 @@ late firmware discovery could have invalidated a lot of work. Reordered:
 | Phase | Outcome | Gate |
 |---|---|---|
 | **0. Spikes** | Retire the existential unknowns (§6) | S1, **S2-A**, S6 all pass |
-| **1. Coordinator + GlassOS** | §3.1 service, on-device cert extraction wizard, GlassOS gRPC client (Dart stubs from the iFit protos), `ConsoleInfo`-seeded ranges, + **one safely-bounded command** (incline only, or speed capped low). Headless — no launcher, no UI polish | **S2-B** passes: real control on the 1750, with clamps / watchdog / stop-preemption enforced from the very first command, and the dead-client behaviour documented |
+| **1. Coordinator + GlassOS** | §3.1 service, out-of-band credential provisioning, GlassOS gRPC client (Dart stubs from the iFit protos), `ConsoleInfo`-seeded ranges, + **one safely-bounded command** (incline only, or speed capped low). Headless — no launcher, no UI polish | **S2-B** passes: real control on the 1750, with clamps / watchdog / stop-preemption enforced from the very first command, and the dead-client behaviour documented |
 | **2. Overlay + navigation** | Always-visible strip + expanded panel; **AccessibilityService providing Back / Home / Recents**; edge-swipe gesture layer (§3.3). Simplest possible rendering | Overlay survives launching Spotify, you can get *back out* of it, and stop is always reachable |
 | **3. Media coupling** | MediaSession control with ownership tracking; pause/resume tied to workout state | Pause workout → Spotify pauses; resume restores only what Stride paused |
-| **4. Launcher shell** | Default HOME, app grid, pin/unpin, iFit still launchable as escape hatch | Boots and survives reboot |
+| **4. Launcher shell** | Default HOME, app grid, pin/unpin | Boots and survives reboot |
 | **5. Sessions + export** | Full workout engine, summary screen, FIT encoding, local history | Valid FIT importable by Strava/Garmin |
 | **6. Generalize + FTMS** | Extract §3.4 abstraction from GlassOS + a *new* generic FTMS driver; profiles CRUD; media-app ranking | Works against an FTMS trainer *and* the 1750 through one interface |
 | **7. Companions** | LAN sync channel, iOS + watchOS + Android apps, HealthKit / Health Connect writes | Watch HR on the console HUD; workout lands in Apple Health |
@@ -747,7 +759,10 @@ gate Phase 0 — it gates shipping any control code, and it belongs behind the C
    profile of the certificate question.
 4. **Console firmware / iFit build** on your 1750 — determines Tier A vs. B and whether privileged
    mode is currently intact.
-5. **Keep iFit launchable** from Stride as an escape hatch (recommended), or full replacement?
+5. ~~**Keep iFit launchable** from Stride as an escape hatch, or full replacement?~~ **Answered:
+   full replacement.** `com.ifit.rivendell`'s only launcher entry is a factory acceptance harness
+   ("Workout Player"), not the console UI, so the tile was never an escape hatch. It is now hidden
+   from the grid — hidden, not uninstalled. The real recovery path is S1's documented procedure.
 6. **Non-treadmill hardware** for testing bike/rower paths, or simulator-only for now?
 7. **Relationship to tHUD** (`a-vikulin/thud`) — it already replaces the iFit player over GlassOS
    gRPC under GPL-3. Build Stride independently, borrow from it, or contribute the launcher/overlay

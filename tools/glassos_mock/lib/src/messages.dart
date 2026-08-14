@@ -4,12 +4,12 @@
 /// None of the field numbers below are confirmed against real hardware. The real
 /// GlassOS `.proto` files are published in a GPL-3 repo we are deliberately not
 /// copying, and the only honest way to learn the true field numbers is to run
-/// apps/spikes/lib/glassos_probe.dart against an actual console and read the wire
+/// apps/spikes/android/app/src/main/kotlin/io/stride/spikes/GlassOsClient.kt against an actual console and read the wire
 /// dump (see docs/PLAN.md section 2.2 and section 7).
 ///
 /// So this file is a self-consistent GUESS chosen to be:
 ///   - shaped like the documented messages (ConsoleInfo, SpeedService, etc.),
-///   - decodable by the schema-free probe,
+///   - decodable by the schema-free client,
 ///   - and isolated: when the real schema arrives, THIS FILE is the only thing
 ///     that should need to change. The server, physics, and fault code below all
 ///     go through these classes.

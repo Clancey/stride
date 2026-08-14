@@ -7,7 +7,7 @@
 ///
 /// The wire format is self-describing: every field is `(field_number << 3) |
 /// wire_type` followed by the payload. That is exactly what the generic decoder
-/// in apps/spikes/lib/glassos_probe.dart walks, so anything written here is
+/// in apps/spikes/android/app/src/main/kotlin/io/stride/spikes/GlassOsClient.kt walks, so anything written here is
 /// decodable there. This encoder is the inverse of that decoder.
 ///
 /// Wire types used:

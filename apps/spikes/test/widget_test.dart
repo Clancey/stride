@@ -53,7 +53,9 @@ void main() {
     await tester.tap(find.byTooltip('Diagnostics'));
     await tester.pumpAndSettle();
 
-    for (final id in <String>['ENV', 'S1', 'S2', 'S3', 'S4', 'S5', 'S10']) {
+    // S2 is deliberately absent: it probed GlassOS with credentials the in-app extractor wrote,
+    // and both are gone. The production mTLS path reads different filenames from filesDir.
+    for (final id in <String>['ENV', 'S1', 'S3', 'S4', 'S5', 'S10']) {
       expect(
         find.textContaining('$id — '),
         findsOneWidget,

@@ -2,7 +2,7 @@
 /// wrapper that can stop/restart the transport for fault injection.
 ///
 /// Services use identity (raw byte) codecs so no generated stubs are needed
-/// and the schema-free probe (apps/spikes/lib/glassos_probe.dart) can call them
+/// and the schema-free client (apps/spikes/android/app/src/main/kotlin/io/stride/spikes/GlassOsClient.kt) can call them
 /// directly. Message bodies are built by lib/src/messages.dart.
 library;
 
@@ -96,10 +96,10 @@ class MockServerConfig {
   /// Strict mTLS: abort the TLS handshake if the client does not present a
   /// certificate. Real GlassOS behaves this way, so it is worth exercising.
   ///
-  /// It defaults to FALSE for one deliberate reason: the schema-free probe in
-  /// apps/spikes/lib/glassos_probe.dart does not present a client cert on its
+  /// It defaults to FALSE for one deliberate reason: the schema-free client in
+  /// apps/spikes/android/app/src/main/kotlin/io/stride/spikes/GlassOsClient.kt does not present a client cert on its
   /// gRPC channel (only on its standalone handshake test), and the task requires
-  /// that unmodified probe to be able to call GetConsole. So the default is
+  /// that unmodified client to be able to call GetConsole. So the default is
   /// "request + validate the client cert if presented" (still genuine mutual TLS
   /// when a cert is offered, as the smoke test proves) without hard-requiring
   /// one. Set requireClientCert=true (CLI --require-client-cert) to model the

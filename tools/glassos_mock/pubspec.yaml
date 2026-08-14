@@ -12,7 +12,7 @@ environment:
 # grpc gives us the HTTP/2 + mTLS server. We deliberately do NOT depend on any
 # generated protobuf stubs: the real GlassOS schema is unknown, so messages are
 # hand-encoded with a small wire-format codec (lib/src/proto_codec.dart) that
-# mirrors the decoder in apps/spikes/lib/glassos_probe.dart. Swapping in the
+# mirrors the decoder in apps/spikes/android/app/src/main/kotlin/io/stride/spikes/GlassOsClient.kt. Swapping in the
 # real schema later means replacing lib/src/messages.dart only.
 dependencies:
   grpc: ^4.0.0

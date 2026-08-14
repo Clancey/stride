@@ -3,7 +3,6 @@ import 'package:flutter/material.dart';
 import '../theme/stride_tokens.dart';
 import 'apps_screen.dart';
 import 'environment_screen.dart';
-import 'glassos_screen.dart';
 import 'launcher_screen.dart';
 import 'media_screen.dart';
 import 'navigation_screen.dart';
@@ -41,13 +40,6 @@ const List<SpikeDiagnostic> spikeDiagnostics = <SpikeDiagnostic>[
     _launcherBuilder,
   ),
   SpikeDiagnostic(
-    'S2',
-    'GlassOS certs + gRPC',
-    'Can we extract the credentials on-device and complete an mTLS gRPC call?',
-    Icons.vpn_key_outlined,
-    _glassosBuilder,
-  ),
-  SpikeDiagnostic(
     'S3',
     'Overlay + edge gestures',
     'Does the overlay survive real apps, and how much touch does it steal?',
@@ -79,7 +71,6 @@ const List<SpikeDiagnostic> spikeDiagnostics = <SpikeDiagnostic>[
 
 Widget _envBuilder(BuildContext _) => const EnvironmentScreen();
 Widget _launcherBuilder(BuildContext _) => const LauncherScreen();
-Widget _glassosBuilder(BuildContext _) => const GlassOsScreen();
 Widget _overlayBuilder(BuildContext _) => const OverlayScreen();
 Widget _appsBuilder(BuildContext _) => const AppsScreen();
 Widget _mediaBuilder(BuildContext _) => const MediaScreen();
