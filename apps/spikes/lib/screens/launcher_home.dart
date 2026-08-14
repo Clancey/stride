@@ -185,8 +185,6 @@ class LauncherHomeState extends State<LauncherHome> {
                               onLaunch: _launch,
                               onAllApps: _openAllApps,
                               onUnpin: _confirmUnpin,
-                              onCreateProfile: _createProfile,
-                              onRenameProfile: _showRenameProfileSheet,
                             ),
                           ),
                           // Only one workout surface at a time. When the overlay is up it owns the
@@ -218,29 +216,6 @@ class LauncherHomeState extends State<LauncherHome> {
         ),
       ),
     );
-  }
-
-  Future<void> _createProfile() async {
-    try {
-      await _profiles.createProfile(_nextProfileName());
-    } catch (_) {
-      if (!mounted) return;
-      _showMessage('Could not create profile');
-    }
-  }
-
-  String _nextProfileName() {
-    final used = _profiles.profiles.map((profile) => profile.name).toSet();
-    for (final name in const <String>[
-      'Walk',
-      'Run',
-      'Recovery',
-      'Intervals',
-      'Guest',
-    ]) {
-      if (!used.contains(name)) return name;
-    }
-    return 'Workout ${_profiles.profiles.length + 1}';
   }
 
   void _openAllApps() {
@@ -340,69 +315,6 @@ class LauncherHomeState extends State<LauncherHome> {
     });
   }
 
-  Future<void> _renameProfile(String id, String name) async {
-    try {
-      await _profiles.renameProfile(id, name);
-    } catch (_) {
-      if (!mounted) return;
-      _showMessage('Could not rename profile');
-    }
-  }
-
-  void _showRenameProfileSheet(String id, String currentName) {
-    final controller = TextEditingController(text: currentName);
-    showStrideSheet<void>(
-      context: context,
-      builder: (context) {
-        return Padding(
-          padding: EdgeInsets.only(
-            left: StrideSpace.lg,
-            right: StrideSpace.lg,
-            bottom: MediaQuery.of(context).viewInsets.bottom + StrideSpace.lg,
-            top: StrideSpace.sm,
-          ),
-          child: Column(
-            mainAxisSize: MainAxisSize.min,
-            crossAxisAlignment: CrossAxisAlignment.stretch,
-            children: [
-              Text(
-                'Rename profile',
-                style: Theme.of(context).textTheme.titleLarge,
-              ),
-              const SizedBox(height: StrideSpace.md),
-              SizedBox(
-                height: StrideSpace.minTouch,
-                child: TextField(
-                  controller: controller,
-                  autofocus: true,
-                  style: Theme.of(context).textTheme.bodyLarge,
-                  decoration: const InputDecoration(hintText: 'Profile name'),
-                  textInputAction: TextInputAction.done,
-                  onSubmitted: (_) {
-                    final name = controller.text.trim();
-                    if (name.isEmpty) return;
-                    Navigator.of(context).pop();
-                    _renameProfile(id, name);
-                  },
-                ),
-              ),
-              const SizedBox(height: StrideSpace.lg),
-              FilledButton(
-                onPressed: () {
-                  final name = controller.text.trim();
-                  if (name.isEmpty) return;
-                  Navigator.of(context).pop();
-                  _renameProfile(id, name);
-                },
-                child: const Text('Save name'),
-              ),
-            ],
-          ),
-        );
-      },
-    ).whenComplete(controller.dispose);
-  }
-
   void _confirmUnpin(LaunchableApp app) {
     showStrideSheet<void>(
       context: context,
@@ -414,7 +326,7 @@ class LauncherHomeState extends State<LauncherHome> {
             crossAxisAlignment: CrossAxisAlignment.stretch,
             children: [
               Text(
-                'Remove ${app.label} from ${_profiles.active.name}?',
+                'Remove ${app.label} from your pinned apps?',
                 style: Theme.of(context).textTheme.titleLarge,
               ),
               const SizedBox(height: StrideSpace.lg),
@@ -519,8 +431,6 @@ class _LauncherPanel extends StatelessWidget {
     required this.onLaunch,
     required this.onAllApps,
     required this.onUnpin,
-    required this.onCreateProfile,
-    required this.onRenameProfile,
   });
 
   final ProfileStore profiles;
@@ -532,8 +442,6 @@ class _LauncherPanel extends StatelessWidget {
   final Future<void> Function(LaunchableApp app) onLaunch;
   final VoidCallback onAllApps;
   final void Function(LaunchableApp app) onUnpin;
-  final Future<void> Function() onCreateProfile;
-  final void Function(String id, String currentName) onRenameProfile;
 
   @override
   Widget build(BuildContext context) {
@@ -541,14 +449,13 @@ class _LauncherPanel extends StatelessWidget {
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.start,
         children: [
-          _ProfileSwitcher(
-            profiles: profiles,
-            onCreateProfile: onCreateProfile,
-            onRenameProfile: onRenameProfile,
-          ),
-          const SizedBox(height: StrideSpace.lg),
-          // No "Pin more" button here: the Add app tile in the grid does the same job at the point
-          // the rider is already looking, and the header still has All apps.
+          // Profiles are hidden, not removed: ProfileStore still backs the pinned grid through a
+          // single active profile, and every rider sees exactly one set of pinned apps. The
+          // switcher was pulled because swapping pin sets needs a better design than a row of
+          // pills. Restoring it is a UI change, not a migration.
+          //
+          // No "Pin more" button here either: the Add app tile in the grid does the same job at
+          // the point the rider is already looking, and the header still has All apps.
           Text(
             'Pinned apps',
             style: Theme.of(context).textTheme.headlineMedium,
@@ -604,114 +511,6 @@ class _LauncherPanel extends StatelessWidget {
           ),
         );
       },
-    );
-  }
-}
-
-class _ProfileSwitcher extends StatelessWidget {
-  const _ProfileSwitcher({
-    required this.profiles,
-    required this.onCreateProfile,
-    required this.onRenameProfile,
-  });
-
-  final ProfileStore profiles;
-  final Future<void> Function() onCreateProfile;
-  final void Function(String id, String currentName) onRenameProfile;
-
-  @override
-  Widget build(BuildContext context) {
-    return SizedBox(
-      height: 84,
-      child: ListView.separated(
-        scrollDirection: Axis.horizontal,
-        itemCount: profiles.profiles.length + 1,
-        separatorBuilder: (context, index) =>
-            const SizedBox(width: StrideSpace.sm),
-        itemBuilder: (context, index) {
-          if (index == profiles.profiles.length) {
-            return _ProfilePill(
-              label: 'Add profile',
-              selected: false,
-              icon: Icons.add,
-              onTap: onCreateProfile,
-            );
-          }
-          final profile = profiles.profiles[index];
-          final selected = profile.id == profiles.active.id;
-          return _ProfilePill(
-            label: profile.name,
-            selected: selected,
-            onTap: () => profiles.setActive(profile.id),
-            onLongPress: () => onRenameProfile(profile.id, profile.name),
-          );
-        },
-      ),
-    );
-  }
-}
-
-class _ProfilePill extends StatelessWidget {
-  const _ProfilePill({
-    required this.label,
-    required this.selected,
-    required this.onTap,
-    this.icon,
-    this.onLongPress,
-  });
-
-  final String label;
-  final bool selected;
-  final VoidCallback onTap;
-  final IconData? icon;
-  final VoidCallback? onLongPress;
-
-  @override
-  Widget build(BuildContext context) {
-    return Material(
-      color: Colors.transparent,
-      borderRadius: BorderRadius.circular(StrideRadius.xl),
-      child: InkWell(
-        borderRadius: BorderRadius.circular(StrideRadius.xl),
-        onTap: onTap,
-        onLongPress: onLongPress,
-        child: AnimatedContainer(
-          duration: StrideMotion.quick,
-          width: 208,
-          padding: const EdgeInsets.symmetric(horizontal: StrideSpace.lg),
-          alignment: Alignment.center,
-          decoration: BoxDecoration(
-            color: selected ? StrideColors.accent : StrideColors.panel,
-            borderRadius: BorderRadius.circular(StrideRadius.xl),
-            border: Border.all(
-              color: selected ? StrideColors.accent : StrideColors.line,
-            ),
-          ),
-          child: Row(
-            mainAxisAlignment: MainAxisAlignment.center,
-            children: [
-              if (icon != null) ...[
-                Icon(
-                  icon,
-                  color: selected ? StrideColors.ink : StrideColors.text,
-                ),
-                const SizedBox(width: StrideSpace.xs),
-              ],
-              Flexible(
-                child: Text(
-                  label,
-                  maxLines: 1,
-                  overflow: TextOverflow.ellipsis,
-                  style: Theme.of(context).textTheme.titleMedium?.copyWith(
-                    color: selected ? StrideColors.ink : StrideColors.text,
-                    fontWeight: FontWeight.w900,
-                  ),
-                ),
-              ),
-            ],
-          ),
-        ),
-      ),
     );
   }
 }

@@ -121,7 +121,7 @@ class _AllAppsScreenState extends State<AllAppsScreen> {
       ScaffoldMessenger.of(context).showSnackBar(
         SnackBar(
           content: Text(
-            '${app.label} pinned to ${widget.profiles.active.name}',
+            '${app.label} pinned to your launcher',
           ),
         ),
       );
@@ -143,7 +143,7 @@ class _AllAppsScreenState extends State<AllAppsScreen> {
               ),
               const SizedBox(height: StrideSpace.sm),
               Text(
-                'It will be removed from ${widget.profiles.active.name}. You can pin it again here later.',
+                'It will be removed from your launcher. You can pin it again here later.',
                 style: Theme.of(context).textTheme.bodyMedium,
               ),
               const SizedBox(height: StrideSpace.lg),

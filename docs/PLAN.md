@@ -501,6 +501,16 @@ companion command without explicit on-console confirmation.
 SQLite (drift). A `Profile` owns pinned apps + order, units, speed/incline presets, HR zones,
 preferred companion, media policy.
 
+**Status: the profile UI is hidden pending a redesign.** `ProfileStore` still backs the launcher —
+pinned apps, ordering, and media auto-add all read and write through a single active profile — but
+the switcher that let a rider create, rename, and swap profiles has been pulled from the launcher
+screen. A row of pills that silently swaps the entire pinned grid is the wrong shape for a control
+the rider hits mid-workout with a treadmill running, and no amount of polish on the pills fixes
+that. The data layer is untouched and fully tested, so restoring profiles is a UI change rather
+than a migration; the next attempt should start from *when* a rider actually needs a different pin
+set (shared household machine? guest mode? per-workout-type layouts?) instead of from the switcher
+widget. User-facing copy no longer names the active profile, since it names something invisible.
+
 **Corrected:** safety limits are **not** a profile field. An **installation/device-level hard
 ceiling** exists that a profile may only *lower*, never raise. **Profile and device switching are
 disallowed while the belt is moving.** Device binding and calibration are stored separately from
@@ -619,7 +629,7 @@ late firmware discovery could have invalidated a lot of work. Reordered:
 | **3. Media coupling** | MediaSession control with ownership tracking; pause/resume tied to workout state | Pause workout → Spotify pauses; resume restores only what Stride paused |
 | **4. Launcher shell** | Default HOME, app grid, pin/unpin | Boots and survives reboot |
 | **5. Sessions + export** | Full workout engine, summary screen, FIT encoding, local history | Valid FIT importable by Strava/Garmin |
-| **6. Generalize + FTMS** | Extract §3.4 abstraction from GlassOS + a *new* generic FTMS driver; profiles CRUD; media-app ranking | Works against an FTMS trainer *and* the 1750 through one interface |
+| **6. Generalize + FTMS** | Extract §3.4 abstraction from GlassOS + a *new* generic FTMS driver; profile UI redesigned from scratch (§3.6); media-app ranking | Works against an FTMS trainer *and* the 1750 through one interface |
 | **7. Companions** | LAN sync channel, iOS + watchOS + Android apps, HealthKit / Health Connect writes | Watch HR on the console HUD; workout lands in Apple Health |
 | **8. Device breadth** | Proprietary families on demand (Echelon, Domyos, Horizon, Sole, Schwinn, Bowflex, Kingsmith) | Each with hardware-in-loop validation, not just trace replay |
 | **9. Optional** | Virtual FTMS peripheral / DIRCON for Zwift; structured workouts (`.zwo` / `.fit` / ERG) | Deferred by design |
