@@ -2,16 +2,35 @@
 
 A Flutter Android launcher and persistent workout overlay for NordicTrack / iFit machines.
 
+<p align="center">
+  <a href="https://www.buymeacoffee.com/clancey"><img src="https://img.shields.io/badge/Buy%20me%20a%20coffee-clancey-FFDD00?style=for-the-badge&logo=buymeacoffee&logoColor=black" alt="Buy me a coffee"></a>
+</p>
+
 Stride replaces the console's launcher, puts the workout controls on a toggleable overlay that
 floats above whatever else is running, and lets you pin and launch ordinary Android apps — Spotify,
 YouTube, Plex — underneath it. Media pauses when the workout pauses. Since the console has no
 physical Home or Back button, Stride supplies system navigation too.
 
-**Status: Phase 0.** Nothing here controls a treadmill yet. The repository currently contains the
-architecture plan, a spike harness whose only job is to answer — on real hardware — whether the
-approach is viable at all, the safety coordinator that will own every motor command, and a mock
-console to test it against. **No spike has been run on hardware yet**; every question in
-`docs/SPIKES.md` is still open.
+**Status: running on hardware.** Stride is installed as the default launcher on a treadmill console
+and updates itself over the air. The overlay, app pinning, media coupling, system navigation, and
+the background updater (`docs/APPSTORE.md`) all work on a real machine. Motor control is not wired
+up yet — the workout metrics you see are read, not commanded — and the Phase 0 questions in
+`docs/SPIKES.md` around GlassOS control are still open.
+
+> **Tested on exactly one machine: a NordicTrack Commercial 1750.**
+> Other iFit consoles run the same Android software and will *probably* work, but nobody has tried.
+> Read [`docs/RUNBOOK.md`](docs/RUNBOOK.md) before you find out, and open an issue either way.
+
+## Install
+
+Everything a console needs is in the catalog repo:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/Clancey/stride-catalog/main/install.sh | bash
+```
+
+The walkthrough — including how to make Stride the launcher, and how to undo that — is
+**[Clancey/stride-catalog](https://github.com/Clancey/stride-catalog)**.
 
 ---
 

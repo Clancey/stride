@@ -6,10 +6,12 @@ import android.app.NotificationManager
 import android.app.Service
 import android.content.Context
 import android.content.Intent
+import android.content.IntentFilter
 import android.content.pm.PackageManager
 import android.os.Build
 import android.os.IBinder
 import android.util.Log
+import androidx.core.content.ContextCompat
 import androidx.core.content.edit
 import io.stride.spikes.WorkoutSession
 import okhttp3.OkHttpClient
@@ -72,11 +74,24 @@ class StrideAppstoreService : Service() {
         }
     }
 
+    private val installResults = InstallResultReceiver()
+
     override fun onCreate() {
         super.onCreate()
         active = this
         startForegroundWithNotification()
         WorkoutSession.addListener(workoutListener)
+        // Registered here rather than in the manifest: this firmware silently drops background
+        // broadcasts to manifest receivers of an O+ app, which stranded every install at
+        // STATUS_PENDING_USER_ACTION with no dialog and no error. See ApkInstaller.statusSender.
+        // The service outlives every install it starts, so a runtime registration is not a
+        // narrower guarantee than a manifest one - it is the same guarantee, actually delivered.
+        ContextCompat.registerReceiver(
+            this,
+            installResults,
+            IntentFilter(ApkInstaller.ACTION_INSTALL_STATUS),
+            ContextCompat.RECEIVER_NOT_EXPORTED,
+        )
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
@@ -113,6 +128,7 @@ class StrideAppstoreService : Service() {
 
     override fun onDestroy() {
         WorkoutSession.removeListener(workoutListener)
+        runCatching { unregisterReceiver(installResults) }
         active = null
         worker.shutdown()
         super.onDestroy()
@@ -125,6 +141,7 @@ class StrideAppstoreService : Service() {
     /** Fetch, parse, classify, then act on whatever the plan says is safe to act on. */
     private fun check() {
         AppstoreState.beginCheck()
+        recordCheckStarted(this)
         val url = catalogUrl(this)
         val body = try {
             fetchCatalog(url)
@@ -407,6 +424,7 @@ class StrideAppstoreService : Service() {
 
         private const val PREFS = "stride_appstore"
         private const val KEY_CATALOG_URL = "catalog_url"
+        private const val KEY_LAST_CHECK = "last_check_wall_ms"
         private const val CHANNEL_ID = "stride_spikes_appstore"
         private const val NOTIFICATION_ID = 4322
         private const val TAG = "StrideAppstore"
@@ -458,6 +476,29 @@ class StrideAppstoreService : Service() {
         // -------------------------------------------------------------- entry points
 
         fun check(context: Context) = start(context, ACTION_CHECK)
+
+        /**
+         * Check, but only if the last one is old enough. Called on every launcher start.
+         *
+         * The timestamp is persisted rather than kept in [AppstoreState], which lives only as long
+         * as the process: a launcher restart would otherwise always look like "never checked" and
+         * this would fetch the catalog every single time.
+         */
+        fun checkOnStart(context: Context) {
+            val prefs = context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+            val last = prefs.getLong(KEY_LAST_CHECK, 0L)
+            if (!UpdatePlan.shouldCheckOnStart(last, System.currentTimeMillis())) return
+            check(context)
+        }
+
+        /**
+         * Stamped when a check *begins*, not when it succeeds. A console with no network would
+         * otherwise retry on every launch, which is the same hammering the guard exists to prevent.
+         */
+        internal fun recordCheckStarted(context: Context) {
+            context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+                .edit { putLong(KEY_LAST_CHECK, System.currentTimeMillis()) }
+        }
 
         fun install(context: Context, packageName: String) =
             start(context, ACTION_INSTALL) { it.putExtra(EXTRA_PACKAGE, packageName) }

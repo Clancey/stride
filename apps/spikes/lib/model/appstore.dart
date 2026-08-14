@@ -384,12 +384,22 @@ class AppstoreStatus {
   final String? lastError;
   final String? catalogUrl;
 
-  /// What the launcher badges. Only genuine updates count — something merely
-  /// *offered* by the catalog and never installed is not a pending update and
-  /// must not nag like one.
+  /// Genuine updates to already-installed apps. Something merely *offered* by
+  /// the catalog and never installed is not a pending update and must not nag
+  /// like one.
   int get pendingCount => _standalone
       .where((item) => item.kind == AppstoreKind.update)
       .length;
+
+  /// What the launcher badges: everything the rider could act on right now.
+  ///
+  /// This is [pendingCount] *plus* offerable bundles, which is not a detail —
+  /// "Install Google Play" is the single most consequential thing the sheet can
+  /// offer, and counting only updates left it invisible behind an unlabelled
+  /// icon that gave no reason to tap it. A bundle mid-run still counts: an
+  /// install that needs a confirmation the rider has not given yet is exactly
+  /// when the header should be saying so.
+  int get actionableCount => pendingCount + offerableBundles.length;
 
   /// Rows a rider can act on individually. Bundle members are excluded: they are
   /// offered as their bundle, never one at a time.

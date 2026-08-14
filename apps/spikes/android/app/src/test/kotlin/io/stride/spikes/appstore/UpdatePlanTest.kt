@@ -261,4 +261,41 @@ class UpdatePlanTest {
         assertTrue(UpdatePlan.backgroundInstallable(plan).isEmpty())
         assertEquals(0, UpdatePlan.pendingCount(plan))
     }
+
+    // ------------------------------------------------------- startup check guard
+
+    @Test
+    fun `a console that has never checked checks on start`() {
+        assertTrue(UpdatePlan.shouldCheckOnStart(lastCheckWallMs = 0L, nowWallMs = 1_000_000L))
+    }
+
+    @Test
+    fun `a check just made is not repeated on the next launcher start`() {
+        // Coming back from Spotify restarts the launcher; that must not refetch the catalog.
+        assertFalse(
+            UpdatePlan.shouldCheckOnStart(
+                lastCheckWallMs = 1_000_000L,
+                nowWallMs = 1_000_000L + 60_000L,
+            )
+        )
+    }
+
+    @Test
+    fun `a stale check is repeated on start`() {
+        assertTrue(
+            UpdatePlan.shouldCheckOnStart(
+                lastCheckWallMs = 1_000_000L,
+                nowWallMs = 1_000_000L + UpdatePlan.STARTUP_CHECK_INTERVAL_MS,
+            )
+        )
+    }
+
+    @Test
+    fun `a backwards clock does not park the console in never-check-again`() {
+        // An NTP correction after boot can move wall time behind a stored stamp. Treating that as
+        // "checked recently" would suppress every future startup check until it drifted past again.
+        assertTrue(
+            UpdatePlan.shouldCheckOnStart(lastCheckWallMs = 9_000_000L, nowWallMs = 1_000L)
+        )
+    }
 }

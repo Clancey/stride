@@ -169,6 +169,31 @@ object UpdatePlan {
         plan.count { it is UpdateAvailable && it.packageName !in bundled }
 
     /**
+     * Whether a freshly started launcher should fetch the catalog straight away.
+     *
+     * The periodic worker guarantees liveness over days; this guarantees *freshness at the moment
+     * someone is looking*. Without it a console that was power-cycled reports "no catalog check has
+     * completed yet" until the first worker tick, up to six hours later.
+     *
+     * The guard is the whole point of modelling it: the launcher is restarted every time the rider
+     * comes back from Spotify, so an unconditional check would fetch the catalog dozens of times an
+     * hour. A backwards clock also counts as stale — an NTP correction should not be able to park a
+     * console in "never check again" until it drifts forward past the stored time.
+     */
+    fun shouldCheckOnStart(
+        lastCheckWallMs: Long,
+        nowWallMs: Long,
+        minIntervalMs: Long = STARTUP_CHECK_INTERVAL_MS,
+    ): Boolean {
+        if (lastCheckWallMs <= 0L) return true
+        if (nowWallMs < lastCheckWallMs) return true
+        return nowWallMs - lastCheckWallMs >= minIntervalMs
+    }
+
+    /** Long enough that returning from an app does not refetch; short enough to feel current. */
+    const val STARTUP_CHECK_INTERVAL_MS: Long = 30 * 60 * 1000L
+
+    /**
      * SAFETY GATE (`PLAN.md` section 5, and `docs/APPSTORE.md`).
      *
      * A `PackageInstaller` confirmation is a full-screen system activity. Raising one while the belt

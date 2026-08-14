@@ -239,7 +239,7 @@ class LauncherHomeState extends State<LauncherHome>
                       onSettings: _openSettings,
                       onGoal: _startWorkoutFlow,
                       goal: _goal,
-                      updateCount: _appstore.pendingCount,
+                      updateCount: _appstore.actionableCount,
                       onUpdates: _openUpdates,
                     ),
                     const SizedBox(height: StrideSpace.lg),

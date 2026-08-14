@@ -173,6 +173,18 @@ makes both call sites idempotent.
 `WorkManager` rather than `AlarmManager` because it is the only mechanism that survives Doze and
 app-standby on Android 8/9 without a battery-optimisation exemption we would rather not request.
 
+On top of that, `MainActivity` calls `StrideAppstoreService.checkOnStart()` every launch, gated by
+`UpdatePlan.shouldCheckOnStart` at 30 minutes. Otherwise a console that is only woken up to be used
+could go a long time between periodic runs and greet the rider with stale state. The timestamp lives
+in app-private prefs, not `AppstoreState`, because the in-process state always reads as "never
+checked" after a restart — which is exactly when this runs. It is stamped when a check *begins*, so
+a console with no network does not retry on every single launch.
+
+The header badge reads `AppstoreStatus.actionableCount` — pending updates *plus* offerable bundles —
+rather than `pendingCount`. `pendingCount` counts only updates to already-installed apps, so a
+console with Google Play still missing would show no badge at all while the one thing worth doing
+sat behind an unlabelled icon.
+
 ## 7. Permissions
 
 | Permission | Why | Grant |
@@ -185,6 +197,33 @@ Silent installation would need the app to be device owner or `/system`-privilege
 provisioned as neither, and getting there means a factory reset and a provisioning flow — so
 user-confirmed installs are the design, not a stepping stone. It is documented here rather than
 left as a flag someone might flip.
+
+### 7.1 The install prompt has to be delivered to a runtime receiver
+
+This firmware will not deliver `PackageInstaller`'s status broadcast to a **manifest-declared**
+receiver. On hardware, every install hung forever with no dialog, no error, and nothing in Stride's
+own logs; `logcat` was the only place the reason appeared:
+
+```
+I/ActivityManager: App 10139/io.stride.spikes targets O+, restricted
+D/BroadcastQueue: suppress to start process of staticReceiver for package:io.stride.spikes
+V/BroadcastQueue: Skipping delivery of ordered broadcast ... INSTALL_STATUS
+```
+
+It suppresses the delivery even though Stride is `TOP` with foreground services running, and even
+when the intent names the receiver as an explicit component. `STATUS_PENDING_USER_ACTION` therefore
+never arrived, and the confirmation activity was never started — a completely silent failure.
+
+Two things follow, and both are load-bearing:
+
+- `InstallResultReceiver` is registered **at runtime** by `StrideAppstoreService` (which is always
+  alive), not in the manifest. The manifest `<receiver>` is removed, and must stay removed: keeping
+  both would double-deliver on any device where the static path *does* work, raising two dialogs for
+  one install.
+- The status `PendingIntent` is addressed by **action + `setPackage`**, not by component. A
+  component-explicit broadcast does not match a runtime registration at all.
+
+If an install ever hangs with no prompt again, this is the first thing to check.
 
 ## 8. The setup checklist
 

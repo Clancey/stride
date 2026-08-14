@@ -161,16 +161,18 @@
             </intent-filter>
         </receiver>
 
-        <!-- App store: where PackageInstaller session results land, including the
-             STATUS_PENDING_USER_ACTION confirmation intent. Not exported - only the platform's own
-             PendingIntent targets it. -->
-        <receiver
-            android:name="io.stride.spikes.appstore.InstallResultReceiver"
-            android:exported="false">
-            <intent-filter>
-                <action android:name="io.stride.spikes.appstore.INSTALL_STATUS"/>
-            </intent-filter>
-        </receiver>
+        <!-- App store: PackageInstaller session results, including the STATUS_PENDING_USER_ACTION
+             confirmation intent, land at InstallResultReceiver - which is registered at RUNTIME by
+             StrideAppstoreService, deliberately not here.
+
+             This console's firmware drops background broadcasts to a manifest ("static") receiver
+             of an O+ app:
+               I/ActivityManager: App .../io.stride.spikes targets O+, restricted
+               D/BroadcastQueue: suppress to start process of staticReceiver for package:...
+               V/BroadcastQueue: Skipping delivery of ordered broadcast ...INSTALL_STATUS
+             With the receiver declared here, every install hung at "installing" with no dialog and
+             no error, because the status the installer sends back was never delivered. Declaring it
+             again would also double-deliver to the runtime registration and raise two dialogs. -->
 
         <!-- S10: Back / Recents. The ONLY mechanism available to a non-system app.
              Enable with:

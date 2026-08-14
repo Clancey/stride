@@ -9,6 +9,7 @@ import io.flutter.embedding.android.FlutterActivity
 import io.flutter.embedding.engine.FlutterEngine
 import io.flutter.plugin.common.MethodChannel
 import io.stride.spikes.appstore.AppstoreWorker
+import io.stride.spikes.appstore.StrideAppstoreService
 
 class MainActivity : FlutterActivity() {
     companion object {
@@ -75,6 +76,12 @@ class MainActivity : FlutterActivity() {
         // rebooted (the common case - it is plugged in) would otherwise only ever check once.
         // enqueueUniquePeriodicWork(KEEP) makes this idempotent.
         AppstoreWorker.ensureScheduled(applicationContext)
+        // ...and check right now, if the last check is old enough to be worth repeating. The
+        // periodic worker alone means a console that has just been power-cycled shows "No catalog
+        // check has completed yet" until its first ~6h tick, which is exactly when someone is most
+        // likely to be looking for an update. The staleness guard is what keeps this from becoming
+        // a catalog fetch on every glance at the launcher.
+        StrideAppstoreService.checkOnStart(applicationContext)
         channel = MethodChannel(flutterEngine.dartExecutor.binaryMessenger, SpikeBridge.CHANNEL).also {
             it.setMethodCallHandler(SpikeBridge(applicationContext))
             registerWorkoutStateListener(it)

@@ -340,5 +340,47 @@ void main() {
       expect(decoded.offerableBundles, hasLength(1));
       expect(decoded.offerableBundles.single.subtitle, contains('Restart'));
     });
+
+    test('an offerable bundle badges the header even with no updates', () {
+      // pendingCount deliberately counts only updates to installed apps, so on a
+      // console with nothing stale it is zero - and the header fell back to an
+      // unlabelled icon while "Install Google Play", the most consequential
+      // thing the sheet can offer, sat behind it giving no reason to tap.
+      final decoded = AppstoreStatus.fromMap(
+        statusWith(
+          items: <Map<String, dynamic>>[
+            item(package: 'com.android.vending', kind: 'notInstalled')
+              ..['bundleId'] = 'google-play',
+          ],
+          bundles: <Map<String, dynamic>>[bundle()],
+        ),
+      );
+      expect(decoded.pendingCount, 0);
+      expect(decoded.actionableCount, 1);
+    });
+
+    test('a finished bundle stops badging the header', () {
+      final decoded = AppstoreStatus.fromMap(
+        statusWith(
+          bundles: <Map<String, dynamic>>[
+            bundle(state: 'installed', installedCount: 4),
+          ],
+        ),
+      );
+      expect(decoded.actionableCount, 0);
+    });
+
+    test('the badge counts updates and bundles together', () {
+      final decoded = AppstoreStatus.fromMap(
+        statusWith(
+          items: <Map<String, dynamic>>[
+            item(package: 'com.example.one', kind: 'update'),
+            item(package: 'com.example.two', kind: 'update'),
+          ],
+          bundles: <Map<String, dynamic>>[bundle()],
+        ),
+      );
+      expect(decoded.actionableCount, 3);
+    });
   });
 }
