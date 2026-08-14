@@ -5,6 +5,38 @@ import 'package:flutter/material.dart';
 import '../theme/stride_tokens.dart';
 import 'app_models.dart';
 
+/// Metrics for one app in a launcher grid.
+///
+/// Tiles are a fixed size, always. A launcher whose icons grow because you only
+/// pinned two apps reads as a row of buttons rather than a set of apps, and the
+/// whole grid reshuffles under the rider's hand every time they pin one more.
+class AppTileMetrics {
+  const AppTileMetrics._({
+    required this.icon,
+    required this.width,
+    required this.labelLines,
+  });
+
+  /// The home grid. Larger, because this is what a rider reaches for mid-walk.
+  static const home = AppTileMetrics._(icon: 96, width: 168, labelLines: 2);
+
+  /// The browse sheet, used standing still, where seeing more at once wins.
+  static const browse = AppTileMetrics._(icon: 76, width: 148, labelLines: 2);
+
+  final double icon;
+  final double width;
+  final int labelLines;
+
+  static const double _labelSize = 16;
+  static const double _labelLeading = 1.25;
+  static const double gutter = StrideSpace.md;
+
+  double get labelHeight => _labelSize * _labelLeading * labelLines;
+
+  /// Icon, gap, and label — so a [Wrap] can reserve identical rows.
+  double get height => icon + StrideSpace.sm + labelHeight + StrideSpace.md * 2;
+}
+
 class AppTile extends StatelessWidget {
   const AppTile({
     super.key,
@@ -14,7 +46,7 @@ class AppTile extends StatelessWidget {
     required this.onLaunch,
     this.onPinToggle,
     this.onLongPress,
-    this.large = false,
+    this.metrics = AppTileMetrics.home,
   });
 
   final LaunchableApp app;
@@ -23,128 +55,113 @@ class AppTile extends StatelessWidget {
   final VoidCallback onLaunch;
   final VoidCallback? onPinToggle;
   final VoidCallback? onLongPress;
-  final bool large;
+  final AppTileMetrics metrics;
 
   @override
   Widget build(BuildContext context) {
-    final theme = Theme.of(context);
-    final iconSize = large ? 72.0 : 56.0;
-
-    return Material(
-      color: large ? StrideColors.panelRaised : StrideColors.panel,
-      borderRadius: BorderRadius.circular(StrideRadius.lg),
-      clipBehavior: Clip.antiAlias,
-      child: Container(
-        constraints: BoxConstraints(
-          minHeight: large ? 150 : 118,
-          minWidth: large ? 168 : 144,
-        ),
-        decoration: BoxDecoration(
+    return SizedBox(
+      width: metrics.width,
+      height: metrics.height,
+      child: Material(
+        color: Colors.transparent,
+        borderRadius: BorderRadius.circular(StrideRadius.lg),
+        child: InkWell(
           borderRadius: BorderRadius.circular(StrideRadius.lg),
-          border: Border.all(
-            color: pinned ? StrideColors.accent : StrideColors.line,
-            width: pinned ? 2 : 1,
-          ),
-        ),
-        child: onPinToggle == null
-            ? InkWell(
-                borderRadius: BorderRadius.circular(StrideRadius.lg),
-                onTap: onLaunch,
-                onLongPress: onLongPress,
-                child: _LaunchTileContent(
+          onTap: onLaunch,
+          onLongPress: onLongPress,
+          child: Padding(
+            padding: const EdgeInsets.symmetric(
+              vertical: StrideSpace.md,
+              horizontal: StrideSpace.xs,
+            ),
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                _Mark(
                   app: app,
                   iconCache: iconCache,
-                  iconSize: iconSize,
-                  large: large,
-                  textStyle: large
-                      ? theme.textTheme.titleLarge
-                      : theme.textTheme.titleMedium,
+                  size: metrics.icon,
+                  pinned: pinned,
+                  onPinToggle: onPinToggle,
                 ),
-              )
-            : Row(
-                crossAxisAlignment: CrossAxisAlignment.stretch,
-                children: [
-                  Expanded(
-                    child: InkWell(
-                      onTap: onLaunch,
-                      child: _LaunchTileContent(
-                        app: app,
-                        iconCache: iconCache,
-                        iconSize: iconSize,
-                        large: large,
-                        textStyle: theme.textTheme.titleMedium,
-                      ),
+                const SizedBox(height: StrideSpace.sm),
+                SizedBox(
+                  height: metrics.labelHeight,
+                  child: Text(
+                    app.label,
+                    maxLines: metrics.labelLines,
+                    textAlign: TextAlign.center,
+                    overflow: TextOverflow.ellipsis,
+                    style: const TextStyle(
+                      fontSize: AppTileMetrics._labelSize,
+                      height: AppTileMetrics._labelLeading,
+                      fontWeight: FontWeight.w600,
+                      color: StrideColors.text,
                     ),
                   ),
-                  DecoratedBox(
-                    decoration: const BoxDecoration(
-                      border: Border(
-                        left: BorderSide(color: StrideColors.line),
-                      ),
-                    ),
-                    child: SizedBox(
-                      width: StrideSpace.minTouch,
-                      child: InkWell(
-                        onTap: onPinToggle,
-                        child: Column(
-                          mainAxisAlignment: MainAxisAlignment.center,
-                          children: [
-                            Icon(
-                              pinned
-                                  ? Icons.remove_circle_outline
-                                  : Icons.push_pin_outlined,
-                              size: 28,
-                              color: pinned
-                                  ? StrideColors.accent
-                                  : StrideColors.text,
-                            ),
-                            const SizedBox(height: StrideSpace.xs),
-                            Text(
-                              pinned ? 'Pinned' : 'Pin',
-                              style: Theme.of(context).textTheme.bodySmall,
-                            ),
-                          ],
-                        ),
-                      ),
-                    ),
-                  ),
-                ],
-              ),
+                ),
+              ],
+            ),
+          ),
+        ),
       ),
     );
   }
 }
 
-class _LaunchTileContent extends StatelessWidget {
-  const _LaunchTileContent({
+class _Mark extends StatelessWidget {
+  const _Mark({
     required this.app,
     required this.iconCache,
-    required this.iconSize,
-    required this.large,
-    required this.textStyle,
+    required this.size,
+    required this.pinned,
+    required this.onPinToggle,
   });
 
   final LaunchableApp app;
   final AppIconCache iconCache;
-  final double iconSize;
-  final bool large;
-  final TextStyle? textStyle;
+  final double size;
+  final bool pinned;
+  final VoidCallback? onPinToggle;
 
   @override
   Widget build(BuildContext context) {
-    return Padding(
-      padding: EdgeInsets.all(large ? StrideSpace.lg : StrideSpace.md),
-      child: Column(
-        crossAxisAlignment: CrossAxisAlignment.start,
-        mainAxisAlignment: MainAxisAlignment.spaceBetween,
+    final icon = AppIconMark(app: app, iconCache: iconCache, size: size);
+    if (onPinToggle == null) {
+      return icon;
+    }
+    // The pin rides on the icon's corner rather than splitting the tile in two.
+    // Launching is the common act; pinning is the occasional one, and it should
+    // not cost half the tile.
+    return SizedBox(
+      width: size + StrideSpace.md,
+      height: size + StrideSpace.xs,
+      child: Stack(
+        clipBehavior: Clip.none,
         children: [
-          AppIconMark(app: app, iconCache: iconCache, size: iconSize),
-          const SizedBox(height: StrideSpace.md),
-          Text(
-            app.label,
-            maxLines: large ? 2 : 1,
-            overflow: TextOverflow.ellipsis,
-            style: textStyle,
+          Positioned(left: 0, top: StrideSpace.xs, child: icon),
+          Positioned(
+            right: 0,
+            top: 0,
+            child: Material(
+              color: pinned ? StrideColors.accent : StrideColors.panelHigh,
+              shape: const CircleBorder(
+                side: BorderSide(color: StrideColors.ink, width: 2),
+              ),
+              clipBehavior: Clip.antiAlias,
+              child: InkWell(
+                onTap: onPinToggle,
+                child: SizedBox(
+                  width: 38,
+                  height: 38,
+                  child: Icon(
+                    pinned ? Icons.push_pin : Icons.push_pin_outlined,
+                    size: 20,
+                    color: pinned ? StrideColors.ink : StrideColors.text,
+                  ),
+                ),
+              ),
+            ),
           ),
         ],
       ),
@@ -212,6 +229,74 @@ class _FallbackIcon extends StatelessWidget {
           color: StrideColors.ink,
           fontSize: size * 0.42,
           fontWeight: FontWeight.w900,
+        ),
+      ),
+    );
+  }
+}
+
+/// The trailing cell of the home grid. Same footprint as an app, so the row
+/// reads as one continuous set rather than a grid plus a button.
+class AddAppTile extends StatelessWidget {
+  const AddAppTile({
+    super.key,
+    required this.onPressed,
+    this.metrics = AppTileMetrics.home,
+  });
+
+  final VoidCallback onPressed;
+  final AppTileMetrics metrics;
+
+  @override
+  Widget build(BuildContext context) {
+    return SizedBox(
+      width: metrics.width,
+      height: metrics.height,
+      child: Material(
+        color: Colors.transparent,
+        borderRadius: BorderRadius.circular(StrideRadius.lg),
+        child: InkWell(
+          borderRadius: BorderRadius.circular(StrideRadius.lg),
+          onTap: onPressed,
+          child: Padding(
+            padding: const EdgeInsets.symmetric(
+              vertical: StrideSpace.md,
+              horizontal: StrideSpace.xs,
+            ),
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                Container(
+                  width: metrics.icon,
+                  height: metrics.icon,
+                  decoration: BoxDecoration(
+                    color: StrideColors.panel,
+                    borderRadius: BorderRadius.circular(metrics.icon * 0.24),
+                    border: Border.all(color: StrideColors.line),
+                  ),
+                  child: Icon(
+                    Icons.add,
+                    size: metrics.icon * 0.38,
+                    color: StrideColors.accent,
+                  ),
+                ),
+                const SizedBox(height: StrideSpace.sm),
+                SizedBox(
+                  height: metrics.labelHeight,
+                  child: const Text(
+                    'Add app',
+                    textAlign: TextAlign.center,
+                    style: TextStyle(
+                      fontSize: AppTileMetrics._labelSize,
+                      height: AppTileMetrics._labelLeading,
+                      fontWeight: FontWeight.w600,
+                      color: StrideColors.textMuted,
+                    ),
+                  ),
+                ),
+              ],
+            ),
+          ),
         ),
       ),
     );

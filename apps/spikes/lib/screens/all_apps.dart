@@ -37,76 +37,78 @@ class _AllAppsScreenState extends State<AllAppsScreen> {
   Widget build(BuildContext context) {
     return Scaffold(
       appBar: AppBar(title: const Text('All apps')),
-      body: Padding(
-        padding: const EdgeInsets.fromLTRB(
-          StrideSpace.xl,
-          StrideSpace.md,
-          StrideSpace.xl,
-          StrideSpace.xl,
-        ),
-        child: Column(
-          crossAxisAlignment: CrossAxisAlignment.start,
-          children: [
-            SizedBox(
-              height: StrideSpace.minTouch,
-              child: TextField(
-                controller: _search,
-                autofocus: false,
-                style: Theme.of(context).textTheme.bodyLarge,
-                decoration: const InputDecoration(
-                  hintText: 'Search installed apps',
-                  prefixIcon: Icon(Icons.search),
+      // The overlay's rails sit on top of this screen, so the drawer has to keep
+      // out of their way or the first and last column of apps end up underneath
+      // the speed and incline columns.
+      body: SafeArea(
+        child: Padding(
+          padding: const EdgeInsets.fromLTRB(
+            StrideSpace.xl,
+            StrideSpace.md,
+            StrideSpace.xl,
+            StrideSpace.xl,
+          ),
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              SizedBox(
+                height: StrideSpace.minTouch,
+                child: TextField(
+                  controller: _search,
+                  autofocus: false,
+                  style: Theme.of(context).textTheme.bodyLarge,
+                  decoration: const InputDecoration(
+                    hintText: 'Search installed apps',
+                    prefixIcon: Icon(Icons.search),
+                  ),
+                  onChanged: (_) => setState(() {}),
                 ),
-                onChanged: (_) => setState(() {}),
               ),
-            ),
-            const SizedBox(height: StrideSpace.lg),
-            Expanded(
-              child: AnimatedBuilder(
-                animation: widget.profiles,
-                builder: (context, _) {
-                  final query = _search.text.trim().toLowerCase();
-                  final apps = widget.apps.where((app) {
-                    if (query.isEmpty) return true;
-                    return app.label.toLowerCase().contains(query) ||
-                        app.package.toLowerCase().contains(query);
-                  }).toList();
+              const SizedBox(height: StrideSpace.lg),
+              Expanded(
+                child: AnimatedBuilder(
+                  animation: widget.profiles,
+                  builder: (context, _) {
+                    final query = _search.text.trim().toLowerCase();
+                    final apps = widget.apps.where((app) {
+                      if (query.isEmpty) return true;
+                      return app.label.toLowerCase().contains(query) ||
+                          app.package.toLowerCase().contains(query);
+                    }).toList();
 
-                  if (apps.isEmpty) {
-                    return const _NoSearchResults();
-                  }
+                    if (apps.isEmpty) {
+                      return const _NoSearchResults();
+                    }
 
-                  return LayoutBuilder(
-                    builder: (context, constraints) {
-                      final columns = (constraints.maxWidth / 210)
-                          .floor()
-                          .clamp(3, 6);
-                      return GridView.builder(
-                        itemCount: apps.length,
-                        gridDelegate: SliverGridDelegateWithFixedCrossAxisCount(
-                          crossAxisCount: columns,
-                          mainAxisSpacing: StrideSpace.md,
-                          crossAxisSpacing: StrideSpace.md,
-                          childAspectRatio: 1.45,
-                        ),
-                        itemBuilder: (context, index) {
-                          final app = apps[index];
-                          final pinned = widget.profiles.isPinned(app.package);
-                          return AppTile(
-                            app: app,
-                            iconCache: widget.iconCache,
-                            pinned: pinned,
-                            onLaunch: () => widget.onLaunch(app),
-                            onPinToggle: () => _togglePin(app, pinned),
-                          );
-                        },
-                      );
-                    },
-                  );
-                },
+                    return LayoutBuilder(
+                      builder: (context, constraints) {
+                        return SingleChildScrollView(
+                          child: Wrap(
+                            spacing: AppTileMetrics.gutter,
+                            runSpacing: AppTileMetrics.gutter,
+                            children: [
+                              for (final app in apps)
+                                AppTile(
+                                  app: app,
+                                  iconCache: widget.iconCache,
+                                  metrics: AppTileMetrics.browse,
+                                  pinned: widget.profiles.isPinned(app.package),
+                                  onLaunch: () => widget.onLaunch(app),
+                                  onPinToggle: () => _togglePin(
+                                    app,
+                                    widget.profiles.isPinned(app.package),
+                                  ),
+                                ),
+                            ],
+                          ),
+                        );
+                      },
+                    );
+                  },
+                ),
               ),
-            ),
-          ],
+            ],
+          ),
         ),
       ),
     );

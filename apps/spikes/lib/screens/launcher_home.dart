@@ -703,89 +703,28 @@ class _LauncherPanel extends StatelessWidget {
     }
     return LayoutBuilder(
       builder: (context, constraints) {
-        final includeAddTile = pinned.length < 4;
-        final itemCount = pinned.length + (includeAddTile ? 1 : 0);
-        final lowCount = itemCount <= 4;
-        final columns = lowCount
-            ? itemCount.clamp(2, 4).toInt()
-            : (constraints.maxWidth / 210).floor().clamp(2, 4).toInt();
-        final cellWidth =
-            (constraints.maxWidth - (columns - 1) * StrideSpace.md) / columns;
-        final aspectRatio = lowCount && constraints.maxHeight.isFinite
-            ? cellWidth / constraints.maxHeight
-            : 1.28;
-        return GridView.builder(
+        // A launcher page: fixed tiles flowing from the top left, with the add
+        // cell trailing the set. Nothing stretches to fill, so pinning a fourth
+        // app doesn't resize the first three.
+        return SingleChildScrollView(
           controller: scrollController,
-          physics: lowCount ? const NeverScrollableScrollPhysics() : null,
-          itemCount: itemCount,
-          gridDelegate: SliverGridDelegateWithFixedCrossAxisCount(
-            crossAxisCount: columns,
-            mainAxisSpacing: StrideSpace.md,
-            crossAxisSpacing: StrideSpace.md,
-            childAspectRatio: aspectRatio,
-          ),
-          itemBuilder: (context, index) {
-            if (includeAddTile && index == itemCount - 1) {
-              return _AddPinnedAppTile(onPressed: onAllApps);
-            }
-            final app = pinned[index];
-            return AppTile(
-              app: app,
-              iconCache: iconCache,
-              pinned: true,
-              large: true,
-              onLaunch: () => onLaunch(app),
-              onLongPress: () => onUnpin(app),
-            );
-          },
-        );
-      },
-    );
-  }
-}
-
-class _AddPinnedAppTile extends StatelessWidget {
-  const _AddPinnedAppTile({required this.onPressed});
-
-  final VoidCallback onPressed;
-
-  @override
-  Widget build(BuildContext context) {
-    return Material(
-      color: StrideColors.panel,
-      borderRadius: BorderRadius.circular(StrideRadius.lg),
-      clipBehavior: Clip.antiAlias,
-      child: InkWell(
-        onTap: onPressed,
-        child: Container(
-          padding: const EdgeInsets.all(StrideSpace.lg),
-          decoration: BoxDecoration(
-            borderRadius: BorderRadius.circular(StrideRadius.lg),
-            border: Border.all(color: StrideColors.line),
-          ),
-          child: Column(
-            crossAxisAlignment: CrossAxisAlignment.start,
-            mainAxisAlignment: MainAxisAlignment.spaceBetween,
+          child: Wrap(
+            spacing: AppTileMetrics.gutter,
+            runSpacing: AppTileMetrics.gutter,
             children: [
-              Container(
-                width: 72,
-                height: 72,
-                decoration: BoxDecoration(
-                  color: StrideColors.panelHigh,
-                  borderRadius: BorderRadius.circular(StrideRadius.md),
+              for (final app in pinned)
+                AppTile(
+                  app: app,
+                  iconCache: iconCache,
+                  pinned: true,
+                  onLaunch: () => onLaunch(app),
+                  onLongPress: () => onUnpin(app),
                 ),
-                child: const Icon(
-                  Icons.add,
-                  size: 34,
-                  color: StrideColors.accent,
-                ),
-              ),
-              const SizedBox(height: StrideSpace.md),
-              Text('Add app', style: Theme.of(context).textTheme.titleLarge),
+              AddAppTile(onPressed: onAllApps),
             ],
           ),
-        ),
-      ),
+        );
+      },
     );
   }
 }
