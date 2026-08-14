@@ -81,6 +81,21 @@ kotlin {
     }
 }
 
+dependencies {
+    // OkHttp gives us HTTP/2 with ALPN and a pluggable SSLSocketFactory, which is all gRPC actually
+    // needs on the wire. We deliberately do NOT pull in grpc-java + the protobuf codegen plugin:
+    // that would mean running protoc over 184 interdependent .proto files through a Gradle plugin
+    // whose support for AGP 9 is unproven, to generate stubs for the six calls we make. The framing
+    // is a 5-byte prefix and the messages we read have four fields each, so GlassOsWire encodes and
+    // decodes them directly. See protocol/glassos/README.md.
+    implementation("com.squareup.okhttp3:okhttp:4.12.0")
+
+    // The wire decoder is the one place where a silent, single-digit mistake turns into a wrong
+    // number on a screen someone is running in front of. It is pure logic with no Android
+    // dependency, so it is testable on the JVM against messages actually captured from the machine.
+    testImplementation("junit:junit:4.13.2")
+}
+
 flutter {
     source = "../.."
 }
