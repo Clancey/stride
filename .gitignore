@@ -1,0 +1,50 @@
+# Dart / Flutter
+.dart_tool/
+.packages
+build/
+.flutter-plugins
+.flutter-plugins-dependencies
+
+# Android
+*.iml
+.gradle/
+local.properties
+key.properties
+*.jks
+*.keystore
+captures/
+.cxx/
+
+# iOS / macOS
+**/ios/Flutter/Generated.xcconfig
+**/ios/Flutter/flutter_export_environment.sh
+**/ios/Pods/
+**/ios/.symlinks/
+**/macos/Pods/
+.symlinks/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+
+# OS
+.DS_Store
+Thumbs.db
+
+# --- Credentials -------------------------------------------------------------
+# GlassOS client credentials are extracted on-device into app-private storage and must never be
+# committed or bundled into a build (see docs/PLAN.md section 2.2). These patterns are a backstop,
+# not the mechanism.
+*.pem
+*.key
+*.p12
+*.pfx
+certs/
+glassos/
+
+# Captured protocol traces may contain serial numbers and account identifiers. Scrub before
+# committing anything under tools/ (docs/PLAN.md section 7).
+*.trace
+*.pcap
+incident-*.log

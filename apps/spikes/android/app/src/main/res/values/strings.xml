@@ -1,0 +1,4 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="accessibility_service_description">Provides Back and Recents navigation for consoles with no physical buttons, and reports the foreground app so workout media controls know what is playing.</string>
+</resources>
