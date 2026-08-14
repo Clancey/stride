@@ -19,14 +19,19 @@ import 'start_workout.dart';
 import 'updates_sheet.dart';
 
 class LauncherHome extends StatefulWidget {
-  const LauncherHome({super.key});
+  const LauncherHome({super.key, this.profiles});
+
+  /// Pin storage to use instead of the on-disk one. Only tests pass this: the
+  /// real store writes through path_provider, which a widget test cannot drive.
+  final ProfileStore? profiles;
 
   @override
   State<LauncherHome> createState() => LauncherHomeState();
 }
 
-class LauncherHomeState extends State<LauncherHome> {
-  final ProfileStore _profiles = ProfileStore();
+class LauncherHomeState extends State<LauncherHome>
+    with WidgetsBindingObserver {
+  late final ProfileStore _profiles = widget.profiles ?? ProfileStore();
   final WorkoutController _workout = WorkoutController();
   final AppIconCache _iconCache = AppIconCache();
   final ScrollController _pinnedScroll = ScrollController();
@@ -44,6 +49,7 @@ class LauncherHomeState extends State<LauncherHome> {
   @override
   void initState() {
     super.initState();
+    WidgetsBinding.instance.addObserver(this);
     _loadApps();
     _workout.load();
     _loadGoal();
@@ -68,6 +74,7 @@ class LauncherHomeState extends State<LauncherHome> {
 
   @override
   void dispose() {
+    WidgetsBinding.instance.removeObserver(this);
     _appstorePoll?.cancel();
     _workout.removeListener(_syncGoalWithSession);
     _profiles.dispose();
@@ -75,6 +82,16 @@ class LauncherHomeState extends State<LauncherHome> {
     _pinnedScroll.dispose();
     _setup.dispose();
     super.dispose();
+  }
+
+  /// Re-read the inventory whenever the launcher comes back to the front.
+  ///
+  /// Uninstalling leaves through a system dialog, so the only honest moment to
+  /// learn whether the rider went through with it is when we get the screen
+  /// back. Installs and removals made outside Stride land here too.
+  @override
+  void didChangeAppLifecycleState(AppLifecycleState state) {
+    if (state == AppLifecycleState.resumed) _loadApps();
   }
 
   void resetToLauncherRoot() {
@@ -385,7 +402,15 @@ class LauncherHomeState extends State<LauncherHome> {
     });
   }
 
-  void _confirmUnpin(LaunchableApp app) {    showStrideSheet<void>(
+  /// The ✕ on a pinned tile offers both ways of getting rid of an app.
+  ///
+  /// Unpinning and uninstalling look identical from the grid — the tile goes
+  /// away either way — so they are presented together, with the destructive one
+  /// clearly the second choice and behind its own confirmation. Uninstall is
+  /// hidden entirely for apps the console will not let go of, rather than shown
+  /// and then failing at the system dialog.
+  void _confirmUnpin(LaunchableApp app) {
+    showStrideSheet<void>(
       context: context,
       builder: (context) {
         return Padding(
@@ -407,6 +432,17 @@ class LauncherHomeState extends State<LauncherHome> {
                 icon: const Icon(Icons.remove_circle_outline),
                 label: const Text('Unpin app'),
               ),
+              if (app.removable) ...[
+                const SizedBox(height: StrideSpace.sm),
+                OutlinedButton.icon(
+                  onPressed: () {
+                    Navigator.of(context).pop();
+                    _confirmUninstall(app);
+                  },
+                  icon: const Icon(Icons.delete_outline),
+                  label: const Text('Delete from console'),
+                ),
+              ],
               const SizedBox(height: StrideSpace.sm),
               OutlinedButton(
                 onPressed: () => Navigator.of(context).pop(),
@@ -417,6 +453,76 @@ class LauncherHomeState extends State<LauncherHome> {
         );
       },
     );
+  }
+
+  /// Second gate before an uninstall.
+  ///
+  /// Android raises its own confirmation too, but that one arrives as a
+  /// full-screen system activity over a console with no hardware buttons. Asking
+  /// here first means the rider chooses to leave Stride, instead of being taken
+  /// out of it by a mis-tap on a tile they only meant to unpin.
+  void _confirmUninstall(LaunchableApp app) {
+    showStrideSheet<void>(
+      context: context,
+      builder: (context) {
+        return Padding(
+          padding: const EdgeInsets.all(StrideSpace.lg),
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            crossAxisAlignment: CrossAxisAlignment.stretch,
+            children: [
+              Text(
+                'Delete ${app.label} from this console?',
+                style: Theme.of(context).textTheme.titleLarge,
+              ),
+              const SizedBox(height: StrideSpace.sm),
+              const Text(
+                'The app and its data are removed. Android will ask you to '
+                'confirm once more.',
+                style: TextStyle(color: StrideColors.textMuted),
+              ),
+              const SizedBox(height: StrideSpace.lg),
+              FilledButton.icon(
+                style: FilledButton.styleFrom(
+                  backgroundColor: StrideColors.danger,
+                  foregroundColor: StrideColors.ink,
+                ),
+                onPressed: () {
+                  Navigator.of(context).pop();
+                  _uninstall(app);
+                },
+                icon: const Icon(Icons.delete_outline),
+                label: Text('Delete ${app.label}'),
+              ),
+              const SizedBox(height: StrideSpace.sm),
+              OutlinedButton(
+                onPressed: () => Navigator.of(context).pop(),
+                child: const Text('Cancel'),
+              ),
+            ],
+          ),
+        );
+      },
+    );
+  }
+
+  /// Sends the app to the system uninstaller and reconciles once we are back.
+  ///
+  /// The pin is left alone here on purpose: the rider may cancel at the system
+  /// dialog, and dropping the pin first would silently rearrange the grid for a
+  /// delete that never happened. [_loadApps] on resume is what settles it — a
+  /// pin whose package is gone already stops rendering.
+  Future<void> _uninstall(LaunchableApp app) async {
+    bool started;
+    try {
+      started = await SpikeBridge.uninstallApp(app.package);
+    } catch (_) {
+      started = false;
+    }
+    if (!mounted) return;
+    if (!started) {
+      _showMessage('${app.label} cannot be deleted on this console');
+    }
   }
 
   /// Unpinning the last app leaves nothing to arrange, so edit mode ends with
@@ -589,7 +695,7 @@ class _LauncherPanel extends StatelessWidget {
           if (editing) ...[
             const SizedBox(height: StrideSpace.xs),
             const Text(
-              'Hold an app to move it. Tap ✕ to unpin.',
+              'Hold an app to move it. Tap ✕ to unpin or delete it.',
               style: TextStyle(color: StrideColors.textMuted),
             ),
           ],

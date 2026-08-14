@@ -107,6 +107,15 @@ class SpikeBridge {
   static Future<bool> launchApp(String package) =>
       _bool('launchApp', {'package': package});
 
+  /// Hands [package] to the system uninstaller.
+  ///
+  /// Returns false when the platform refuses outright — a system-image app, or a console with no
+  /// uninstaller activity — so the caller can say so instead of leaving the rider waiting for a
+  /// dialog that will never appear. True only means the system dialog was raised: the rider still
+  /// confirms there, and the app list has to be re-read to learn what actually happened.
+  static Future<bool> uninstallApp(String package) =>
+      _bool('uninstallApp', {'package': package});
+
   /// PNG bytes for an app's launcher icon, or null if it cannot be rendered.
   ///
   /// Kept out of [listApps] deliberately: icons are large, and inlining ~40 of them turns a cheap
