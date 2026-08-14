@@ -77,6 +77,41 @@ appends to it rather than overwriting it, but if something does overwrite it, th
 only way back. A value of `null` means the setting is unset, which is different from an empty
 string — restore it with `settings delete secure <key>`, not by writing `"null"`.
 
+### First session on the real console — do these in order
+
+The temptation on day one is to install Stride and set it as HOME, because that is the interesting
+part. Do not. Setting HOME is the only step in this repository that can leave the console unusable,
+and it is also the step that gains the least: almost every open hardware question can be answered
+without it.
+
+Sort the spikes by what they can cost you:
+
+| Order | Spikes | Risk | Why it is safe |
+|---|---|---|---|
+| 1 | **ENV**, **S4** (app inventory), **S5** (MediaSession) | None | Read-only. They enumerate and observe. Nothing is set, nothing is replaced. |
+| 2 | **S2-A** (credential extraction) | None to the console | Reads files and talks to a mock. It does not command the machine. |
+| 3 | **S3** (overlay + edge gestures) | Recoverable | Adds a window over the running console UI. The worst case is stolen touches, and stopping the service removes it. iFit is still HOME throughout. |
+| 4 | **S10** (Back / Home / Recents) | Recoverable | Enabling the accessibility service is a settings change with a documented restore (§3). |
+| 5 | **S1** (become HOME) | **Can lock you out** | Only after §0's persistence gate has passed *and* the revert command has been run successfully against the current iFit HOME. |
+| 6 | **S2-B** (real motor control) | **Can move the belt** | Not a UI task. Requires the Coordinator, clamps, watchdog and stop-preemption to exist first (plan §3.1). Nobody on the belt. Safety key within reach. |
+
+Stages 1-4 answer most of §6's questions and none of them can strand you. Get all of them recorded
+before you consider stage 5.
+
+Two practical notes for a Wi-Fi ADB session:
+
+- **`adb tcpip 5555` does not survive a reboot.** Wireless debugging typically reverts to USB mode on
+  restart, so the first reboot after you set HOME is exactly when you are most likely to lose the
+  connection *and* most likely to need it. That combination is the lockout. Prove the cold-boot path
+  in §0, or keep USB available, before stage 5.
+- **Pin the console's IP.** A DHCP lease change silently loses you the device. Set a static lease on
+  the router first; rediscovering the console by scanning while it sits on a broken launcher is not
+  a position you want to be in.
+
+Nothing about stages 1-4 requires the belt to move, and nothing in this build can move it. Do the
+hardware work with the machine powered but idle, and keep the safety key out of the magnet until
+there is a reason for it to be in.
+
 ---
 
 ## 1. Revert the default launcher
