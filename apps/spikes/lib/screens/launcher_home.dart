@@ -547,19 +547,11 @@ class _LauncherPanel extends StatelessWidget {
             onRenameProfile: onRenameProfile,
           ),
           const SizedBox(height: StrideSpace.lg),
-          Row(
-            children: [
-              Text(
-                'Pinned apps',
-                style: Theme.of(context).textTheme.headlineMedium,
-              ),
-              const Spacer(),
-              TextButton.icon(
-                onPressed: onAllApps,
-                icon: const Icon(Icons.add_circle_outline),
-                label: const Text('Pin more'),
-              ),
-            ],
+          // No "Pin more" button here: the Add app tile in the grid does the same job at the point
+          // the rider is already looking, and the header still has All apps.
+          Text(
+            'Pinned apps',
+            style: Theme.of(context).textTheme.headlineMedium,
           ),
           const SizedBox(height: StrideSpace.md),
           Expanded(child: _pinnedBody()),

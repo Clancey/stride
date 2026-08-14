@@ -168,8 +168,22 @@ class OverlayService : Service() {
         private const val LAP_MILES = 0.25
         private const val LAP_TITLE = "\u00BC mile"
 
-        private const val HANDLE_WIDTH_DP = 48f
-        private const val HANDLE_HEIGHT_DP = 88f
+        private const val HANDLE_HEIGHT_DP = 80f
+
+        /**
+         * Shared so the "Show" handle lands exactly where "Hide overlay" was.
+         *
+         * The two are one control in the rider's head — the same switch in its two positions — so
+         * having Hide sit bottom-right and Show reappear bottom-centre made it read as a different
+         * button and cost a hunt every time.
+         *
+         * The inset is measured, not derived: the bar's own bottom padding also carries the safety
+         * notice, so matching the padding alone left the handle sitting 25 px low.
+         */
+        private const val HIDE_BUTTON_WIDTH_DP = 150f
+        private const val BAR_SIDE_PADDING_DP = 22f
+        private const val BAR_BOTTOM_PADDING_DP = 10f
+        private const val HANDLE_BOTTOM_INSET_DP = 39f
 
         /** Fraction of the screen height the edge strips span, centred vertically. */
         private const val EDGE_STRIP_SPAN = 0.5f
@@ -1984,7 +1998,12 @@ class OverlayService : Service() {
         val root = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
             background = roundedRect(Color.argb(238, 4, 9, 18), 0f, Color.argb(110, 90, 112, 142))
-            setPadding(dp(22f), dp(10f), dp(22f), dp(10f))
+            setPadding(
+                dp(BAR_SIDE_PADDING_DP),
+                dp(BAR_BOTTOM_PADDING_DP),
+                dp(BAR_SIDE_PADDING_DP),
+                dp(BAR_BOTTOM_PADDING_DP),
+            )
             minimumHeight = dp(HUD_BOTTOM_ESTIMATE_DP)
             addOnLayoutChangeListener { view, _, top, _, bottom, _, _, _, _ ->
                 val laidOutHeight = bottom - top
@@ -2041,7 +2060,7 @@ class OverlayService : Service() {
             gravity = Gravity.CENTER_VERTICAL
         }
         edgeCluster.addView(bottomNavButton("Menu", "⋯", width = dp(104f)) { showMoreMenu() })
-        edgeCluster.addView(bottomNavButton("Hide overlay", "⌄", width = dp(150f)) { hideChrome() }.apply {
+        edgeCluster.addView(bottomNavButton("Hide overlay", "⌄", width = dp(HIDE_BUTTON_WIDTH_DP)) { hideChrome() }.apply {
             (layoutParams as LinearLayout.LayoutParams).marginEnd = 0
         })
         row.addView(
@@ -2268,8 +2287,13 @@ class OverlayService : Service() {
             setOnClickListener { showChrome() }
             elevation = dp(16f).toFloat()
         }
-        val params = baseParams(dp(HANDLE_WIDTH_DP), dp(HANDLE_HEIGHT_DP), Gravity.BOTTOM or Gravity.CENTER_HORIZONTAL)
-        params.y = dp(0f)
+        val params = baseParams(
+            dp(HIDE_BUTTON_WIDTH_DP),
+            dp(HANDLE_HEIGHT_DP),
+            Gravity.BOTTOM or Gravity.END,
+        )
+        params.x = dp(BAR_SIDE_PADDING_DP)
+        params.y = dp(HANDLE_BOTTOM_INSET_DP)
         try {
             windowManager.addView(handle, params)
             handleView = handle
@@ -2295,7 +2319,7 @@ class OverlayService : Service() {
         handle.text = "⌃"
         handle.contentDescription = "Show Stride overlay"
         val lp = handle.layoutParams as? WindowManager.LayoutParams ?: return
-        lp.y = dp(0f)
+        lp.y = dp(HANDLE_BOTTOM_INSET_DP)
         try {
             windowManager.updateViewLayout(handle, lp)
         } catch (_: Exception) {

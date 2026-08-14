@@ -55,6 +55,48 @@ class SpikeBridge(private val context: Context) : MethodChannel.MethodCallHandle
         const val IFIT_CONSOLE_PACKAGE = "com.ifit.rivendell"
 
         private const val DEFAULT_ICON_SIZE_PX = 192
+
+        /**
+         * Launcher entries that exist on this console but are not apps a rider would ever want.
+         *
+         * Deliberately an explicit list rather than a "hide system apps" rule: most of what a
+         * rider *does* want here is system-signed too, so a blanket rule would empty the grid.
+         * This is a fixed appliance with a known image, so naming them is honest and reviewable.
+         */
+        internal val HIDDEN_PACKAGES = setOf(
+            // Vendor and factory test tools shipped on the MediaTek board.
+            "com.cvte.mt8390.simpletest",
+            "com.mediatek.bluetooth",
+            "com.mediatek.gnss.nonframeworklbs",
+            "com.mesh.test.provisioner",
+            // A background service with a launcher entry it should not have. Tapping it does
+            // nothing useful, and it is what actually drives the treadmill.
+            "com.ifit.glassos_service",
+            // Developer harnesses: a WebView test shell and the systrace capture tool.
+            "org.chromium.webview_shell",
+            "com.android.traceur",
+            // iFit. Its only CATEGORY_LAUNCHER entry is
+            // com.ifit.val_workout_acceptance.view.WorkoutAcceptanceActivity — a factory
+            // acceptance-test harness labelled "Workout Player", not the console experience — so
+            // this tile never was the escape hatch it was once planned to be. Stride drives the
+            // treadmill itself now, so the tile is gone. IFIT_CONSOLE_PACKAGE is unaffected: cert
+            // extraction reads the APK through getApplicationInfo, not through this list.
+            IFIT_CONSOLE_PACKAGE,
+            // Android settings is reachable from Stride's own settings screen, which warns first
+            // that our overlay is blanked in there. A pinned tile would skip that warning and drop
+            // a rider into a screen with no Back or Home on a console with no physical buttons.
+            "com.android.settings",
+        )
+
+        /**
+         * Whether a launchable package should be kept out of the app grid and the pin picker.
+         *
+         * Pure so it can be tested without a PackageManager. [selfPackage] is passed rather than
+         * hard-coded: Stride is the launcher, so offering to pin or launch ourselves is a no-op
+         * tile that costs a rider a tap to discover it does nothing.
+         */
+        internal fun isHiddenFromLauncher(pkg: String, selfPackage: String): Boolean =
+            pkg == selfPackage || pkg in HIDDEN_PACKAGES
     }
 
     override fun onMethodCall(call: MethodCall, result: MethodChannel.Result) {
@@ -300,6 +342,7 @@ class SpikeBridge(private val context: Context) : MethodChannel.MethodCallHandle
             val intent = Intent(Intent.ACTION_MAIN).addCategory(category)
             pm.queryIntentActivities(intent, 0).forEach { ri ->
                 val pkg = ri.activityInfo.packageName
+                if (isHiddenFromLauncher(pkg, context.packageName)) return@forEach
                 val entry = out.getOrPut(pkg) {
                     mutableMapOf(
                         "package" to pkg,
