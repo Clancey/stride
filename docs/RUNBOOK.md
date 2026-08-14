@@ -327,6 +327,17 @@ tools/deploy.sh              # defaults to 192.168.10.51:45557
 tools/deploy.sh <ip>:<port>  # the wireless-debugging port changes on reboot
 ```
 
+**Before you deploy to anyone but yourself, unlock the release key.** Without
+`tools/keystore.sh unlock`, `deploy.sh` builds with the *debug* key. That APK installs and runs
+normally, so nothing looks wrong — but Android refuses an update signed by a different key, so
+Stride can never update itself on that console. The tester has to uninstall, which takes their
+profiles, pins, and goal history with it, and you find out on the day you ship a fix.
+
+So: builds that leave your machine come from the release workflow (which asserts the signer
+fingerprint and fails the run on a mismatch), or from a local build after `unlock`. Debug-signed is
+fine for your own console as long as you accept the same uninstall when you switch it back. Check
+what you actually built with `apksigner verify --print-certs`; see [SIGNING.md](SIGNING.md).
+
 ### A trap: your overlay is hidden over Settings
 
 Android hides non-system overlay windows over the Settings app's permission pages, on purpose —
