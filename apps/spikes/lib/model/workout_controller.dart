@@ -68,6 +68,14 @@ class WorkoutVolume {
   bool get available => max > 0;
 }
 
+/// Fallback safety copy for when the host has not answered yet.
+///
+/// It deliberately matches `MachineLink.CANNOT_READ_NOTICE` on the Kotlin side. "We have not heard
+/// from the machine" and "we cannot read the machine" are the same claim from the rider's point of
+/// view, and it is the safer of the two sentences to guess.
+const String _cannotReadNotice =
+    "Stride can't read the treadmill. The belt may be moving.";
+
 @immutable
 class MachineSnapshot {
   const MachineSnapshot({
@@ -75,6 +83,7 @@ class MachineSnapshot {
     required this.reason,
     required this.canCommand,
     required this.noReadingLabel,
+    required this.metricsNotice,
     this.speedMph,
     this.inclinePercent,
     this.distanceMiles,
@@ -99,6 +108,8 @@ class MachineSnapshot {
       noReadingLabel:
           _asNonEmptyString(map['noReading'] ?? map['noReadingLabel']) ??
           'Not measured',
+      metricsNotice:
+          _asNonEmptyString(map['metricsNotice']) ?? _cannotReadNotice,
     );
   }
 
@@ -108,6 +119,7 @@ class MachineSnapshot {
       reason: reason ?? 'Console link unavailable in this build.',
       canCommand: false,
       noReadingLabel: 'Not measured',
+      metricsNotice: _cannotReadNotice,
     );
   }
 
@@ -120,6 +132,12 @@ class MachineSnapshot {
   final double? paceMinPerMile;
   final int? fanLevel;
   final bool canCommand;
+
+  /// The safety sentence to print beside these metrics, chosen by the host from what is actually
+  /// true right now. Never concatenate the read and control warnings: claiming both at once is a
+  /// visible contradiction, and safety copy that is obviously wrong in the easy case is not
+  /// believed in the hard case.
+  final String metricsNotice;
 }
 
 class WorkoutController extends ChangeNotifier {

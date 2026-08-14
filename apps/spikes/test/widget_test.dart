@@ -21,17 +21,19 @@ void main() {
     expect(find.text('Controls locked'), findsOneWidget);
     expect(find.text('Start workout'), findsOneWidget);
     expect(find.text('Media volume'), findsOneWidget);
-    expect(
-      find.textContaining(
-        "Stride doesn't control the treadmill. Use the console's own controls or the safety key.",
-      ),
-      findsOneWidget,
-    );
+    // With no host attached the machine is unreadable, so the honest sentence is the one about
+    // reading. Printing the control warning here too would claim we are reading the machine at the
+    // exact moment we are not, and safety copy that is obviously wrong in the easy case is not
+    // believed in the hard case.
     expect(
       find.textContaining(
         "Stride can't read the treadmill. The belt may be moving.",
       ),
       findsOneWidget,
+    );
+    expect(
+      find.textContaining("Stride doesn't control the treadmill"),
+      findsNothing,
     );
     expect(find.text('All apps'), findsOneWidget);
 

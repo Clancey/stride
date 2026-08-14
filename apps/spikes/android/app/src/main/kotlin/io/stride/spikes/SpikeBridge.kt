@@ -47,6 +47,7 @@ class SpikeBridge(private val context: Context) : MethodChannel.MethodCallHandle
 
     init {
         WorkoutMediaCoupling.attach(context)
+        WorkoutMachineCoupling.attach()
     }
 
     companion object {
@@ -108,6 +109,14 @@ class SpikeBridge(private val context: Context) : MethodChannel.MethodCallHandle
                 "mediaSkipPrevious" -> result.success(MediaNowPlaying.skipPrevious(context))
                 "trackFloorGet" -> result.success(trackFloorGet())
                 "trackFloorSet" -> result.success(trackFloorSet(call))
+
+                // --- settings + system grants ---
+                "settingsGet" -> result.success(settingsGet())
+                "transportSet" -> result.success(transportSet(call))
+                "grantsGet" -> result.success(grantsGet())
+                "grantOpenSettings" -> result.success(
+                    StridePermissions.openSettingsFor(context, call.argument<String>("id").orEmpty()),
+                )
 
                 // --- S10: navigation ---
                 "accessibilityConnected" -> result.success(StrideAccessibilityService.isConnected())
@@ -455,6 +464,40 @@ class SpikeBridge(private val context: Context) : MethodChannel.MethodCallHandle
         return systemAudio.setLevel(level)
     }
 
+    // ------------------------------------------------------------- settings
+
+    private fun settingsGet(): Map<String, Any?> {
+        StrideSettings.attach(context)
+        return mapOf(
+            "trackFloor" to StrideSettings.trackFloor,
+            "transport" to StrideSettings.transport.name.lowercase(Locale.US),
+            // Reported separately from the choice itself. The rider can select the direct path;
+            // that is not the same as it working, and the UI must be able to say so.
+            "transportImplemented" to StrideSettings.transportImplemented,
+        )
+    }
+
+    private fun transportSet(call: MethodCall): Boolean {
+        StrideSettings.attach(context)
+        val raw = call.argument<String>("transport") ?: return false
+        // Reject an unknown value instead of silently falling back to GlassOS. A settings screen
+        // that reports success while storing something else is worse than one that fails.
+        val parsed = StrideSettings.Transport.entries
+            .firstOrNull { it.name.equals(raw, ignoreCase = true) } ?: return false
+        StrideSettings.transport = parsed
+        return true
+    }
+
+    private fun grantsGet(): List<Map<String, Any?>> =
+        StridePermissions.all(context).map {
+            mapOf(
+                "id" to it.id,
+                "label" to it.label,
+                "granted" to it.granted,
+                "consequence" to it.consequence,
+            )
+        }
+
     private fun machineSnapshot(): Map<String, Any?> = mapOf(
         "status" to MachineLink.status.name.lowercase(Locale.US),
         "reason" to MachineLink.reason,
@@ -468,6 +511,9 @@ class SpikeBridge(private val context: Context) : MethodChannel.MethodCallHandle
         "beltMayBeMoving" to MachineLink.beltMayBeMoving,
         "fanLevel" to MachineLink.fanLevel,
         "canCommand" to MachineLink.canCommand(),
+        // Resolved here, not in Dart. MachineLink owns every safety sentence and the rule for
+        // choosing between them; a second copy of that rule in Dart is a second thing to get wrong.
+        "metricsNotice" to MachineLink.metricsNotice,
     )
 
     // ------------------------------------------------------------------ goals

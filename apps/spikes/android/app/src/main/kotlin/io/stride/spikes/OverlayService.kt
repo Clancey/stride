@@ -96,6 +96,9 @@ class OverlayService : Service() {
         /** Set (or, with null, un-set) the rider's choice and redraw if the overlay is up. */
         fun setTrackFloor(chosen: Boolean?) {
             trackFloorChosen = chosen
+            // The console reboots. A choice the rider made about their own screen has to still be
+            // true afterwards, so this is written through rather than held in memory.
+            StrideSettings.trackFloor = chosen
             refreshChrome()
         }
 
@@ -127,6 +130,18 @@ class OverlayService : Service() {
 
         /** Width of a quick-pick column. */
         private const val RAIL_WIDTH_DP = 132f
+
+        /**
+         * How far past the end rungs a value may sit and still mark that rung.
+         *
+         * Small on purpose. Its whole job is to absorb rounding, not to pull a stopped belt onto
+         * the lowest speed pill.
+         */
+        private const val RAIL_MARK_TOLERANCE = 0.25
+
+        /** Wide enough for the five fan segments, which are the sheet's widest row. */
+        private const val MENU_WIDTH_DP = 700f
+        private val DESTRUCTIVE_INK = Color.rgb(255, 138, 128)
 
         /** Footprint of the track floor. Wide and shallow, so the oval reads as ground. */
         private const val FLOOR_WIDTH_DP = 1020f
@@ -273,6 +288,8 @@ class OverlayService : Service() {
     private var topMetricsView: View? = null
     private var leftInclineView: View? = null
     private var rightSpeedView: View? = null
+    private var inclineRail: RailBinding? = null
+    private var speedRail: RailBinding? = null
     private var bottomBarView: View? = null
     private var handleView: TextView? = null
     private val edgeViews = mutableListOf<View>()
@@ -292,10 +309,11 @@ class OverlayService : Service() {
     private var nowPlayingPlay: TextView? = null
 
     private var elapsedHeroView: TextView? = null
-    private var bottomStateView: TextView? = null
     private var primaryTransportButton: TextView? = null
     private var endTransportButton: TextView? = null
     private var volumeValueView: TextView? = null
+    private var moreMenuView: View? = null
+    private val fanSegmentViews = mutableMapOf<Int, TextView>()
 
     private val amber = Color.rgb(255, 178, 55)
     private val amberMuted = Color.rgb(255, 222, 171)
@@ -363,6 +381,7 @@ class OverlayService : Service() {
     }
 
     private fun updateMachineMetrics() {
+        syncRailHighlights()
         machineCells.forEach { entry ->
             val view = entry.root.findViewWithTag<TextView>("value") ?: return@forEach
             val value = entry.read()
@@ -409,12 +428,19 @@ class OverlayService : Service() {
     override fun onCreate() {
         super.onCreate()
         active = this
+        // Before anything reads a setting. The overlay can be started by BootReceiver with no
+        // Activity ever having run, so it cannot assume the launcher attached the store first.
+        StrideSettings.attach(this)
+        trackFloorChosen = StrideSettings.trackFloor
         windowManager = getSystemService(Context.WINDOW_SERVICE) as WindowManager
         systemAudio = SystemAudio(this)
         WorkoutSession.addListener(workoutListener)
         // Start reading the machine here rather than in the Activity: the overlay outlives the
         // launcher UI, and the metrics on it are exactly what someone mid-run is looking at.
         MachineLink.attach(this)
+        // Also attached here, not only from the bridge: the overlay outlives the Flutter engine,
+        // and the pause button on it must still stop the belt after the launcher UI is gone.
+        WorkoutMachineCoupling.attach()
         startForegroundWithNotification()
     }
 
@@ -487,7 +513,6 @@ class OverlayService : Service() {
         edgeViews.forEach { safeRemove(it) }
         edgeViews.clear()
         elapsedHeroView = null
-        bottomStateView = null
         primaryTransportButton = null
         endTransportButton = null
         volumeValueView = null
@@ -545,12 +570,6 @@ class OverlayService : Service() {
         includeFontPadding = false
     }
 
-    private fun stateLabel(): String = when (WorkoutSession.state) {
-        WorkoutSession.State.IDLE -> "Ready"
-        WorkoutSession.State.RUNNING -> "Running"
-        WorkoutSession.State.PAUSED -> "Timer paused"
-    }
-
     private fun scheduleElapsedTicker() {
         mainHandler.removeCallbacks(elapsedTicker)
         updateElapsedDisplays()
@@ -565,7 +584,6 @@ class OverlayService : Service() {
     }
 
     private fun updateWorkoutUi() {
-        bottomStateView?.text = stateLabel()
         updateElapsedDisplays()
         updateTransportButtons()
         updateVolumeViews()
@@ -573,50 +591,44 @@ class OverlayService : Service() {
 
     private fun updateTransportButtons() {
         val primary = primaryTransportButton ?: return
+        // Ending only makes sense once the rider has already stopped moving. While the belt runs,
+        // Pause is the single thing worth reaching for, and a stop lives one tap deeper.
+        if (WorkoutSession.state == WorkoutSession.State.PAUSED) {
+            endTransportButton?.visibility = View.VISIBLE
+        }
         when (WorkoutSession.state) {
             WorkoutSession.State.IDLE -> {
                 configureActionText(
                     primary,
-                    label = "Start timer",
+                    label = "Start workout",
                     primary = true,
                     enabled = true,
                 ) {
                     WorkoutSession.start()
                     lastGesture = "timer started"
                 }
-                configureActionText(
-                    endTransportButton,
-                    label = "End workout",
-                    primary = false,
-                    enabled = false,
-                ) {}
+                // Hidden rather than greyed out. A disabled "End workout" beside "Start workout"
+                // is a control the rider has to read and dismiss every time they glance down.
+                endTransportButton?.visibility = View.GONE
             }
 
             WorkoutSession.State.RUNNING -> {
                 configureActionText(
                     primary,
-                    label = "Pause timer",
+                    label = "Pause workout",
                     primary = true,
                     enabled = true,
                 ) {
                     WorkoutSession.pause()
                     lastGesture = "timer paused"
                 }
-                configureActionText(
-                    endTransportButton,
-                    label = "End workout",
-                    primary = false,
-                    enabled = true,
-                ) {
-                    WorkoutSession.stop()
-                    lastGesture = "workout ended"
-                }
+                endTransportButton?.visibility = View.GONE
             }
 
             WorkoutSession.State.PAUSED -> {
                 configureActionText(
                     primary,
-                    label = "Resume timer",
+                    label = "Resume workout",
                     primary = true,
                     enabled = true,
                 ) {
@@ -628,6 +640,7 @@ class OverlayService : Service() {
                     label = "End workout",
                     primary = false,
                     enabled = true,
+                    destructive = true,
                 ) {
                     WorkoutSession.stop()
                     lastGesture = "workout ended"
@@ -641,6 +654,7 @@ class OverlayService : Service() {
         label: String,
         primary: Boolean,
         enabled: Boolean,
+        destructive: Boolean = false,
         onClick: () -> Unit,
     ) {
         button ?: return
@@ -648,15 +662,29 @@ class OverlayService : Service() {
         button.isEnabled = enabled
         button.isClickable = enabled
         button.alpha = if (enabled) 1f else 0.5f
-        button.setTextColor(if (enabled) Color.WHITE else Color.rgb(150, 161, 178))
+        // Ending a workout is the only irreversible thing on this bar, so it carries the warning
+        // colour in its text and edge. An outline rather than a red slab: it must read as serious
+        // without competing with the primary action for the eye.
+        button.setTextColor(
+            when {
+                !enabled -> Color.rgb(150, 161, 178)
+                destructive -> DESTRUCTIVE_INK
+                else -> Color.WHITE
+            },
+        )
         button.background = rippleRounded(
             color = when {
                 !enabled -> Color.rgb(30, 36, 45)
+                destructive -> Color.argb(60, 120, 30, 34)
                 primary -> Color.rgb(20, 109, 255)
                 else -> Color.rgb(48, 58, 74)
             },
             radius = 24f,
-            strokeColor = if (enabled) Color.argb(180, 178, 211, 255) else Color.argb(120, 93, 105, 124),
+            strokeColor = when {
+                !enabled -> Color.argb(120, 93, 105, 124)
+                destructive -> DESTRUCTIVE_INK
+                else -> Color.argb(180, 178, 211, 255)
+            },
         )
         button.setOnClickListener(if (enabled) View.OnClickListener { onClick() } else null)
     }
@@ -1070,6 +1098,8 @@ class OverlayService : Service() {
         topMetricsView = null
         leftInclineView = null
         rightSpeedView = null
+        inclineRail = null
+        speedRail = null
         bottomBarView = null
         trackFloorRoot = null
         trackFloorView = null
@@ -1079,7 +1109,6 @@ class OverlayService : Service() {
         cornerRightView = null
         clearNowPlayingRefs()
         elapsedHeroView = null
-        bottomStateView = null
         primaryTransportButton = null
         endTransportButton = null
         volumeValueView = null
@@ -1270,26 +1299,38 @@ class OverlayService : Service() {
         val presets = MachineLink.inclinePresets
             ?.map { it.roundToInt().toString() }
             ?: listOf("12", "10", "8", "6", "5", "4", "3", "2", "1", "0", "-1", "-2", "-3")
-        leftInclineView = addRail(
+        val binding = addRail(
             accent = amber,
             entries = presets,
             entrySuffix = "%",
             currentEntry = MachineLink.inclinePercent?.roundToInt()?.toString(),
             gravity = Gravity.START or Gravity.TOP,
+            onPick = { percent ->
+                MachineCoordinator.setInclinePercent(percent)
+                lastGesture = "incline -> $percent%"
+            },
         )
+        inclineRail = binding
+        leftInclineView = binding?.scroll
     }
 
     private fun addSpeedRail() {
         val presets = MachineLink.speedPresets
             ?.map { it.roundToInt().toString() }
             ?: listOf("12", "10", "9", "8", "7", "6", "5", "4", "3", "2", "1")
-        rightSpeedView = addRail(
+        val binding = addRail(
             accent = cyan,
             entries = presets,
             entrySuffix = "",
             currentEntry = MachineLink.speedMph?.roundToInt()?.toString(),
             gravity = Gravity.END or Gravity.TOP,
+            onPick = { mph ->
+                MachineCoordinator.setSpeedMph(mph)
+                lastGesture = "speed -> $mph mph"
+            },
         )
+        speedRail = binding
+        rightSpeedView = binding?.scroll
     }
 
     /**
@@ -1354,12 +1395,14 @@ class OverlayService : Service() {
         entrySuffix: String,
         currentEntry: String?,
         gravity: Int,
-    ): View? {
+        onPick: (Double) -> Unit,
+    ): RailBinding? {
         val (railTop, railHeight) = railBounds()
         var railSettling = false
         var ignoreClicksUntilMs = 0L
         val clearSettling = Runnable { railSettling = false }
         var activeView: View? = null
+        val buttons = LinkedHashMap<String, TextView>()
 
         val content = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
@@ -1374,9 +1417,18 @@ class OverlayService : Service() {
                 active = active,
             ) {
                 if (railSettling || SystemClock.uptimeMillis() < ignoreClicksUntilMs) return@railEntryButton
-                showMachineControlUnavailable()
+                // The pill's own label is the source of the value, so what the rider sees is
+                // exactly what gets sent. Parsing can only fail if a preset is not a number, in
+                // which case sending nothing is the right answer.
+                val value = entry.toDoubleOrNull()
+                if (value == null || !MachineLink.canCommand()) {
+                    showMachineControlUnavailable()
+                    return@railEntryButton
+                }
+                onPick(value)
             }
             if (active) activeView = button
+            buttons[entry] = button
             content.addView(button)
         }
 
@@ -1412,6 +1464,9 @@ class OverlayService : Service() {
         val params = baseParams(dp(RAIL_WIDTH_DP), railHeight, gravity)
         params.x = dp(30f)
         params.y = railTop
+        val binding = RailBinding(accent = accent, buttons = buttons, scroll = rail)
+        binding.applied = currentEntry
+        binding.isSettling = { railSettling }
         try {
             windowManager.addView(rail, params)
             // Report the edge this rail occupies, offset included, so Flutter can inset its grid
@@ -1425,9 +1480,74 @@ class OverlayService : Service() {
                     rail.scrollTo(0, target)
                 }
             }
-            return rail
+            return binding
         } catch (_: Exception) {
             return null
+        }
+    }
+
+    /**
+     * A live handle on one rail, so the highlight can follow the machine instead of freezing at the
+     * value that happened to be true when the window was built.
+     *
+     * This matters beyond tidiness: the console's own physical buttons and any residual iFit
+     * workout can move speed and incline without Stride asking. A rail that still marks the last
+     * value *Stride* sent is telling the rider the belt is somewhere it is not, which is exactly the
+     * kind of confident-but-wrong readout the safety-copy rule in MachineLink exists to prevent.
+     */
+    private class RailBinding(
+        val accent: Int,
+        val buttons: Map<String, TextView>,
+        val scroll: ScrollView,
+    ) {
+        var applied: String? = null
+        var isSettling: () -> Boolean = { false }
+    }
+
+    /**
+     * Re-mark both rails from current telemetry. Text and background only — no view is added or
+     * removed — so this is safe from the one-second tick, unlike a rebuild.
+     */
+    private fun syncRailHighlights() {
+        applyRailHighlight(inclineRail, MachineLink.inclinePercent)
+        applyRailHighlight(speedRail, MachineLink.speedMph)
+    }
+
+    /**
+     * Mark the pill nearest the machine's actual value.
+     *
+     * Nearest rather than exact-match: the console's own buttons move in half steps, so an exact
+     * string comparison against integer presets leaves the whole column unmarked at 2.5 mph — the
+     * rider gets a scale with no position on it precisely when they are looking for one. The top
+     * strip stays the authoritative number; the rail is a picker showing which rung they are on.
+     */
+    private fun applyRailHighlight(rail: RailBinding?, current: Double?) {
+        val binding = rail ?: return
+        val target = current?.let { value ->
+            val rungs = binding.buttons.keys.mapNotNull { key -> key.toDoubleOrNull()?.let { key to it } }
+            val lowest = rungs.minOfOrNull { it.second }
+            val highest = rungs.maxOfOrNull { it.second }
+            // Off the bottom of the scale is not the bottom rung. A stopped belt sits below the
+            // lowest speed preset, and snapping it to "1" would light a pill claiming the machine
+            // is walking when it is standing still. Nothing marked is the truthful answer there.
+            val offScale = lowest == null || highest == null ||
+                value < lowest - RAIL_MARK_TOLERANCE || value > highest + RAIL_MARK_TOLERANCE
+            if (offScale) null else rungs.minByOrNull { abs(it.second - value) }?.first
+        }
+        if (binding.applied == target) return
+        binding.applied?.let { previous ->
+            binding.buttons[previous]?.let { styleRailEntry(it, binding.accent, active = false) }
+        }
+        val active = target?.let { binding.buttons[it] }
+        active?.let { styleRailEntry(it, binding.accent, active = true) }
+        binding.applied = target
+        // Never yank the column out from under a rider mid-scroll; they are reaching for a value and
+        // moving the list would make them miss it.
+        if (active != null && !binding.isSettling()) {
+            binding.scroll.post {
+                val target = (active.top - (binding.scroll.height - active.height) / 2).coerceAtLeast(0)
+                binding.scroll.smoothScrollTo(0, target)
+            }
         }
     }
 
@@ -1437,20 +1557,274 @@ class OverlayService : Service() {
      * rather than as sixteen competing buttons.
      */
     private fun railEntryButton(label: String, accent: Int, active: Boolean, onClick: () -> Unit): TextView =
-        textView(label, 30f, if (active) Color.rgb(5, 10, 18) else Color.rgb(206, 214, 232), bold = true, gravity = Gravity.CENTER).apply {
+        textView(label, 30f, Color.rgb(206, 214, 232), bold = true, gravity = Gravity.CENTER).apply {
             isClickable = true
             isFocusable = true
-            contentDescription = "$label locked. ${MachineLink.CONTROL_LOCKED_NOTICE}"
-            background = rippleRounded(
-                color = if (active) accent else Color.argb(224, 18, 25, 46),
-                radius = 34f,
-                strokeColor = if (active) Color.WHITE else Color.argb(150, 62, 76, 116),
-            )
+            contentDescription = label
+            styleRailEntry(this, accent, active)
             setOnClickListener { onClick() }
             val lp = LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, dp(66f))
             lp.topMargin = dp(11f)
             layoutParams = lp
             minimumHeight = dp(66f)
+        }
+
+    /** The one place a rail pill's marked/unmarked look is defined, so build and refresh cannot drift. */
+    private fun styleRailEntry(view: TextView, accent: Int, active: Boolean) {
+        view.setTextColor(if (active) Color.rgb(5, 10, 18) else Color.rgb(206, 214, 232))
+        view.background = rippleRounded(
+            color = if (active) accent else Color.argb(224, 18, 25, 46),
+            radius = 34f,
+            strokeColor = if (active) Color.WHITE else Color.argb(150, 62, 76, 116),
+        )
+    }
+
+    // ------------------------------------------------------------------ more menu
+
+    /**
+     * The occasional controls, one tap away instead of always on screen.
+     *
+     * A modal sheet rather than an expanding bar section: the sheet can be as tall as it needs to
+     * be without moving the transport controls, and the transport controls staying exactly where
+     * they were is the point. A rider reaching for pause must not find that opening a menu shifted
+     * it.
+     */
+    private fun showMoreMenu() {
+        if (moreMenuView != null) {
+            dismissMoreMenu()
+            return
+        }
+        val scrim = FrameLayout(this).apply {
+            setBackgroundColor(Color.argb(168, 2, 5, 11))
+            isClickable = true
+            setOnClickListener { dismissMoreMenu() }
+        }
+        val card = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            background = roundedRect(Color.rgb(9, 14, 24), 30f, Color.argb(150, 96, 118, 152))
+            setPadding(dp(26f), dp(20f), dp(26f), dp(24f))
+            // Swallows its own taps so a miss inside the sheet does not dismiss it.
+            isClickable = true
+            // Explicit width, not WRAP_CONTENT. A wrapping card measures its MATCH_PARENT rows
+            // against a width it has not decided yet, and the sheet collapsed into a single column
+            // with one fan pill and a three-line toggle. Sized to the widest row: five fan segments
+            // plus the card's own padding.
+            val lp = FrameLayout.LayoutParams(
+                dp(MENU_WIDTH_DP),
+                FrameLayout.LayoutParams.WRAP_CONTENT,
+                Gravity.BOTTOM or Gravity.END,
+            )
+            lp.bottomMargin = (if (hudBottomPx > 0) hudBottomPx else dp(HUD_BOTTOM_ESTIMATE_DP)) + dp(16f)
+            // Clear of the speed rail, so the sheet reads as sitting beside the column rather than
+            // dropped on top of it.
+            lp.marginEnd = dp(30f) + dp(RAIL_WIDTH_DP) + dp(18f)
+            layoutParams = lp
+        }
+
+        card.addView(menuSectionLabel("Navigation", first = true))
+        card.addView(LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+            layoutParams = LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT,
+                LinearLayout.LayoutParams.WRAP_CONTENT,
+            )
+            addView(menuAction("‹  Back") {
+                dismissMoreMenu()
+                val svc = StrideAccessibilityService.instance
+                lastGesture = if (svc == null) {
+                    "BACK failed: accessibility service not connected"
+                } else if (svc.goBack()) "BACK ok" else "BACK rejected"
+            })
+            addView(menuAction("⌂  Home") {
+                dismissMoreMenu()
+                goHomeFromService()
+                lastGesture = "HOME ok"
+            })
+            addView(menuAction("▣  Recents") {
+                dismissMoreMenu()
+                val svc = StrideAccessibilityService.instance
+                lastGesture = if (svc == null) {
+                    "RECENTS failed: accessibility service not connected"
+                } else if (svc.goRecents()) "RECENTS ok" else "RECENTS rejected"
+            })
+        })
+
+        card.addView(menuSectionLabel("Fan", first = false))
+        card.addView(fanSegments())
+
+        card.addView(menuSectionLabel("Media volume", first = false))
+        card.addView(volumeCluster().apply {
+            layoutParams = LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT,
+                dp(88f),
+            )
+        })
+
+        card.addView(menuSectionLabel("Overlay", first = false))
+        card.addView(LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+            layoutParams = LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT,
+                LinearLayout.LayoutParams.WRAP_CONTENT,
+            )
+            addView(menuToggle("Metrics", metricsVisible) {
+                metricsVisible = !metricsVisible
+                dismissMoreMenu()
+                rebuildChromeViews()
+                lastGesture = if (metricsVisible) "metrics shown" else "metrics hidden"
+            })
+            addView(menuToggle("Track floor", trackFloorWanted()) {
+                trackFloorChosen = !trackFloorWanted()
+                dismissMoreMenu()
+                rebuildChromeViews()
+                lastGesture = if (trackFloorChosen == true) "track floor shown" else "track floor hidden"
+            })
+        })
+
+        scrim.addView(card)
+        val params = baseParams(
+            WindowManager.LayoutParams.MATCH_PARENT,
+            WindowManager.LayoutParams.MATCH_PARENT,
+            Gravity.TOP or Gravity.START,
+        )
+        try {
+            windowManager.addView(scrim, params)
+            moreMenuView = scrim
+        } catch (_: Exception) {
+            moreMenuView = null
+        }
+    }
+
+    private fun dismissMoreMenu() {
+        moreMenuView?.let { safeRemove(it) }
+        moreMenuView = null
+        // The volume readout lived in the sheet. Leaving the reference set would let the ticker
+        // keep writing into a view that is no longer attached to anything.
+        volumeValueView = null
+        fanSegmentViews.clear()
+    }
+
+    /** A section heading. More space above than below, so the label binds to what it introduces. */
+    private fun menuSectionLabel(title: String, first: Boolean): TextView =
+        textView(title, 15f, Color.rgb(150, 168, 196), bold = true).apply {
+            letterSpacing = 0.06f
+            val lp = LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.WRAP_CONTENT,
+                LinearLayout.LayoutParams.WRAP_CONTENT,
+            )
+            lp.topMargin = if (first) 0 else dp(26f)
+            lp.bottomMargin = dp(10f)
+            layoutParams = lp
+        }
+
+    /**
+     * The fan, as a scale rather than a lock.
+     *
+     * This control used to read "Locked" because Stride had no fan implementation at all — the pill
+     * was decoration describing a limitation. It now writes FanStateService, and Auto is offered
+     * only when the machine says it can match fan speed to effort.
+     */
+    private fun fanSegments(): LinearLayout = LinearLayout(this).apply {
+        orientation = LinearLayout.HORIZONTAL
+        layoutParams = LinearLayout.LayoutParams(
+            LinearLayout.LayoutParams.MATCH_PARENT,
+            LinearLayout.LayoutParams.WRAP_CONTENT,
+        )
+        val current = MachineCoordinator.lastFanState ?: StrideSettings.fanState
+        val states = listOf(
+            GlassOsCommands.FAN_OFF,
+            GlassOsCommands.FAN_LOW,
+            GlassOsCommands.FAN_MEDIUM,
+            GlassOsCommands.FAN_HIGH,
+            GlassOsCommands.FAN_AUTO,
+        )
+        states.forEachIndexed { index, state ->
+            val active = current == state
+            val pill = textView(
+                GlassOsCommands.fanStateName(state),
+                19f,
+                if (active) Color.rgb(28, 18, 4) else Color.rgb(206, 214, 232),
+                bold = true,
+                gravity = Gravity.CENTER,
+            ).apply {
+                isClickable = true
+                isFocusable = true
+                contentDescription = "Fan ${GlassOsCommands.fanStateName(state)}"
+                background = rippleRounded(
+                    color = if (active) amber else Color.argb(224, 18, 25, 46),
+                    radius = 26f,
+                    strokeColor = if (active) Color.WHITE else Color.argb(140, 62, 76, 116),
+                )
+                val lp = LinearLayout.LayoutParams(dp(108f), dp(72f))
+                if (index > 0) lp.marginStart = dp(8f)
+                layoutParams = lp
+                minimumHeight = dp(72f)
+                setOnClickListener {
+                    if (!MachineLink.canCommand()) {
+                        showMachineControlUnavailable()
+                        return@setOnClickListener
+                    }
+                    StrideSettings.fanState = state
+                    MachineCoordinator.setFan(state)
+                    lastGesture = "fan -> ${GlassOsCommands.fanStateName(state)}"
+                    refreshFanSegments(state)
+                }
+            }
+            fanSegmentViews[state] = pill
+            addView(pill)
+        }
+    }
+
+    private fun refreshFanSegments(selected: Int) {
+        fanSegmentViews.forEach { (state, view) ->
+            val active = state == selected
+            view.setTextColor(if (active) Color.rgb(28, 18, 4) else Color.rgb(206, 214, 232))
+            view.background = rippleRounded(
+                color = if (active) amber else Color.argb(224, 18, 25, 46),
+                radius = 26f,
+                strokeColor = if (active) Color.WHITE else Color.argb(140, 62, 76, 116),
+            )
+        }
+    }
+
+    private fun menuToggle(label: String, on: Boolean, onClick: () -> Unit): TextView =
+        textView(
+            if (on) "$label  on" else "$label  off",
+            17f,
+            if (on) Color.rgb(190, 232, 255) else Color.rgb(150, 165, 188),
+            bold = true,
+            gravity = Gravity.CENTER,
+        ).apply {
+            isClickable = true
+            isFocusable = true
+            contentDescription = if (on) "$label on" else "$label off"
+            background = rippleRounded(
+                color = if (on) Color.rgb(20, 38, 52) else Color.rgb(20, 24, 33),
+                radius = 24f,
+                strokeColor = if (on) Color.argb(190, 90, 170, 214) else Color.argb(120, 78, 92, 118),
+            )
+            setPadding(dp(20f), 0, dp(20f), 0)
+            val lp = LinearLayout.LayoutParams(LinearLayout.LayoutParams.WRAP_CONTENT, dp(72f))
+            lp.marginEnd = dp(10f)
+            layoutParams = lp
+            minimumHeight = dp(72f)
+            setOnClickListener { onClick() }
+        }
+
+    private fun menuAction(label: String, onClick: () -> Unit): TextView =
+        textView(label, 17f, Color.rgb(226, 233, 245), bold = true, gravity = Gravity.CENTER).apply {
+            isClickable = true
+            isFocusable = true
+            contentDescription = label
+            background = rippleRounded(Color.rgb(20, 24, 33), 24f, Color.argb(120, 78, 92, 118))
+            setPadding(dp(20f), 0, dp(20f), 0)
+            val lp = LinearLayout.LayoutParams(LinearLayout.LayoutParams.WRAP_CONTENT, dp(72f))
+            lp.marginEnd = dp(10f)
+            layoutParams = lp
+            minimumHeight = dp(72f)
+            setOnClickListener { onClick() }
         }
 
     private fun addBottomBar() {
@@ -1473,67 +1847,32 @@ class OverlayService : Service() {
                 LinearLayout.LayoutParams.WRAP_CONTENT,
             )
         }
-        row.addView(bottomNavButton("Back", "‹") {
-            val svc = StrideAccessibilityService.instance
-            lastGesture = if (svc == null) {
-                "BACK failed: accessibility service not connected"
-            } else if (svc.goBack()) "BACK ok" else "BACK rejected"
-        })
-        row.addView(bottomNavButton("Home", "⌂") {
-            goHomeFromService()
-            lastGesture = "HOME ok"
-        })
-        row.addView(bottomNavButton("Recents", "▣") {
-            val svc = StrideAccessibilityService.instance
-            lastGesture = if (svc == null) {
-                "RECENTS failed: accessibility service not connected"
-            } else if (svc.goRecents()) "RECENTS ok" else "RECENTS rejected"
-        })
         row.addView(timerCluster())
-        row.addView(volumeCluster())
-        row.addView(fanCluster())
-        row.addView(smallPillButton(
-            if (metricsVisible) "Metrics on" else "Metrics off",
-            if (metricsVisible) Color.rgb(20, 38, 52) else Color.rgb(22, 26, 34),
-            if (metricsVisible) Color.rgb(190, 232, 255) else Color.rgb(150, 165, 188),
-        ) {
-            metricsVisible = !metricsVisible
-            rebuildChromeViews()
-            lastGesture = if (metricsVisible) "metrics shown" else "metrics hidden"
-        }.apply {
-            val lp = layoutParams as LinearLayout.LayoutParams
-            lp.marginStart = dp(10f)
-            layoutParams = lp
+        // Three controls, and two of them are the workout. Back, Home and Recents moved into the
+        // menu: they are reachable there and by the edge swipe, and keeping them on the bar meant
+        // the belt controls shared a row with navigation for a machine that is mostly not being
+        // navigated.
+        // Pushes the menu and the hide control to the far edge, so the workout controls own the
+        // left of the bar and never trade places with them as the transport changes width.
+        row.addView(View(this).apply {
+            layoutParams = LinearLayout.LayoutParams(0, dp(1f), 1f)
         })
-        row.addView(smallPillButton(
-            if (trackFloorWanted()) "Track on" else "Track off",
-            if (trackFloorWanted()) Color.rgb(31, 28, 62) else Color.rgb(22, 26, 34),
-            if (trackFloorWanted()) Color.rgb(198, 192, 255) else Color.rgb(150, 165, 188),
-        ) {
-            val next = !trackFloorWanted()
-            trackFloorChosen = next
-            rebuildChromeViews()
-            lastGesture = if (next) "track floor shown" else "track floor hidden"
-        }.apply {
-            val lp = layoutParams as LinearLayout.LayoutParams
-            lp.marginStart = dp(8f)
-            layoutParams = lp
-        })
-        row.addView(smallPillButton("Hide overlay", Color.rgb(42, 25, 18), Color.rgb(255, 222, 190)) {
-            hideChrome()
-        }.apply {
-            val lp = layoutParams as LinearLayout.LayoutParams
-            lp.marginStart = dp(10f)
-            layoutParams = lp
+        row.addView(bottomNavButton("Menu", "⋯", width = dp(104f)) { showMoreMenu() })
+        row.addView(bottomNavButton("Hide overlay", "⌄", width = dp(150f)) { hideChrome() }.apply {
+            (layoutParams as LinearLayout.LayoutParams).marginEnd = 0
         })
         root.addView(row)
-        root.addView(textView(MachineLink.NO_CONTROL_NOTICE, 14f, Color.rgb(238, 226, 202), bold = true, gravity = Gravity.CENTER).apply {
+        // Bound to machineNoticeView so the 1s ticker can keep it honest. Built from a constant it
+        // froze at "doesn't control" and printed that beside a full row of "Not measured", which
+        // claims we are reading the machine at the exact moment we are not.
+        root.addView(textView(MachineLink.metricsNotice, 14f, Color.rgb(238, 226, 202), bold = true, gravity = Gravity.CENTER).apply {
             val lp = LinearLayout.LayoutParams(
                 LinearLayout.LayoutParams.MATCH_PARENT,
                 LinearLayout.LayoutParams.WRAP_CONTENT,
             )
             lp.topMargin = dp(8f)
             layoutParams = lp
+            machineNoticeView = this
         })
 
         val params = baseParams(
@@ -1551,8 +1890,9 @@ class OverlayService : Service() {
         }
     }
 
-    private fun bottomNavButton(label: String, icon: String, onClick: () -> Unit): View {
-        val buttonWidth = if (resources.displayMetrics.widthPixels < dp(1500f)) dp(86f) else dp(96f)
+    private fun bottomNavButton(label: String, icon: String, width: Int = 0, onClick: () -> Unit): View {
+        val buttonWidth = if (width > 0) width
+            else if (resources.displayMetrics.widthPixels < dp(1500f)) dp(86f) else dp(96f)
         return navSurfaceButton(
             label = label,
             icon = icon,
@@ -1573,50 +1913,46 @@ class OverlayService : Service() {
         gravity = Gravity.CENTER_VERTICAL
         background = roundedRect(Color.rgb(10, 19, 32), 28f, Color.argb(120, 108, 132, 164))
         setPadding(dp(12f), dp(8f), dp(12f), dp(8f))
-        val lp = LinearLayout.LayoutParams(0, dp(88f), 1.3f)
+        // Sized to the words, not to the row. Stretched across the full bar the primary action
+        // read as a banner rather than something to press, and a button that wide gives a rider no
+        // target to aim at — every part of it is equally the middle of nowhere.
+        val lp = LinearLayout.LayoutParams(LinearLayout.LayoutParams.WRAP_CONTENT, dp(88f))
         lp.marginStart = dp(6f)
         lp.marginEnd = dp(12f)
         layoutParams = lp
-        primaryTransportButton = textView("", 20f, Color.WHITE, bold = true, gravity = Gravity.CENTER).apply {
-            layoutParams = LinearLayout.LayoutParams(0, dp(72f), 1f)
+        primaryTransportButton = textView("", 22f, Color.WHITE, bold = true, gravity = Gravity.CENTER).apply {
+            layoutParams = LinearLayout.LayoutParams(dp(360f), dp(72f))
             minimumHeight = dp(72f)
         }
         addView(primaryTransportButton)
-        endTransportButton = textView("", 18f, Color.WHITE, bold = true, gravity = Gravity.CENTER).apply {
-            val endLp = LinearLayout.LayoutParams(dp(134f), dp(72f))
-            endLp.marginStart = dp(10f)
+        endTransportButton = textView("", 19f, Color.WHITE, bold = true, gravity = Gravity.CENTER).apply {
+            val endLp = LinearLayout.LayoutParams(dp(224f), dp(72f))
+            endLp.marginStart = dp(12f)
             layoutParams = endLp
             minimumHeight = dp(72f)
         }
         addView(endTransportButton)
-        bottomStateView = textView(stateLabel(), 13f, Color.rgb(198, 215, 238), bold = true, gravity = Gravity.CENTER).apply {
-            val stateLp = LinearLayout.LayoutParams(dp(90f), LinearLayout.LayoutParams.MATCH_PARENT)
-            stateLp.marginStart = dp(10f)
-            layoutParams = stateLp
-        }
-        addView(bottomStateView)
+        // No separate state chip. The primary button already reads "Start" or "Pause", so a
+        // "Running" label beside it spent bar width restating the button next to it.
     }
 
+    /**
+     * Volume, as a value with two steppers.
+     *
+     * No inner title: the sheet's section heading already says "Media volume", and repeating it
+     * inside the control put the same two words on screen twice in a row. Styled like the other
+     * rows rather than in its own blue, so the sheet reads as one surface instead of a stack of
+     * competing widgets.
+     */
     private fun volumeCluster(): LinearLayout = LinearLayout(this).apply {
         orientation = LinearLayout.HORIZONTAL
         gravity = Gravity.CENTER_VERTICAL
-        background = roundedRect(Color.rgb(8, 30, 48), 28f, Color.argb(170, 67, 170, 235))
-        setPadding(dp(12f), dp(8f), dp(12f), dp(8f))
-        val lp = LinearLayout.LayoutParams(0, dp(88f), 0.95f)
-        lp.marginEnd = dp(12f)
-        layoutParams = lp
-        addView(LinearLayout(context).apply {
-            orientation = LinearLayout.VERTICAL
-            gravity = Gravity.CENTER_VERTICAL
-            layoutParams = LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.MATCH_PARENT, 1f)
-            addView(textView("Media volume", 14f, Color.rgb(205, 233, 255), bold = true))
-            volumeValueView = textView(volumeText(), 24f, Color.WHITE, bold = true).apply {
-                val valueLp = LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT)
-                valueLp.topMargin = dp(6f)
-                layoutParams = valueLp
-            }
-            addView(volumeValueView)
-        })
+        background = roundedRect(Color.rgb(20, 24, 33), 24f, Color.argb(120, 78, 92, 118))
+        setPadding(dp(20f), dp(8f), dp(10f), dp(8f))
+        volumeValueView = textView(volumeText(), 26f, Color.WHITE, bold = true).apply {
+            layoutParams = LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f)
+        }
+        addView(volumeValueView)
         addView(controlButton("▼", enabled = true) { changeVolume(-1) }.apply {
             layoutParams = LinearLayout.LayoutParams(dp(72f), dp(72f))
         })
@@ -1624,28 +1960,6 @@ class OverlayService : Service() {
             val plusLp = LinearLayout.LayoutParams(dp(72f), dp(72f))
             plusLp.marginStart = dp(8f)
             layoutParams = plusLp
-        })
-    }
-
-    private fun fanCluster(): LinearLayout = LinearLayout(this).apply {
-        orientation = LinearLayout.VERTICAL
-        gravity = Gravity.CENTER
-        isClickable = true
-        isFocusable = true
-        contentDescription = "Fan locked. ${MachineLink.CONTROL_LOCKED_NOTICE}"
-        background = roundedRect(Color.rgb(35, 24, 13), 28f, Color.argb(210, 255, 178, 55))
-        setPadding(dp(12f), dp(8f), dp(12f), dp(8f))
-        setOnClickListener { showMachineControlUnavailable() }
-        val lp = LinearLayout.LayoutParams(0, dp(88f), 0.52f)
-        lp.marginEnd = dp(10f)
-        layoutParams = lp
-        addView(textView("Fan", 14f, amberMuted, bold = true, gravity = Gravity.CENTER).apply {
-            layoutParams = LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT)
-        })
-        addView(textView("Locked", 21f, Color.WHITE, bold = true, gravity = Gravity.CENTER).apply {
-            val lockedLp = LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT)
-            lockedLp.topMargin = dp(7f)
-            layoutParams = lockedLp
         })
     }
 

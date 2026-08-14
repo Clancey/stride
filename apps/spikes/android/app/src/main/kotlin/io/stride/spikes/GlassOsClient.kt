@@ -10,16 +10,16 @@ import okhttp3.RequestBody.Companion.toRequestBody
 import java.util.concurrent.TimeUnit
 
 /**
- * A read-only client for the console's GlassOS daemon.
+ * Transport and readers for the console's GlassOS daemon.
  *
- * ## This client cannot move the belt
+ * ## This class no longer forbids control, but it does not offer it either
  *
- * That is a structural property, not a convention. `SpeedService/SetSpeed`,
- * `InclineService/SetIncline`, `WorkoutService/StartNewWorkout`, `Pause`, `Resume` and `Stop` are
- * simply not implemented here, so no amount of UI wiring or future refactoring can accidentally
- * command the machine through this class. Commands, when they come, need the Coordinator's clamps,
- * watchdog and stop-preemption, and they will arrive as a separate type that is obviously
- * dangerous to touch.
+ * Earlier revisions had no way at all to command the machine, and said so here. That is no longer
+ * true: [postRaw] can carry a request body, and the command surface in [GlassOsCommands] is built on
+ * it. The guarantee moved rather than disappeared — **no command reaches this transport except
+ * through [MachineCoordinator]**, which owns the clamps, the ramp limit, stop preemption and the
+ * generation check. Nothing in this file should grow a `setSpeed`-shaped method; put it in
+ * [GlassOsCommands] where it is obviously dangerous to touch.
  *
  * The distinction is not academic. `StartNewWorkout` takes no arguments and reads like a harmless
  * session start, but measured on the real machine it drove the console `IDLE → WARM_UP → WORKOUT`
@@ -28,8 +28,8 @@ import java.util.concurrent.TimeUnit
  *
  * ## Reading, by contrast, is safe
  *
- * Nothing here can change the machine's state, which is why telemetry can land well before control
- * does, and why the metrics in the overlay can stop saying "Not measured" without unlocking a
+ * The readers here cannot change the machine's state, which is why telemetry landed well before
+ * control did, and why the metrics in the overlay stopped saying "Not measured" without unlocking a
  * single button.
  *
  * Every call is blocking; callers must be off the main thread. Timeouts are deliberately short —
@@ -83,14 +83,39 @@ class GlassOsClient(private val context: Context) {
      * or null on any failure. Everything reachable from here is read-only: the request body is
      * always [GlassOsWire.EMPTY_FRAME], so no value can be carried to the machine.
      */
-    private fun callRaw(service: String, method: String): ByteArray? {
-        val client = ensureClient() ?: return null
+    private fun callRaw(service: String, method: String): ByteArray? =
+        postRaw(service, method, GlassOsWire.EMPTY_FRAME)
+
+    /**
+     * Perform a unary call carrying an already-framed request body.
+     *
+     * Internal rather than private because the command surface needs it, and internal rather than
+     * public so the only callers are in this module. [GlassOsCommands] is the intended one.
+     */
+    internal fun postRaw(
+        service: String,
+        method: String,
+        framed: ByteArray,
+        readTimeoutSeconds: Long = 0,
+    ): ByteArray? {
+        val base = ensureClient() ?: return null
+        // Reads keep the short default so a stalled console degrades to "no reading" instead of
+        // freezing the overlay. Commands need longer: StartNewWorkout spins the machine up and
+        // measured well past two seconds, which surfaced as a bogus "no reply" on a command the
+        // treadmill had actually accepted. newBuilder shares the connection pool, so this is a
+        // timeout override rather than a second client.
+        val client = if (readTimeoutSeconds <= 0) base else {
+            base.newBuilder()
+                .readTimeout(readTimeoutSeconds, TimeUnit.SECONDS)
+                .callTimeout(readTimeoutSeconds + 2, TimeUnit.SECONDS)
+                .build()
+        }
         return try {
             val request = Request.Builder()
                 .url("$ENDPOINT/com.ifit.glassos.$service/$method")
                 .addHeader("te", "trailers")
                 .addHeader("client_id", clientId)
-                .post(GlassOsWire.EMPTY_FRAME.toRequestBody(GRPC))
+                .post(framed.toRequestBody(GRPC))
                 .build()
             client.newCall(request).execute().use { response ->
                 if (!response.isSuccessful) {

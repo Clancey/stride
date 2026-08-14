@@ -29,6 +29,7 @@ class MainActivity : FlutterActivity() {
         super.configureFlutterEngine(flutterEngine)
         // Idempotent, and deliberately also done by OverlayService: either surface can be the one
         // on screen, and whichever comes up first should start reading the machine.
+        StrideSettings.attach(applicationContext)
         MachineLink.attach(applicationContext)
         channel = MethodChannel(flutterEngine.dartExecutor.binaryMessenger, SpikeBridge.CHANNEL).also {
             it.setMethodCallHandler(SpikeBridge(applicationContext))

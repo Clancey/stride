@@ -50,6 +50,61 @@ object GlassOsWire {
 
         /** A `string` field, or null if absent. */
         fun string(field: Int): String? = bytes[field]?.toString(Charsets.UTF_8)
+
+        /** A nested message field, decoded, or null if absent. */
+        fun message(field: Int): Fields? = bytes[field]?.let { parse(it) }
+
+        /**
+         * Whether the message carried [field] at all, of any wire type.
+         *
+         * Needed to read a `oneof`, where "which branch is set" is answered by presence rather than
+         * by value. `WorkoutResult` is exactly this shape: an absent error field is the difference
+         * between a command that succeeded and one that failed.
+         */
+        fun hasField(field: Int): Boolean = varints.containsKey(field) || bytes.containsKey(field)
+
+        /**
+         * Human text for an `IFitError` nested in field 1.
+         *
+         * `WorkoutResult.error` is an `IFitError`, which is itself a oneof over nine error types,
+         * each of which carries `errorCode = 1` and `message = 2`. So the useful text is two levels
+         * down, not one. `WorkoutError` additionally reports the state it saw and the states it
+         * expected, which is the difference between "the machine said no" and "the machine wanted
+         * to be IDLE and was in RESULTS" — the second is actionable, the first is not.
+         */
+        fun errorDetail(): String {
+            val blob = bytes[1] ?: return "refused"
+            val error = parse(blob)
+            // Field numbers are IFitError's oneof branches, in its own declaration order.
+            val branches = mapOf(
+                1 to "network", 2 to "user", 3 to "auth", 4 to "connection", 5 to "workout",
+                6 to "input", 7 to "activityLog", 8 to "console", 9 to "programmedSession",
+            )
+            for ((field, name) in branches) {
+                val nested = error.bytes[field]?.let { parse(it) } ?: continue
+                val parts = mutableListOf<String>()
+                parts += name
+                nested.long(1)?.let { parts += "code $it" }
+                nested.string(2)?.takeIf { it.isNotBlank() }?.let { parts += it }
+                if (field == 5) {
+                    nested.long(3)?.let { parts += "state ${workoutStateName(it)}" }
+                    nested.long(4)?.let { parts += "expected ${workoutStateName(it)}" }
+                }
+                return parts.joinToString(", ")
+            }
+            return "refused"
+        }
+    }
+
+    /** `WorkoutState` enum names, so a refusal reads as a state rather than a bare number. */
+    private fun workoutStateName(value: Long): String = when (value.toInt()) {
+        0 -> "UNKNOWN"
+        1 -> "IDLE"
+        2 -> "DMK"
+        3 -> "RUNNING"
+        4 -> "PAUSED"
+        5 -> "RESULTS"
+        else -> "state $value"
     }
 
     /**
@@ -130,6 +185,52 @@ object GlassOsWire {
 
     /** The five-byte frame for a request carrying no fields, which is most of what we send. */
     val EMPTY_FRAME: ByteArray = frame(ByteArray(0))
+
+    /**
+     * Encode a single proto3 `double` field as a complete message body.
+     *
+     * Both control requests we send — `SpeedRequest{double kph = 1}` and
+     * `InclineRequest{double percent = 1}` — are exactly one double in field 1, so this is the only
+     * encoder the command path needs. Doubles are wire type 1 (64-bit), little-endian IEEE-754.
+     *
+     * Proto3 would normally omit a field equal to zero, since the default is indistinguishable from
+     * absent. This writes it anyway: `SetSpeed(0.0)` is a request to stop the belt, and dropping it
+     * on the floor because zero is the default would turn a stop into a no-op.
+     */
+    fun encodeDouble(field: Int, value: Double): ByteArray {
+        val out = ByteArrayOutputStream(9)
+        writeVarint(out, (field.toLong() shl 3) or 1L)
+        val bits = java.lang.Double.doubleToRawLongBits(value)
+        for (i in 0 until 8) out.write(((bits ushr (8 * i)) and 0xFF).toInt())
+        return out.toByteArray()
+    }
+
+    /**
+     * One varint field — used for enums such as FanState.
+     *
+     * Writes the value even when it is zero, for the same reason [encodeDouble] does: proto3 omits
+     * zero on the wire, but FAN_STATE_OFF *is* zero, and a fan that cannot be turned off is worse
+     * than one that was never controllable.
+     */
+    fun encodeVarintField(field: Int, value: Int): ByteArray {
+        val out = ByteArrayOutputStream(6)
+        writeVarint(out, (field.toLong() shl 3))
+        writeVarint(out, value.toLong())
+        return out.toByteArray()
+    }
+
+    private fun writeVarint(out: ByteArrayOutputStream, value: Long) {
+        var v = value
+        while (true) {
+            val b = (v and 0x7F).toInt()
+            v = v ushr 7
+            if (v == 0L) {
+                out.write(b)
+                return
+            }
+            out.write(b or 0x80)
+        }
+    }
 
     /**
      * Strip the gRPC frame from a response body, returning the message payload.

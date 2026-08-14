@@ -41,13 +41,20 @@ object MachineLink {
     const val CANNOT_READ_NOTICE: String =
         "Stride can't read the treadmill. The belt may be moving."
 
-    /** The sentence that must appear on any surface offering workout actions. */
-    const val NO_CONTROL_NOTICE: String =
-        "Stride doesn't control the treadmill. Use the console's own controls or the safety key."
+    /**
+     * The sentence for a linked machine Stride can command.
+     *
+     * It used to read "Stride doesn't control the treadmill", which was true when nothing here
+     * could move the belt and became a lie the moment [MachineCoordinator] shipped. The warning
+     * that survives is the one that is still true and still matters: software stop is best-effort,
+     * and the key is not.
+     */
+    const val SAFETY_KEY_NOTICE: String =
+        "The safety key is the only emergency stop. Stride's stop is best-effort."
 
     /** What a disabled machine control says when someone taps it. It must never just swallow it. */
     const val CONTROL_LOCKED_NOTICE: String =
-        "Stride can't control the belt yet. Use the console's own controls."
+        "Stride can't reach the console right now. Use the console's own controls."
 
     /**
      * The safety sentence to print beside a metric readout, chosen by what is actually true.
@@ -58,7 +65,7 @@ object MachineLink {
      */
     val metricsNotice: String
         get() = when (status) {
-            Status.LINKED_READ_ONLY -> NO_CONTROL_NOTICE
+            Status.LINKED -> SAFETY_KEY_NOTICE
             Status.DISCONNECTED -> CANNOT_READ_NOTICE
         }
 
@@ -67,10 +74,13 @@ object MachineLink {
         DISCONNECTED,
 
         /**
-         * Reading the machine, and deliberately unable to move it. This is a real, useful state,
-         * not a waypoint to a better one: metrics are live while every control stays inert.
+         * Fresh telemetry is arriving over a live transport.
+         *
+         * This says nothing about whether a particular command will be accepted — the machine can
+         * still refuse a write depending on its own state. It means only that the link is good
+         * enough to try, which is why every command still returns an outcome.
          */
-        LINKED_READ_ONLY,
+        LINKED,
     }
 
     /** How long a reading stays believable after the last successful poll. */
@@ -103,7 +113,7 @@ object MachineLink {
     }
 
     val status: Status
-        get() = if (fresh() != null) Status.LINKED_READ_ONLY else Status.DISCONNECTED
+        get() = if (fresh() != null) Status.LINKED else Status.DISCONNECTED
 
     /**
      * Why we are in this state, in words a person on the machine can act on — not an error code.
@@ -112,7 +122,7 @@ object MachineLink {
      */
     val reason: String
         get() = when (status) {
-            Status.LINKED_READ_ONLY ->
+            Status.LINKED ->
                 "Stride is reading this machine, but doesn't control it. " +
                     "Speed, incline and fan stay on the console."
             Status.DISCONNECTED -> DISCONNECTED_REASON
@@ -188,7 +198,7 @@ object MachineLink {
      */
     fun attach(context: Context) {
         if (thread != null) return
-        client = GlassOsClient(context.applicationContext)
+        client = GlassOsClient(context.applicationContext).also { MachineCoordinator.attach(it) }
         val t = HandlerThread("machine-link").also { it.start() }
         thread = t
         val h = Handler(t.looper)
@@ -293,7 +303,14 @@ object MachineLink {
      *  9. The UI distinguishes requested / confirmed / unknown, and never shows a requested value
      *     styled as a measured one.
      *
-     * Until every one of those is true, this returns false and the controls above it stay inert.
+     * Most of that checklist is now satisfied and control has shipped, so this no longer returns a
+     * hardcoded false. It is still **not** the safety boundary: it answers only "is there a live,
+     * fresh link a command could travel over". Every clamp, ramp, generation check and stop
+     * preemption lives in [MachineCoordinator], and a command that does not go through the
+     * coordinator has none of them.
+     *
+     * Items 3 and 8 of the checklist above remain unverified by use. Until they are, the UI must
+     * keep describing the physical safety key as the only true stop.
      */
-    fun canCommand(): Boolean = false
+    fun canCommand(): Boolean = MachineCoordinator.available
 }

@@ -926,10 +926,7 @@ class _WorkoutPanel extends StatelessWidget {
               children: [
                 _WorkoutHeader(state: controller.state),
                 const SizedBox(height: StrideSpace.sm),
-                const _SafetyNotice(
-                  text:
-                      "Stride doesn't control the treadmill. Use the console's own controls or the safety key. Stride can't read the treadmill. The belt may be moving.",
-                ),
+                _SafetyNotice(text: controller.machine.metricsNotice),
                 const SizedBox(height: StrideSpace.sm),
                 _ElapsedHero(elapsedMs: controller.elapsedMs),
                 if (goal.isTrackable) ...[

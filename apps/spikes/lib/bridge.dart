@@ -138,6 +138,16 @@ class SpikeBridge {
   static Future<String?> foregroundPackage() async =>
       await _channel.invokeMethod<String>('foregroundPackage');
 
+  // Settings + system grants
+  static Future<Map<String, dynamic>> settingsGet() => _map('settingsGet');
+  static Future<bool> transportSet(String transport) =>
+      _bool('transportSet', <String, dynamic>{'transport': transport});
+  static Future<List<Map<String, dynamic>>> grantsGet() => _list('grantsGet');
+  static Future<bool> grantOpenSettings(String id) =>
+      _bool('grantOpenSettings', <String, dynamic>{'id': id});
+  static Future<bool> trackFloorSet(bool? chosen) =>
+      _bool('trackFloorSet', <String, dynamic>{'chosen': chosen});
+
   // S2 - iFit APK location
   static Future<Map<String, dynamic>> ifitApkPaths() => _map('ifitApkPaths');
 
