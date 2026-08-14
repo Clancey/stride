@@ -218,6 +218,26 @@ adb shell input keyevent KEYCODE_APP_SWITCH # 187
 This works from the host because `adb shell` runs with shell UID, which holds `INJECT_EVENTS`. A
 sideloaded app does not — which is exactly why Stride needs the accessibility service (plan §3.3).
 
+### Back and Home stopped working — the overlay buttons do nothing
+
+Most likely the accessibility service was silently disabled. A **force-stop** does not merely unbind
+it: on API 28 it *emptied* `enabled_accessibility_services` and reset `accessibility_enabled` to `0`,
+and nothing ever restored it. A crash loop, an OEM battery/memory manager, an app update, or someone
+pressing "Force stop" in Settings can all do this. On this console that means no navigation at all.
+
+Check first — the setting and the *bound* state are different things, and only the second one matters:
+
+```bash
+adb shell settings get secure enabled_accessibility_services
+adb shell settings get secure accessibility_enabled
+adb shell dumpsys accessibility | grep -o 'label=[^,]*'   # authoritative: is it actually bound?
+```
+
+`dumpsys accessibility` prints the service **label**, not the package, so grepping for the package
+name will wrongly look like a failure. If the label is absent, re-add the component using the
+surgical snippet in §3 (append, never overwrite — the list is shared with OEM services), then set
+`accessibility_enabled 1` and re-check `dumpsys`.
+
 ---
 
 ## 5. If the belt is moving and you cannot stop it

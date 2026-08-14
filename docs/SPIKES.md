@@ -76,6 +76,7 @@ What the emulator confirmed, and what it did not:
 | Stride can be set as HOME, and reverted | both work | **No** — GlassOS may lock HOME. S1 still required |
 | ADB survives a reboot | yes | **No** — emulator ADB is not the console's. Gate still required |
 | Accessibility service survives reboot, stays bound | yes | **Partly** — good sign for S10; OEM policy may differ |
+| Accessibility service survives a **force-stop** | **no** — setting is emptied, never restored | Likely; re-test on hardware |
 | Overlay auto-restarts at boot, stays foreground | yes | Partly, same caveat |
 | Edge swipe reveals the nav panel over a third-party app | yes | Partly — real apps are more hostile |
 | Back/Home/Recents act via accessibility | yes | Partly |
@@ -397,9 +398,31 @@ stutter and pushes the always-visible strip toward native Android views (PLAN.md
 - [ ] `GLOBAL_ACTION_BACK` reaches a **third-party app** (not just this app)
 - [ ] `GLOBAL_ACTION_RECENTS` works
 - [ ] **Survives a reboot** ← the real question
+- [ ] **Survives a force-stop / crash** ← see below, this one already failed once
 - [ ] Foreground package reporting works (bonus: improves media ownership tracking)
 
 **Result:** ______
 
 If this fails, Back has no alternative implementation for a non-system app and navigation degrades
 to Home-only. Record exactly how it failed.
+
+### A force-stop silently removes the service, and it does not come back
+
+Observed on the API 28 emulator. After `am force-stop io.stride.spikes`, Android did not merely
+unbind the service — it **emptied `enabled_accessibility_services` and set `accessibility_enabled`
+back to `0`**. The service stayed dead, and nothing restored it. Re-adding the component to the
+setting was required.
+
+Reboot survival and force-stop survival are therefore *different questions*, and the harness passing
+the first tells you nothing about the second. On a console with no physical Home or Back button this
+is a lockout: the overlay's buttons are the only navigation, and anything that force-stops Stride
+takes them away with no user-visible way back. Plausible triggers on real hardware include an OEM
+battery or memory manager, a crash loop, a user finding "Force stop" in Settings, and an app update.
+
+Things worth deciding before shipping, none of which are answered yet:
+
+- Can Stride detect that its own accessibility service is no longer enabled, and say so loudly on
+  the launcher rather than silently losing Back?
+- Is a Home-only degraded mode acceptable, given HOME is a real intent Stride can always receive as
+  the HOME activity, while BACK is not?
+- Does the console's firmware do this too, or does an OEM policy make it worse?
