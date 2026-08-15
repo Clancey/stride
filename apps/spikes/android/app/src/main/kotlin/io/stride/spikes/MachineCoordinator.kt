@@ -57,6 +57,12 @@ object MachineCoordinator {
     /** Gap between ramp steps. Short enough to feel immediate, long enough to be a ramp. */
     private const val STEP_INTERVAL_MS = 700L
 
+    /** Stops sent to clear a stale console session before a new workout. */
+    private const val MAX_CLEAR_ATTEMPTS = 3
+
+    /** Pause after a clearing stop, so the console's state read reflects it. */
+    private const val CLEAR_SETTLE_MS = 300L
+
     private const val MPH_TO_KPH = 1.609344
 
     /** The outcome of one command, as the UI should describe it. */
@@ -135,30 +141,53 @@ object MachineCoordinator {
      * can all leave a workout live. That case was found the hard way — the console sat in RUNNING
      * with every metric reading "Not measured", and refused every start until it was stopped.
      *
-     * Note the related discovery this encodes: GlassOS only publishes telemetry *during* a workout,
-     * so adopting an existing one is not merely tolerable, it is how metrics start flowing at all.
+     * Start means *start*. Stride only shows its Start control when it believes no workout is
+     * running, so a leftover console session is stale by definition and is cleared rather than
+     * carried forward. Resuming it instead — which is what this used to do from PAUSED — put the
+     * rider on the console's "resume or quit" prompt after tapping Start, which is not a start.
+     *
+     * The one exception is a belt that is genuinely moving: adopting that is the honest option,
+     * because stopping a live belt to start our own session is surprise motion, not safety. It also
+     * encodes a related discovery — GlassOS only publishes telemetry *during* a workout, so
+     * adopting a live one is how metrics start flowing at all.
      */
     fun startWorkout() = submit("Start workout") {
-        when (val state = it.workoutState()) {
-            GlassOsCommands.WORKOUT_RUNNING -> {
-                // Already moving. Adopting is the honest option: the rider is on a live belt, and
-                // stopping it to start our own would be a surprise motion, not a safety measure.
-                Log.i(TAG, "console already running; adopting the existing workout")
-                Outcome.Ok
+        val state = it.workoutState()
+        if (shouldAdoptWorkout(state, MachineLink.speedMph)) {
+            Log.i(TAG, "console already running with the belt moving; adopting the existing workout")
+            return@submit Outcome.Ok
+        }
+        clearWorkout(it, state)
+        it.startWorkout().toOutcome()
+    }
+
+    /**
+     * Stop whatever session the console is holding, so a new one may begin.
+     *
+     * Looped rather than sent once because the console walks through states on its way to idle: a
+     * paused session stops into results, and results has to be cleared in turn. Bounded, and abandoned
+     * the moment a stop stops changing anything, so a console that will not budge is left alone
+     * instead of hammered — StartNewWorkout is still attempted afterwards either way.
+     */
+    private fun clearWorkout(commands: GlassOsCommands, initial: Int?) {
+        var state = initial
+        var attempts = 0
+        while (state != null && state != GlassOsCommands.WORKOUT_IDLE && attempts < MAX_CLEAR_ATTEMPTS) {
+            Log.i(TAG, "console workout state $state before start; clearing it")
+            commands.stop()
+            attempts++
+            try {
+                Thread.sleep(CLEAR_SETTLE_MS)
+            } catch (t: InterruptedException) {
+                Thread.currentThread().interrupt()
+                return
             }
-            GlassOsCommands.WORKOUT_PAUSED -> {
-                Log.i(TAG, "console paused; resuming rather than starting")
-                it.resume().toOutcome()
+            val next = commands.workoutState()
+            if (next == state) {
+                Log.w(TAG, "console stayed in state $state after a stop; starting anyway")
+                return
             }
-            GlassOsCommands.WORKOUT_RESULTS -> {
-                Log.i(TAG, "console on results; clearing it before starting")
-                it.stop()
-                it.startWorkout().toOutcome()
-            }
-            else -> {
-                Log.i(TAG, "console workout state before start = $state")
-                it.startWorkout().toOutcome()
-            }
+            state = next
         }
     }
 
@@ -316,3 +345,20 @@ object MachineCoordinator {
     private fun format(v: Double): String =
         if (v == v.toInt().toDouble()) v.toInt().toString() else String.format("%.1f", v)
 }
+
+/**
+ * Whether a Start should adopt the console's existing workout instead of starting a new one.
+ *
+ * Only a belt that is actually moving is adopted. A console reporting RUNNING with the belt at rest
+ * is the stale-session case — a stop whose reply was lost, or a finished session the console never
+ * let go of — and adopting it hands the rider a workout that is already over, which is how tapping
+ * Start ended up on the console's "resume or quit" prompt. Every other state (paused, results, idle,
+ * or unknown) starts fresh.
+ *
+ * Pure, and separate from [MachineCoordinator], so the decision can be tested without a console.
+ */
+internal fun shouldAdoptWorkout(state: Int?, beltSpeedMph: Double?): Boolean =
+    state == GlassOsCommands.WORKOUT_RUNNING && (beltSpeedMph ?: 0.0) > BELT_MOVING_MPH
+
+/** Above this the belt is moving, rather than reporting rounding noise around a stop. */
+private const val BELT_MOVING_MPH = 0.1
