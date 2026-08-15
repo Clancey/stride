@@ -254,7 +254,21 @@ object MachineCoordinator {
      *
      * Returns the `ConsoleState` GlassOS answers with, or null if there was no usable answer.
      */
-    fun connectConsole(): Int? = commands?.connect()
+    fun connectConsole(): Int? {
+        val c = commands ?: return null
+        val state = c.connect()
+        // Refreshed here rather than only when the link is opened, because a handshake can run again
+        // long afterwards — the direct path re-runs it whenever the machine has dropped and come
+        // back — and the limits that came with it are the ones now in force. Applying them only at
+        // open meant a reconnected treadmill kept whatever ceiling the previous machine reported,
+        // or none at all if the first handshake never got that far.
+        //
+        // Null is a real answer meaning "this transport cannot say", not a failure to be ignored:
+        // GlassOS never reports a range, and passing its null through is what makes Stride's own
+        // fixed ceiling stand alone. See applyMachineLimits.
+        applyMachineLimits(c.limits())
+        return state
+    }
 
     /**
      * Begin a workout, reconciling with whatever the console is already doing.

@@ -210,9 +210,19 @@ object MachineLink {
     /**
      * What the direct handshake concluded, in a sentence fit to show a rider. Null on the GlassOS
      * path or before the attempt has finished.
+     *
+     * Read through from the session rather than cached here. The handshake runs from two places —
+     * [openDirect] when the link is first opened, and [DirectMachineCommands.connect] when it has
+     * dropped and come back — and a copy taken at the first would keep describing a failure the
+     * second had already fixed.
+     *
+     * [openFailure] covers the case the session cannot describe: there is no session, because no
+     * transport could be opened at all.
      */
-    @Volatile
-    var directDetail: String? = null
+    val directDetail: String?
+        get() = directSession?.lastConnect?.detail ?: openFailure
+
+    @Volatile private var openFailure: String? = null
         private set
 
     @Volatile private var inclinePresetsCache: List<Double>? = null
@@ -393,6 +403,20 @@ object MachineLink {
      * dropped rather than carried across, because a speed read from GlassOS is not evidence about a
      * direct link, and a stale reading is the one thing this object exists to prevent.
      */
+    /**
+     * Counts completed [retarget]s, so a caller can tell when a switch has actually landed.
+     *
+     * The switch is asynchronous — it closes a link, opens another, and runs a handshake that can
+     * take seconds on BLE — but the settings screen wants to show what the new transport found. It
+     * cannot simply re-read after the call returns, because at that moment nothing has happened yet.
+     * Bumped at the *end* of the work, so observing a change means the new link is fully open and
+     * every value derived from it is the new one.
+     */
+    private val retargetSeq = java.util.concurrent.atomic.AtomicInteger(0)
+
+    /** @see retargetSeq */
+    val retargetCount: Int get() = retargetSeq.get()
+
     fun retarget() {
         val app = appContext ?: return
         handler?.post {
@@ -405,6 +429,7 @@ object MachineLink {
             // backoff and the success TTL, so this attempt is never skipped as too-soon or
             // short-circuited by the previous transport's handshake.
             reconnect()
+            retargetSeq.incrementAndGet()
         }
     }
 
@@ -447,7 +472,7 @@ object MachineLink {
             null
         }
         if (transport == null) {
-            directDetail = DIRECT_NO_TRANSPORT
+            openFailure = DIRECT_NO_TRANSPORT
             MachineCoordinator.rebind(null)
             return
         }
@@ -465,14 +490,14 @@ object MachineLink {
         }
 
         if (result == null) {
-            directDetail = DIRECT_NO_ANSWER
+            openFailure = DIRECT_NO_ANSWER
             session.close()
             directSession = null
             MachineCoordinator.rebind(null)
             return
         }
 
-        directDetail = result.detail
+        openFailure = null
         direct = DirectMachineClient(session)
         // The machine's own ceiling, so the clamp becomes the intersection of ours and theirs.
         MachineCoordinator.applyMachineLimits(session.probe.limits)
@@ -484,7 +509,11 @@ object MachineLink {
         direct = null
         directSession?.let { runCatching { it.close() } }
         directSession = null
-        directDetail = null
+        openFailure = null
+        // Closed, not merely dropped. Clearing the field stops *future* work from finding it; the
+        // close is what stops work that is already in flight on another thread from finishing a
+        // call it started before the rider switched away. See GlassOsClient.close.
+        client?.let { runCatching { it.close() } }
         client = null
         snapshot = null
         snapshotAt = 0L
@@ -785,8 +814,15 @@ object MachineLink {
     /** The three things a rider can ask the machine to change. */
     enum class Control { SPEED, INCLINE, FAN }
 
-    /** Whether the direct handshake has completed and a session is bound. */
-    val directLinked: Boolean get() = directSession != null
+    /**
+     * Whether a machine actually answered the direct handshake.
+     *
+     * Not "is a session bound". A session is deliberately bound even when nothing answered, because
+     * that is what gives [DirectMachineCommands.connect] somewhere to retry from when the treadmill
+     * is powered on a minute later. Reporting that as linked would put "the treadmill answered" on
+     * the settings screen next to a treadmill that never did.
+     */
+    val directLinked: Boolean get() = directSession?.lastConnect?.connected == true
 
     /**
      * What the machine itself said it supports, for the settings screen to display.
@@ -800,11 +836,20 @@ object MachineLink {
      */
     fun directCapabilities(): Map<String, Any?>? {
         val session = directSession ?: return null
+        val limits = session.probe.limits
         return mapOf(
             "speed" to session.supports(Control.SPEED),
             "incline" to session.supports(Control.INCLINE),
             "fan" to session.supports(Control.FAN),
             "transport" to session.transportName,
+            // The machine's own range, read from MIN_KPH/MAX_KPH and MIN_GRADE/MAX_GRADE. This is
+            // the rider's answer to "what can this thing actually do", and it is worth showing
+            // because it is the strongest evidence the link is real: a plausible range means the
+            // frames are being decoded correctly, and a nonsense one means they are not.
+            "minSpeedMph" to limits?.minSpeedMph,
+            "maxSpeedMph" to limits?.maxSpeedMph,
+            "minIncline" to limits?.minInclinePercent,
+            "maxIncline" to limits?.maxInclinePercent,
         )
     }
 

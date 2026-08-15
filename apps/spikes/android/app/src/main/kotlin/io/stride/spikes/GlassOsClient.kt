@@ -101,6 +101,16 @@ class GlassOsClient(private val context: Context) {
         framed: ByteArray,
         readTimeoutSeconds: Long = 0,
     ): ByteArray? {
+        // Checked on every single call, not merely at construction, and this is the mechanism that
+        // makes "direct sends nothing to GlassOS" true rather than merely likely.
+        //
+        // Dropping the reference in MachineLink is not enough on its own. A handshake or command
+        // already in flight has its own reference on its own thread, captured before the rider
+        // switched, and it will happily finish the call it started — putting a Connect on the
+        // GlassOS socket moments after the rider asked for the machine to be driven directly.
+        // Narrowing that window with a re-check would leave a smaller window. Closing the client
+        // removes it: every captured reference becomes inert at the instant of the switch.
+        if (closed) return null
         val base = ensureClient() ?: return null
         // Reads keep the short default so a stalled console degrades to "no reading" instead of
         // freezing the overlay. Commands need longer: StartNewWorkout spins the machine up and
@@ -143,6 +153,19 @@ class GlassOsClient(private val context: Context) {
     }
 
     /** Perform a unary call with an empty request. Returns null on any failure. */
+    /**
+     * Make this client refuse all further traffic, permanently.
+     *
+     * One-way on purpose: a closed client is never reopened, it is replaced. Reopening would mean a
+     * reference captured before a switch could come back to life after a second switch, which is
+     * precisely the class of bug this exists to remove.
+     */
+    fun close() {
+        closed = true
+    }
+
+    @Volatile private var closed = false
+
     private fun call(service: String, method: String): GlassOsWire.Fields? =
         callRaw(service, method)?.let { GlassOsWire.parse(it) }
 
@@ -423,10 +446,16 @@ class GlassOsClient(private val context: Context) {
         fun beltMayBeMoving(name: String?): Boolean? = when (name) {
             "WORKOUT", "WARM_UP", "COOL_DOWN", "RESUME" -> true
             "IDLE", "PAUSED", "WORKOUT_RESULTS", "SAFETY_KEY_REMOVED", "LOCKED", "SLEEP" -> false
-            // DISCONNECTED, CONSOLE_STATE_UNKNOWN, DEMO, ERROR and anything unrecognised fall
-            // through to null on purpose. A demo routine can drive the belt, an errored console has
-            // not told us what it is doing, and a state this build does not know is by definition
-            // not one it can rule motion out from.
+            // DISCONNECTED is false, and it is the one entry on that line worth arguing about. It is
+            // not "I do not know what I am doing" — it is "there is no treadmill attached to me",
+            // which is a definite statement, and a console with nothing attached is not running a
+            // workout for us to worry about. It is grouped here rather than with the nulls below
+            // because the nulls mean "cannot say", and this one says.
+            DISCONNECTED_NAME -> false
+            // CONSOLE_STATE_UNKNOWN, DEMO, ERROR and anything unrecognised fall through to null on
+            // purpose. A demo routine can drive the belt, an errored console has not told us what it
+            // is doing, and a state this build does not know is by definition not one it can rule
+            // motion out from.
             else -> null
         }
     }

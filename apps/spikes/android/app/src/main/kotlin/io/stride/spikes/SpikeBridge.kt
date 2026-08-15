@@ -623,6 +623,10 @@ class SpikeBridge(private val context: Context) : MethodChannel.MethodCallHandle
             "directDetail" to MachineLink.directDetail,
             "directLinked" to MachineLink.directLinked,
             "directCapabilities" to MachineLink.directCapabilities(),
+            // Lets the screen tell "the switch has not run yet" from "it ran and found nothing".
+            // Without it, a re-read immediately after transportSet reports the *old* transport's
+            // findings, and the rider sees the previous link's capabilities under the new setting.
+            "retargetCount" to MachineLink.retargetCount,
         )
     }
 

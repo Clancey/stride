@@ -608,17 +608,45 @@ Progress is computed against the machine's own distance register, never integrat
 time. When the reading is stale or absent the ring shows `Not measured` and no arc. A confident
 wrong number about how far someone has run is worse than no number.
 
-### 3.10 Direct-machine protocol — a documented codec, deliberately unwired
+### 3.10 Direct machine access — a second transport, not a second app
 
-`docs/DIRECT_MACHINE_PROTOCOL.md` and `FitProCodec.kt` describe the FitPro2 register protocol the
-console itself speaks to the motor controller, below GlassOS. It settles a question that had been
-open since Revision 1: **distance is a register the machine reports (`CURRENT_DISTANCE`,
-`ACTUAL_DISTANCE`), not something the console integrates.**
+`docs/DIRECT_MACHINE_PROTOCOL.md`, `FitProCodec.kt`, `FitProTransport.kt`, `DirectMachine.kt`.
 
-It ships as a pure codec with **no transport and no callers**, and stays that way until the
-standing safety work in §3.1 exists to sit in front of it. The in-frame byte order and CRC are
-still unverified, and the endianness is genuinely mixed — speed big-endian, incline and distance
-little-endian — so this is documentation with tests, not a driver.
+Stride can drive the treadmill without GlassOS in the loop, speaking the FitPro register protocol
+to the motor controller itself over USB serial or BLE. The `transport` setting chooses; both paths
+are implementations of one interface, `MachineCommands`.
+
+This began as a bug in a sentence. The settings screen told riders that fan speed and incline would
+not work under direct access — and the setting was a no-op, so the controls were in fact live via
+GlassOS. False copy in the dangerous direction. Fixing it honestly meant building the thing the
+setting claimed to be.
+
+The wire format is **recovered from decompiled GlassOS 6.14.6, not guessed** — the register block
+is a bitmask, the checksum is a SUM8, the BLE envelope and chunking are BLE-only, and `CONNECT` is
+never sent because connecting is a handshake rather than a command. Seven specific claims in the
+previous revision of the protocol doc turned out to be wrong; they are listed there under
+"Corrections" because a wrong field id or endianness does not fail loudly, it produces a different
+valid command.
+
+Three decisions carry the design:
+
+- **The interface is the contract.** Anything the app can ask a machine is a method on
+  `MachineCommands`, including `connect()`, so nothing in the control path branches on which
+  transport is active. A test implements the interface purely so that adding a method to it breaks
+  the build until both transports answer.
+- **Isolation is structural.** In direct mode no `GlassOsClient` is constructed — not idle, absent
+  — so there is no socket, no credentials, and no startup `Connect`. `close()` is one-way and
+  checked before every send, so a reference captured before a transport switch cannot send after
+  it.
+- **The machine answers the capability questions.** The handshake's `DEVICE_INFO` reply carries the
+  console's supported-register mask, and `MIN_KPH`/`MAX_KPH`/`MIN_GRADE`/`MAX_GRADE` carry its
+  limits. What speeds and inclines are available is read from the treadmill, not from a table we
+  maintain — which is what makes the settings copy true by construction rather than by review.
+
+It also settles a question open since Revision 1: **distance is a register the machine reports
+(`CURRENT_DISTANCE`, `ACTUAL_DISTANCE`), not something the console integrates.**
+
+Not yet run against real hardware. What remains is a sanity readback, not a search.
 
 ### 3.11 Updates — how anything ever reaches a console again
 

@@ -194,6 +194,7 @@ class DirectMachineSession(
      * Blocking; call off the main thread.
      */
     fun connect(reference: FitProProbe.Reference? = null): ConnectResult = synchronized(wire) {
+        lastConnect = null
         deviceInfo = null
         supportedCommands = emptySet()
         fanRegister = null
@@ -204,7 +205,7 @@ class DirectMachineSession(
             supportedCommands = emptySet(),
             probe = FitProProbe.Result(FitProProbe.Stage.UNCONFIRMED, "no device answered"),
             detail = "No FitPro device answered on ${transport.name}.",
-        )
+        ).also { lastConnect = it }
 
         deviceInfo = info
         address = info.address
@@ -233,8 +234,21 @@ class DirectMachineSession(
             supportedCommands = supportedCommands,
             probe = probeResult,
             detail = describe(info, probeResult),
-        )
+        ).also { lastConnect = it }
     }
+
+    /**
+     * The outcome of the most recent [connect], so callers do not have to keep their own copy.
+     *
+     * They used to: [MachineLink] cached the detail string at the one place it ran the handshake.
+     * That was correct exactly once. The handshake is now also re-run from
+     * [DirectMachineCommands.connect] whenever the link has dropped and come back, and a cached
+     * copy would still be describing the session that failed — telling the rider the treadmill
+     * never answered while it is answering.
+     */
+    @Volatile
+    var lastConnect: ConnectResult? = null
+        private set
 
     /**
      * Ask `DEVICE_INFO` at each candidate address until one answers.
@@ -319,6 +333,7 @@ class DirectMachineSession(
 
     override fun close() {
         synchronized(wire) {
+            lastConnect = null
             probe.reset()
             deviceInfo = null
             supportedCommands = emptySet()
@@ -508,7 +523,7 @@ class DirectMachineClient(private val session: DirectMachineSession) {
 
         return GlassOsClient.Snapshot(
             consoleState = FitProValues.consoleStateName(mode),
-            workoutId = null,
+            workoutId = workoutInstanceId(mode),
             speedMph = speedMph,
             inclinePercent = response.value(FitProCodec.Register.ACTUAL_INCLINE)
                 ?.let(FitProCodec::decodeIncline),
@@ -524,6 +539,76 @@ class DirectMachineClient(private val session: DirectMachineSession) {
             fanLevel = fan?.let { response.value(it) }?.let { FitProValues.fanLevel(it) },
         )
     }
+
+    /**
+     * A stand-in for GlassOS's `workoutID`, which the hardware does not have.
+     *
+     * ## What GlassOS's version actually is
+     *
+     * Every metric response carries a `workoutID` in field 1 — decompiled as the constructor
+     * parameter `workoutInstanceID` on `xl.b`, the data point behind `GetSpeed`, `GetDistance`,
+     * `GetElapsedTime` and the rest. `am.j` builds those two ways and the difference is the whole
+     * meaning of the field: `p(workoutInstanceID, timeSeconds, value)` during a workout, and `q()`
+     * — which passes `CoreConstants.EMPTY_STRING` and a zero time — when there is not one.
+     *
+     * So the field is not a value Stride displays. It is a discriminator: **non-empty exactly when a
+     * workout instance exists.** That is what [GlassOsTelemetry.reading] uses it for, and it matters
+     * because proto3 omits zeros — a missing speed inside a workout is a measured 0.0, and the same
+     * missing speed outside one means nothing is measuring. Without this field those are identical
+     * on the wire.
+     *
+     * ## Why the direct path needs an equivalent at all
+     *
+     * The register protocol has no such ambiguity — a register either answered with bytes or did
+     * not — and it has no workout-instance register either; `sh/a` defines `WORKOUT_MODE` and
+     * `START_REQUESTED` and nothing resembling an instance id. So this could have been left null,
+     * and it was.
+     *
+     * Leaving it null is a parity gap even though nothing breaks today. `workoutId` is on the shared
+     * [GlassOsClient.Snapshot], and the obvious reading of a null there is "no workout is running" —
+     * which on the direct path would be a lie during every run. Any future caller that tests it, as
+     * [GlassOsTelemetry] already does, would silently get the wrong answer on one transport only.
+     * The transports must be answerable to the same questions.
+     *
+     * ## What this returns
+     *
+     * The same *meaning*, honestly synthesised rather than pretending to be iFit's identifier: a
+     * non-empty token while the console has a live workout instance, null when it does not, and a
+     * *new* token each time a workout begins — so a caller comparing two readings can tell a second
+     * run from a continuation of the first, which is the other thing an instance id is for.
+     *
+     * RESULTS counts as still belonging to the instance: the totals on screen are that workout's,
+     * and GlassOS keeps reporting them there too. IDLE, SLEEP, LOCKED and DEMO do not.
+     *
+     * ## Why UNKNOWN holds rather than clears
+     *
+     * [read] resolves a `WORKOUT_MODE` register that did not answer to `UNKNOWN`, so `UNKNOWN` is
+     * not a console state — it is a failed read. Clearing on it would end the instance every time
+     * one register dropped off a noisy link and mint a fresh token on the next good poll, turning a
+     * single run into two as far as any caller comparing tokens is concerned. So the three cases are
+     * distinct: a live mode mints or keeps, a mode that positively says no workout clears, and
+     * `UNKNOWN` holds whatever we last knew. This is the same rule as `!= false` elsewhere here —
+     * unknown is not refusal. It cannot fail open either: holding can only preserve an id we already
+     * had evidence for, never invent one.
+     */
+    private fun workoutInstanceId(mode: FitProCodec.WorkoutMode): String? {
+        synchronized(instanceLock) {
+            when {
+                mode in WORKOUT_MODES ->
+                    // Counted rather than random so it is reproducible in a log and in a test. It
+                    // only has to be distinct from the previous one, not globally unique.
+                    if (workoutInstance == null) {
+                        workoutInstance = "direct-${instanceCounter.incrementAndGet()}"
+                    }
+                mode == FitProCodec.WorkoutMode.UNKNOWN -> Unit
+                else -> workoutInstance = null
+            }
+            return workoutInstance
+        }
+    }
+
+    private val instanceLock = Any()
+    private var workoutInstance: String? = null
 
     /** This machine's own limits, or null until [FitProProbe] has read them. */
     fun limits(): MachineLimits? = session.probe.limits
@@ -543,6 +628,26 @@ class DirectMachineClient(private val session: DirectMachineSession) {
             FitProCodec.Register.ACTUAL_INCLINE,
             FitProCodec.Register.CURRENT_CALORIES,
         )
+
+        /**
+         * The console states that mean a workout instance exists.
+         *
+         * RESULTS is included: the numbers on screen still belong to the workout that just ended,
+         * and GlassOS keeps serving them there too, so a rider reading a final distance of zero
+         * because we had already declared the instance over would be a regression against iFit.
+         */
+        val WORKOUT_MODES: Set<FitProCodec.WorkoutMode> = setOf(
+            FitProCodec.WorkoutMode.RUNNING,
+            FitProCodec.WorkoutMode.PAUSE,
+            FitProCodec.WorkoutMode.PAUSE_OVERRIDE,
+            FitProCodec.WorkoutMode.WARM_UP,
+            FitProCodec.WorkoutMode.COOL_DOWN,
+            FitProCodec.WorkoutMode.RESUME,
+            FitProCodec.WorkoutMode.RESULTS,
+        )
+
+        /** Shared so two sessions in one process cannot mint the same instance id. */
+        val instanceCounter = java.util.concurrent.atomic.AtomicLong(0)
     }
 }
 
