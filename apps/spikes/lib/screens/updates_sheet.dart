@@ -87,16 +87,58 @@ class _UpdatesSheetState extends State<_UpdatesSheet> {
   /// Stride restarting itself is the one update with a consequence worth
   /// spelling out: the overlay goes down with the process, and the overlay is
   /// the only Back and Home this console has.
+  ///
+  /// It is also the one update where "what do I get for that" has an answer, so
+  /// the notes from the catalog are shown here rather than behind a link — this
+  /// console has no browser, and a rider deciding mid-session deserves to read
+  /// it in place.
   Future<bool?> _confirmSelfUpdate(AppstoreItem item) => showDialog<bool>(
     context: context,
     builder: (context) => AlertDialog(
       backgroundColor: StrideColors.panelRaised,
       title: const Text('Update Stride?'),
-      content: Text(
-        'Stride will close while it updates to ${item.availableVersionName}, '
-        'then start itself again. The workout HUD, Back, and Home are gone for '
-        'those few seconds.\n\n'
-        'Do this between workouts, not during one.',
+      content: SizedBox(
+        // Constrained because the notes are arbitrary length and a rider skipping
+        // several releases can receive a few of them at once. Unbounded, the
+        // dialog grows until the buttons leave the screen — on a console with no
+        // Back button, that is a dead end.
+        width: 520,
+        child: SingleChildScrollView(
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              Text(
+                'Stride will close while it updates to ${item.availableVersionName}, '
+                'then start itself again. The workout HUD, Back, and Home are gone for '
+                'those few seconds.\n\n'
+                'Do this between workouts, not during one.',
+              ),
+              // Absent for a catalog published before notes existed, or one whose
+              // generator produced nothing. Silence is better than an empty
+              // heading over blank space.
+              if (item.releaseNotes.isNotEmpty) ...[
+                const SizedBox(height: StrideSpace.lg),
+                const Divider(color: StrideColors.line, height: 1),
+                const SizedBox(height: StrideSpace.md),
+                Text(
+                  item.releaseNotes.length > 1
+                      ? "What's new since ${item.installedVersionName ?? 'your version'}"
+                      : "What's new",
+                  style: Theme.of(context).textTheme.titleSmall,
+                ),
+                const SizedBox(height: StrideSpace.xs),
+                for (final note in item.releaseNotes)
+                  _ReleaseNoteBlock(
+                    note: note,
+                    // One release needs no version heading: the dialog already
+                    // says which version this is.
+                    showVersion: item.releaseNotes.length > 1,
+                  ),
+              ],
+            ],
+          ),
+        ),
       ),
       actions: [
         TextButton(
@@ -286,6 +328,49 @@ class _StorePointer extends StatelessWidget {
       ),
     ],
   );
+}
+
+/// One version's notes inside the self-update dialog.
+///
+/// The text arrives already flattened to plain text by `tools/changelog.sh`, so
+/// there is deliberately no markdown rendering here — bullets are literal "•"
+/// characters in the string. Anything that needs richer formatting should be
+/// fixed in the generator, not parsed on the console.
+class _ReleaseNoteBlock extends StatelessWidget {
+  const _ReleaseNoteBlock({required this.note, required this.showVersion});
+
+  final ReleaseNote note;
+  final bool showVersion;
+
+  @override
+  Widget build(BuildContext context) {
+    final theme = Theme.of(context);
+    return Padding(
+      padding: const EdgeInsets.only(top: StrideSpace.sm),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          if (showVersion)
+            Text(
+              note.date == null
+                  ? note.versionName
+                  : '${note.versionName} · ${note.date}',
+              style: theme.textTheme.labelLarge?.copyWith(
+                color: StrideColors.accent,
+              ),
+            ),
+          Text(
+            note.notes,
+            style: theme.textTheme.bodyMedium?.copyWith(
+              color: StrideColors.textMuted,
+              height: 1.4,
+            ),
+          ),
+        ],
+      ),
+    );
+  }
 }
 
 class _SectionLabel extends StatelessWidget {

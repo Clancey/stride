@@ -388,4 +388,78 @@ class CatalogManifestTest {
         }
         assertTrue(e.message!!.contains("more than one bundle"))
     }
+
+    // ----------------------------------------------------------------- release notes
+
+    private val notesJson = """,
+        "releaseNotes": [
+          {"versionCode": 8, "versionName": "1.0.7", "date": "2026-08-14", "notes": "Older news"},
+          {"versionCode": 12, "versionName": "1.0.11", "date": "2026-08-15", "notes": "Newest news"},
+          {"versionCode": 9, "versionName": "1.0.8", "date": "2026-08-14", "notes": "Middle news"}
+        ]"""
+
+    private fun entryWithNotes(versionCode: Long = 12) =
+        CatalogManifest.parse(catalog(entryJson(versionCode = versionCode, extra = notesJson)))
+            .apps.single()
+
+    @Test
+    fun `release notes parse newest first regardless of catalog order`() {
+        // The console renders them in list order, so ordering is this parser's job rather than a
+        // property the generator is trusted to have got right.
+        assertEquals(
+            listOf(12L, 9L, 8L),
+            entryWithNotes().releaseNotes.map { it.versionCode },
+        )
+    }
+
+    @Test
+    fun `an entry with no release notes parses`() {
+        // Every catalog published before this field existed, and every third-party app in it.
+        assertTrue(CatalogManifest.parse(catalog(entryJson())).apps.single().releaseNotes.isEmpty())
+    }
+
+    @Test
+    fun `a malformed note is skipped rather than rejecting the catalog`() {
+        // Notes change what a rider is told, never what is installed. Throwing here would take the
+        // console's only update path down to protect some prose.
+        val json = """,
+            "releaseNotes": [
+              {"versionName": "1.0.9", "notes": "no version code"},
+              {"versionCode": 11, "notes": "   "},
+              "not an object",
+              {"versionCode": 12, "versionName": "1.0.11", "notes": "good"}
+            ]"""
+        val notes = CatalogManifest.parse(catalog(entryJson(extra = json))).apps.single().releaseNotes
+        assertEquals(1, notes.size)
+        assertEquals("good", notes.single().notes)
+    }
+
+    @Test
+    fun `notes newer than the installed version are the ones worth showing`() {
+        // The case this exists for: the catalog went from versionCode 9 to 12, so a console on 9
+        // is owed 12 and nothing else, while a console on 8 is owed both 9 and 12.
+        assertEquals(listOf(12L), entryWithNotes().notesNewerThan(9L).map { it.versionCode })
+        assertEquals(listOf(12L, 9L), entryWithNotes().notesNewerThan(8L).map { it.versionCode })
+    }
+
+    @Test
+    fun `a console already on the newest version is told nothing`() {
+        assertTrue(entryWithNotes().notesNewerThan(12L).isEmpty())
+    }
+
+    @Test
+    fun `notes above the served version are never advertised`() {
+        // A catalog serving 9 must not describe 12: the console cannot install it yet, so listing
+        // it promises a change the update will not deliver.
+        assertEquals(
+            listOf(9L),
+            entryWithNotes(versionCode = 9).notesNewerThan(8L).map { it.versionCode },
+        )
+    }
+
+    @Test
+    fun `an app that is not installed gets the newest note only`() {
+        // A first install has no backlog to catch up on; the whole history would just be noise.
+        assertEquals(listOf(12L), entryWithNotes().notesNewerThan(null).map { it.versionCode })
+    }
 }

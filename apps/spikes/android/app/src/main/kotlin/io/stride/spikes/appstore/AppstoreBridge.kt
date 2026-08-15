@@ -45,6 +45,17 @@ class AppstoreBridge(private val context: Context) {
                 "installedVersionName" to item.installedVersionName(),
                 "sizeBytes" to item.entry.sizeBytes,
                 "releaseNotesUrl" to item.entry.releaseNotesUrl,
+                // Only what this console has not read. A rider on versionCode 9 being offered 12
+                // gets 10, 11 and 12; a rider already on 12 gets nothing, rather than being shown
+                // the release they are running as if it were news.
+                "releaseNotes" to item.entry.notesNewerThan(item.installedVersionCode()).map { note ->
+                    mapOf(
+                        "versionCode" to note.versionCode,
+                        "versionName" to note.versionName,
+                        "date" to note.date,
+                        "notes" to note.notes,
+                    )
+                },
                 "iconUrl" to item.entry.iconUrl,
                 "ineligibleReason" to (item as? Ineligible)?.reason?.name?.lowercase(),
                 "stage" to (status?.stage ?: AppstoreState.Stage.IDLE).name.lowercase(),
@@ -263,6 +274,13 @@ class AppstoreBridge(private val context: Context) {
     private fun PlanItem.installedVersionName(): String? = when (this) {
         is UpdateAvailable -> installed.versionName
         is UpToDate -> installed.versionName
+        else -> null
+    }
+
+    /** Null when the app is not on the device, which is what tells the notes window to stand down. */
+    private fun PlanItem.installedVersionCode(): Long? = when (this) {
+        is UpdateAvailable -> installed.versionCode
+        is UpToDate -> installed.versionCode
         else -> null
     }
 }
