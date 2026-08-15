@@ -60,6 +60,7 @@ class SpikeBridge {
   static Future<bool> workoutPause() => _bool('workoutPause');
   static Future<bool> workoutResume() => _bool('workoutResume');
   static Future<int> workoutStop() => _int('workoutStop');
+  static Future<bool> workoutCancelStart() => _bool('workoutCancelStart');
   static Future<Map<String, dynamic>> volumeGet() => _map('volumeGet');
   static Future<bool> volumeSet(int level) =>
       _bool('volumeSet', {'level': level});

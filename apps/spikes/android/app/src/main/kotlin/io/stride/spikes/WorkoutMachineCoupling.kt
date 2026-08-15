@@ -1,5 +1,7 @@
 package io.stride.spikes
 
+import android.os.Handler
+import android.os.Looper
 import android.util.Log
 
 /**
@@ -20,10 +22,56 @@ object WorkoutMachineCoupling {
 
     private const val TAG = "WorkoutMachineCoupling"
 
+    /**
+     * How long a start may sit unanswered before we stop showing "Starting…" and give up.
+     *
+     * Sized to be longer than any answer we expect, not as a guess at how long a start takes: the
+     * console's own command timeout is 12s, and a start can spend one of those on the handshake
+     * before it spends another on the command itself. Anything past that is not slow, it is stuck.
+     *
+     * The point is not to be clever about the deadline. It is that there has to be one. Every path
+     * out of [WorkoutSession.State.STARTING] runs on an answer arriving, and an answer that never
+     * arrives would otherwise leave a rider looking at a disabled button with no way back.
+     */
+    private const val START_TIMEOUT_MS = 30_000L
+
+    private val watchdog = Handler(Looper.getMainLooper())
+
+    /**
+     * The pending expiry for the current attempt, if any.
+     *
+     * Held so it can be cancelled individually. Clearing the handler wholesale looked equivalent
+     * and was not: a late answer to an abandoned attempt would remove the *newer* attempt's
+     * watchdog on its way out, leaving the one state in the app that has no other way out of
+     * "Starting…" with nothing watching it.
+     */
+    private var pendingWatchdog: Runnable? = null
+
     @Volatile
     private var attached = false
 
     private var lastState = WorkoutSession.state
+
+    /**
+     * Which start attempt is current.
+     *
+     * A start is answered asynchronously, and by the time the answer lands the rider may have
+     * paused, ended, or started again. Reverting on a stale answer would tear down a session they
+     * are already using, so each attempt carries a token and only the newest one may roll back.
+     */
+    private var startToken = 0
+
+    /**
+     * Try to start again, after a start was refused.
+     *
+     * Nothing clever: the same path as the Start button. It exists because the alternative to
+     * offering a retry is deciding on the rider's behalf that their machine is unusable, and this
+     * app is in no position to make that call — a console can drop its link to the lower board and
+     * pick it back up, and the only way to find out is to ask it again.
+     */
+    fun retryStart() {
+        WorkoutSession.start()
+    }
 
     @Synchronized
     fun attach() {
@@ -48,6 +96,88 @@ object WorkoutMachineCoupling {
         MachineCoordinator.restoreFan(StrideSettings.fanState)
     }
 
+    /**
+     * What to do once the machine has answered a start.
+     *
+     * Stride's clock used to start regardless of the answer. On a console that had lost its link to
+     * the treadmill that produced the worst screen in the app: "Pause workout" over a stationary
+     * belt, the side rails dim because the machine was refusing setpoints, and the only trace of
+     * the refusal in a log line nobody standing on a treadmill can read. The clock now starts on
+     * the answer, so it can only ever run while the belt was actually told to move.
+     *
+     * A refusal is reported, not just swallowed, because the rider's next move depends on which one
+     * it was — a console with no machine attached is not something tapping Start again will fix.
+     */
+    private fun onStartSettled(token: Int, outcome: MachineCoordinator.Outcome) {
+        // Sampled together, under the lock that guards the token, so the answer cannot be judged
+        // against one attempt's identity and then applied to another's state.
+        val (stale, state) = synchronized(this) { (token != startToken) to WorkoutSession.state }
+        when (startSettlement(outcome, stale, state)) {
+            StartSettlement.IGNORE -> return
+
+            StartSettlement.STAND_DOWN -> clearWatchdog(token)
+
+            StartSettlement.CONFIRM -> {
+                clearWatchdog(token)
+                // The belt is moving, so this is the instant the workout began. Everything
+                // downstream — the clock, the goal, the media coupling — hangs off this transition.
+                WorkoutSession.confirmStart()
+                restoreFan()
+            }
+
+            StartSettlement.ABANDON -> {
+                clearWatchdog(token)
+                val detail = when (outcome) {
+                    is MachineCoordinator.Outcome.Rejected -> outcome.reason
+                    is MachineCoordinator.Outcome.Failed -> outcome.reason
+                    else -> ""
+                }
+                Log.w(TAG, "start refused by the machine; returning to idle: $detail")
+                WorkoutSession.abandon()
+                OverlayService.reportStartRefused(detail)
+            }
+        }
+    }
+
+    /**
+     * Arm the escape hatch for a start that may never be answered.
+     *
+     * On expiry this abandons rather than waits, which sends the coupling's stop on the way out —
+     * so if the start does land afterwards, the belt is told to stop right behind it. That ordering
+     * is the reason giving up is safe: the worst case is a machine that briefly starts and stops,
+     * not one that runs under a screen that has forgotten about it.
+     */
+    private fun armWatchdog(token: Int) {
+        val expiry = Runnable { onStartTimedOut(token) }
+        synchronized(this) {
+            pendingWatchdog?.let { watchdog.removeCallbacks(it) }
+            pendingWatchdog = expiry
+        }
+        watchdog.postDelayed(expiry, START_TIMEOUT_MS)
+    }
+
+    /**
+     * Disarm the watchdog, but only if it still belongs to [token].
+     *
+     * The token check is the whole point: a late answer must not take down the guard on an attempt
+     * that came after it.
+     */
+    private fun clearWatchdog(token: Int) {
+        val expiry = synchronized(this) {
+            if (token != startToken) return
+            pendingWatchdog.also { pendingWatchdog = null }
+        }
+        expiry?.let { watchdog.removeCallbacks(it) }
+    }
+
+    private fun onStartTimedOut(token: Int) {
+        val stale = synchronized(this) { token != startToken }
+        if (stale || WorkoutSession.state != WorkoutSession.State.STARTING) return
+        Log.w(TAG, "start was never answered after ${START_TIMEOUT_MS}ms; returning to idle")
+        WorkoutSession.abandon()
+        OverlayService.reportStartRefused("The treadmill did not answer.")
+    }
+
     private fun onTransition(next: WorkoutSession.State) {
         val previous = synchronized(this) {
             val state = lastState
@@ -57,13 +187,27 @@ object WorkoutMachineCoupling {
         try {
             when {
                 // Stop first and unconditionally. If the rider ends a workout we do not care what
-                // state we thought we were in; the belt must be told to stop.
-                next == WorkoutSession.State.IDLE && previous != WorkoutSession.State.IDLE ->
+                // state we thought we were in; the belt must be told to stop. This covers an
+                // abandoned start too: a refusal can be a reply that was lost rather than a command
+                // that never landed, so a belt that might be moving still gets told to stop.
+                next == WorkoutSession.State.IDLE && previous != WorkoutSession.State.IDLE -> {
+                    // Retire the attempt before anything else. Any answer still in flight belongs
+                    // to a start the rider has left behind, and the token is what tells the two
+                    // apart — without this bump a slow reply could land after a retry had begun and
+                    // be mistaken for that newer attempt's answer.
+                    val retired = synchronized(this) {
+                        ++startToken
+                        pendingWatchdog.also { pendingWatchdog = null }
+                    }
+                    retired?.let { watchdog.removeCallbacks(it) }
                     MachineCoordinator.stop()
+                }
 
-                previous == WorkoutSession.State.IDLE && next == WorkoutSession.State.RUNNING -> {
-                    MachineCoordinator.startWorkout()
-                    restoreFan()
+                previous == WorkoutSession.State.IDLE &&
+                    next == WorkoutSession.State.STARTING -> {
+                    val token = synchronized(this) { ++startToken }
+                    armWatchdog(token)
+                    MachineCoordinator.startWorkout { outcome -> onStartSettled(token, outcome) }
                 }
 
                 previous == WorkoutSession.State.RUNNING && next == WorkoutSession.State.PAUSED ->
@@ -77,5 +221,53 @@ object WorkoutMachineCoupling {
             // needs the clock and, more importantly, still needs the UI responsive.
             Log.w(TAG, "Machine coupling skipped after a workout state change.", t)
         }
+    }
+}
+
+/** What to do with a start the machine has answered. */
+internal enum class StartSettlement {
+    /** Not ours to act on. Leave every bit of state alone. */
+    IGNORE,
+
+    /** Ours, but there is nothing left to do beyond disarming the watchdog. */
+    STAND_DOWN,
+
+    /** The belt is moving. Start the clock. */
+    CONFIRM,
+
+    /** The machine did not start. Return to idle and tell the rider. */
+    ABANDON,
+}
+
+/**
+ * Decide what a settled start means, given the answer, whether it is stale, and where the session
+ * is now.
+ *
+ * Pulled out as a pure function because this is the lockout-critical decision in the app: it is the
+ * only thing standing between a rider and a screen stuck on "Starting…", and every branch of it
+ * has to be checkable without a treadmill. The two easy mistakes it exists to pin are acting on an
+ * answer that belongs to a previous attempt, and returning [IGNORE] for something that is ours —
+ * the latter would leave the watchdog armed as the only way out.
+ */
+internal fun startSettlement(
+    outcome: MachineCoordinator.Outcome,
+    stale: Boolean,
+    state: WorkoutSession.State,
+): StartSettlement {
+    // A stale answer belongs to an attempt the rider has already moved past. Acting on it would
+    // tear down a session they are using, and even standing down would disarm the newer attempt's
+    // watchdog — so this one really does touch nothing.
+    if (stale) return StartSettlement.IGNORE
+    // Answered after the rider cancelled, or after the watchdog gave up. Nothing to confirm and
+    // nothing to abandon — they are already where an abandon would have put them, and the stop that
+    // covers a belt which may have started anyway was sent on the way out of STARTING.
+    if (state != WorkoutSession.State.STARTING) return StartSettlement.STAND_DOWN
+    return when (outcome) {
+        is MachineCoordinator.Outcome.Ok -> StartSettlement.CONFIRM
+        // Superseded normally arrives *after* the transition that caused it, so the check above has
+        // already sent it home. Reaching here means the start was cancelled by something that did
+        // not move the session — and STARTING is the one state with no way out of its own accord,
+        // so it must be resolved rather than merely stopped watching.
+        else -> StartSettlement.ABANDON
     }
 }

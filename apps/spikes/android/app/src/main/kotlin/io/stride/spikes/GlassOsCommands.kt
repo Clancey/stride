@@ -152,6 +152,32 @@ class GlassOsCommands(private val client: GlassOsClient) {
     }
 
     /**
+     * Attach this client to the console, and report the state it comes back with.
+     *
+     * The step Stride was missing, and the reason a rebooted console ignored everything it was
+     * told. GlassOS does not hand out control of the machine just because a client can open a
+     * socket and present a certificate: until someone calls `Connect`, `GetConsoleState` reports
+     * DISCONNECTED, `GetConsole` returns nothing, `CanWrite` is false, and every RPC that would
+     * move the belt blocks until it times out. Reads that do not need the machine — cached console
+     * info, fan state — answer instantly throughout, which is what made the fault look like a
+     * broken treadmill rather than a missing handshake.
+     *
+     * It looked like it worked before only because the console's own iFit app connects when it
+     * starts, and Stride inherited that. A console that boots straight into Stride never gets it,
+     * which is exactly the case the rider hit after a reboot.
+     *
+     * Returns the `ConsoleState` from the reply, or null if the call itself failed. Safe to call
+     * repeatedly: an already-connected console just answers with its current state.
+     */
+    fun connect(): Int? =
+        client.postRaw("ConsoleService", "Connect", GlassOsWire.EMPTY_FRAME, COMMAND_TIMEOUT_S)
+            ?.let { raw ->
+                val fields = GlassOsWire.parse(raw)
+                interpretConnectionResult(fields)
+                    ?: null.also { Log.w(TAG, "ConsoleService/Connect: ${fields.errorDetail()}") }
+            }
+
+    /**
      * The console's own workout state, as a raw `WorkoutState` enum number.
      *
      * A read, not a command, but it lives here because it is only ever needed to explain why a
@@ -200,4 +226,26 @@ class GlassOsCommands(private val client: GlassOsClient) {
          */
         const val COMMAND_TIMEOUT_S = 12L
     }
+}
+
+/**
+ * Read the `ConsoleState` out of a `ConnectionResult`.
+ *
+ * `ConnectionResult` is a oneof: field 1 an `IFitError`, field 2 the state. Null means the console
+ * refused to attach, and is deliberately distinct from returning DISCONNECTED — one is "the
+ * handshake failed", the other is "the handshake worked and the answer is that nothing is
+ * attached", and a retry loop that confused the two would either give up or spin.
+ *
+ * The zero case is the trap this encodes: DISCONNECTED is 0, proto3 omits zero, so a successful
+ * Connect against a machineless console is an *empty* message. Absent therefore means DISCONNECTED
+ * here, not "no answer".
+ *
+ * Pure, and separate from [GlassOsCommands], so the decode can be tested against bytes captured
+ * from a real console without one attached.
+ */
+internal fun interpretConnectionResult(fields: GlassOsWire.Fields): Int? {
+    // Field 1 present is the error arm. Nothing is logged here: this stays pure so it can be
+    // tested against real captured bytes, and the caller has the context worth logging anyway.
+    if (fields.hasField(1)) return null
+    return fields.enum(2) ?: GlassOsClient.ConsoleState.DISCONNECTED
 }

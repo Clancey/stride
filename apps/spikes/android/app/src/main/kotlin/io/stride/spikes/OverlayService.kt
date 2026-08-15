@@ -114,6 +114,44 @@ class OverlayService : Service() {
             active?.let { svc -> svc.mainHandler.post { svc.rebuildChromeViews() } }
         }
 
+        /**
+         * Tell the rider their workout did not start, why, and what they can still do.
+         *
+         * A card rather than a toast, and unconditional rather than best-effort: the belt not
+         * moving is the one thing on this overlay nobody should have to infer. Before this, a
+         * refused start left the UI showing "Pause workout" over a stationary belt, and the only
+         * record of the refusal was a log line.
+         *
+         * It offers a retry rather than just an apology, and the retry goes all the way to the
+         * console. A head unit can drop its link to the lower board and get it back, and Stride's
+         * own opinion about that link is never allowed to be the thing that stops a rider from
+         * asking their treadmill to move.
+         *
+         * A no-op when no overlay is up, because there is then no rider looking at one. The state
+         * has already been rolled back by [WorkoutMachineCoupling] either way, so nothing depends
+         * on this being seen.
+         */
+        fun reportStartRefused(detail: String) {
+            val svc = active ?: return
+            svc.mainHandler.post {
+                svc.showFixIt(
+                    title = "The treadmill didn't start",
+                    body = if (MachineLink.consoleDetached) {
+                        MachineLink.CONSOLE_DETACHED_NOTICE
+                    } else {
+                        "The console refused to start a workout, so Stride's timer has been put " +
+                            "back. A stop was sent as well, in case the treadmill got the start " +
+                            "after all."
+                    },
+                    where = detail.takeIf { it.isNotBlank() },
+                    actionLabel = "Try again",
+                    dismissLabel = "Not now",
+                ) {
+                    WorkoutMachineCoupling.retryStart()
+                }
+            }
+        }
+
         // v2: Android freezes a channel's importance at creation time, so raising this from MIN to
         // LOW needs a new id to reach consoles that already ran an older build.
         private const val CHANNEL_ID = "stride_overlay_v2"
@@ -428,7 +466,15 @@ class OverlayService : Service() {
             view.setTextSize(TypedValue.COMPLEX_UNIT_SP, if (blank) entry.blankSize else entry.valueSize)
             view.setTextColor(if (blank) entry.blankColor else entry.valueColor)
         }
-        machineNoticeView?.text = MachineLink.metricsNotice
+        machineNoticeView?.let { notice ->
+            notice.text = MachineLink.metricsNotice
+            // An error has to read like one. In the normal case this line is a quiet reminder about
+            // the safety key; when the console has lost the treadmill it is the only thing on
+            // screen saying so, and parchment-on-black is not how you say "nothing will move".
+            notice.setTextColor(
+                if (MachineLink.consoleDetached) Color.rgb(255, 138, 128) else Color.rgb(238, 226, 202),
+            )
+        }
         trackFloorView?.progress = lapProgress()
         goalRingView?.let { applyGoalRing(it) }
         refreshNowPlaying()
@@ -671,6 +717,23 @@ class OverlayService : Service() {
                 endTransportButton?.visibility = View.GONE
             }
 
+            WorkoutSession.State.STARTING -> {
+                // Says what is actually happening, and stays tappable as a cancel. A disabled
+                // button here would be the app telling a rider standing on a treadmill to wait
+                // with no way out, and the belt may be about to move — reaching for the screen to
+                // call it off is exactly what they should be able to do.
+                configureActionText(
+                    primary,
+                    label = "Starting…",
+                    primary = true,
+                    enabled = true,
+                ) {
+                    WorkoutSession.abandon()
+                    lastGesture = "start cancelled"
+                }
+                endTransportButton?.visibility = View.GONE
+            }
+
             WorkoutSession.State.RUNNING -> {
                 configureActionText(
                     primary,
@@ -826,6 +889,7 @@ class OverlayService : Service() {
         body: String,
         where: String?,
         actionLabel: String,
+        dismissLabel: String? = "Not now",
         onAction: () -> Unit,
     ) {
         dismissFixIt()
@@ -872,7 +936,9 @@ class OverlayService : Service() {
                     LinearLayout.LayoutParams.MATCH_PARENT,
                     LinearLayout.LayoutParams.WRAP_CONTENT,
                 ).apply { topMargin = dp(24f) }
-                addView(menuAction("Not now") { dismissFixIt() })
+                addView(menuAction("Not now") { dismissFixIt() }.apply {
+                    if (dismissLabel == null) visibility = View.GONE else text = dismissLabel
+                })
                 addView(
                     menuAction(actionLabel) {
                         dismissFixIt()

@@ -27,7 +27,19 @@ import android.os.SystemClock
  */
 object WorkoutSession {
 
-    enum class State { IDLE, RUNNING, PAUSED }
+    /**
+     * IDLE → STARTING → RUNNING ⇄ PAUSED → IDLE.
+     *
+     * [STARTING] is the rider's intent, recorded before the machine has agreed to it. It exists
+     * because Stride used to go straight to RUNNING and start counting the moment the button was
+     * pressed, which on a console that took ten seconds to answer produced a screen that said
+     * "Pause workout" over a stationary belt and then banked ten seconds of standing still as
+     * exercise. Neither half of that is something the app is entitled to claim.
+     *
+     * The clock does not run in STARTING. That is the whole point of the state: it is honest about
+     * having asked and not yet been answered.
+     */
+    enum class State { IDLE, STARTING, RUNNING, PAUSED }
 
     private val listeners = mutableListOf<(State) -> Unit>()
 
@@ -47,11 +59,31 @@ object WorkoutSession {
         if (state == State.RUNNING) accumulatedMs + (SystemClock.elapsedRealtime() - runningSinceMs)
         else accumulatedMs
 
-    /** Starts a fresh session. No-op if one is already in progress. */
+    /**
+     * Ask for a fresh session. No-op if one is already in progress.
+     *
+     * Lands in [STARTING], not RUNNING: the rider has asked, and nothing has agreed yet. The clock
+     * begins at [confirmStart], so the first second counted is a second the belt was actually
+     * turning.
+     */
     @Synchronized
     fun start() {
         if (state != State.IDLE) return
         accumulatedMs = 0L
+        runningSinceMs = 0L
+        transition(State.STARTING)
+    }
+
+    /**
+     * The machine agreed. Begin counting, from this instant.
+     *
+     * Separate from [start] so the gap between asking and being answered belongs to nobody: it is
+     * not exercise, and it is not paused time either. A console that takes a moment to spin up
+     * costs the rider nothing.
+     */
+    @Synchronized
+    fun confirmStart() {
+        if (state != State.STARTING) return
         runningSinceMs = SystemClock.elapsedRealtime()
         transition(State.RUNNING)
     }
@@ -88,6 +120,26 @@ object WorkoutSession {
         WorkoutGoal.clear()
         transition(State.IDLE)
         return total
+    }
+
+    /**
+     * Give up a session that never really began, and return to IDLE.
+     *
+     * Distinct from [stop] in the one way that matters to the rider: the goal survives. A start the
+     * machine refused is not a workout they completed, and wiping the target they set moments
+     * earlier would punish them for the treadmill's failure. The banked time is discarded, because
+     * there was nothing to bank.
+     *
+     * Listeners still fire, and the machine coupling still sends its stop. That is deliberate. The
+     * refusal we are reacting to may be a reply that was lost rather than a command that never
+     * landed, and a belt that might be moving must be told to stop either way.
+     */
+    @Synchronized
+    fun abandon() {
+        if (state == State.IDLE) return
+        accumulatedMs = 0L
+        runningSinceMs = 0L
+        transition(State.IDLE)
     }
 
     @Synchronized

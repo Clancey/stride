@@ -77,7 +77,12 @@ object MachineCoordinator {
     /** Compared by identity in [drain], so it must be the exact string the stop job carries. */
     private const val STOP_LABEL = "Stop"
 
-    private data class Job(val generation: Int, val label: String, val run: () -> Outcome)
+    private data class Job(
+        val generation: Int,
+        val label: String,
+        val onDone: ((Outcome) -> Unit)? = null,
+        val run: () -> Outcome,
+    )
 
     private val queue = LinkedBlockingDeque<Job>()
     private val generation = AtomicInteger(0)
@@ -134,6 +139,17 @@ object MachineCoordinator {
     // ------------------------------------------------------------- commands
 
     /**
+     * Attach the console to its machine, synchronously, on the caller's thread.
+     *
+     * Not queued behind the worker: this is what [MachineLink] calls from its poll when the console
+     * says nothing is attached, and putting it in the command queue would mean a handshake could sit
+     * behind commands that cannot possibly succeed until the handshake has happened.
+     *
+     * Returns the `ConsoleState` GlassOS answers with, or null if there was no usable answer.
+     */
+    fun connectConsole(): Int? = commands?.connect()
+
+    /**
      * Begin a workout, reconciling with whatever the console is already doing.
      *
      * A bare StartNewWorkout is only valid from an idle console, and on real hardware it very often
@@ -151,13 +167,45 @@ object MachineCoordinator {
      * encodes a related discovery — GlassOS only publishes telemetry *during* a workout, so
      * adopting a live one is how metrics start flowing at all.
      */
-    fun startWorkout() = submit("Start workout") {
+    fun startWorkout(onDone: ((Outcome) -> Unit)? = null) = submit("Start workout", onDone = onDone) {
+        val gen = generation.get()
+        // Connect first, always. It is cheap on a console that is already attached — it just
+        // answers with the current state — and it is the difference between working and not on one
+        // that is not. A rider pressing Start is the one moment we know they want the machine, so
+        // this is the right place to make sure GlassOS has actually given it to us.
+        //
+        // Routed through MachineLink rather than straight to the wire so this shares the poll's
+        // handshake: a start arriving just after one attached returns immediately instead of
+        // repeating it, and a start arriving during one waits for that answer rather than racing it.
+        // The snapshot cannot be used to skip this — it is up to a poll interval stale.
+        val connected = MachineLink.connectNow()
+        if (!connected.attached) {
+            // Fail here rather than pressing on. Every command below would go on to block for the
+            // full timeout and then fail anyway, turning a refusal we already know about into most
+            // of a minute of the rider watching a spinner. This is not the app overruling the
+            // console: we asked the hardware, just now, and it told us — either by saying it has no
+            // machine, or by not answering at all.
+            return@submit Outcome.Failed(
+                if (connected is MachineLink.ConnectResult.Disconnected) {
+                    "The console has no treadmill attached."
+                } else {
+                    "The console did not answer."
+                },
+            )
+        }
         val state = it.workoutState()
         if (shouldAdoptWorkout(state, MachineLink.speedMph)) {
             Log.i(TAG, "console already running with the belt moving; adopting the existing workout")
             return@submit Outcome.Ok
         }
         clearWorkout(it, state)
+        // Re-checked immediately before the one command here that can set the belt in motion.
+        // Everything above blocks — the handshake, the state read, and the clearing loop each wait
+        // on the console — so by now the rider may have cancelled, or the start watchdog may have
+        // given up and put the UI back to idle. Starting anyway would move a treadmill under a
+        // screen that shows no workout. The stop that follows a cancel would catch it a moment
+        // later, but a moment is exactly what must not happen on a machine someone is standing on.
+        if (generation.get() != gen) return@submit Outcome.Superseded
         it.startWorkout().toOutcome()
     }
 
@@ -290,10 +338,15 @@ object MachineCoordinator {
 
     // -------------------------------------------------------------- plumbing
 
-    private fun submit(label: String, delayMs: Long = 0L, run: (GlassOsCommands) -> Outcome) {
+    private fun submit(
+        label: String,
+        delayMs: Long = 0L,
+        onDone: ((Outcome) -> Unit)? = null,
+        run: (GlassOsCommands) -> Outcome,
+    ) {
         val gen = generation.get()
         queue.addLast(
-            Job(gen, label) {
+            Job(gen, label, onDone) {
                 if (delayMs > 0) {
                     try {
                         Thread.sleep(delayMs)
@@ -305,6 +358,12 @@ object MachineCoordinator {
                 // Re-checked after the sleep as well as before dequeue: a stop during the gap
                 // between ramp steps must cancel the rest of the climb.
                 if (generation.get() != gen) return@Job Outcome.Superseded
+                // Deliberately not short-circuited on [MachineLink.consoleDetached]. Refusing here
+                // without touching the wire would be faster, but it also makes the app's own
+                // reading of the console the thing that decides whether a rider may use their
+                // treadmill — and a single stale or wrong poll would then lock them out with no
+                // way to overrule it. The console gets asked every time; a detached one answers by
+                // timing out, and that failure is now shown with a retry rather than swallowed.
                 val c = commands ?: return@Job Outcome.Failed("No link to the console")
                 run(c)
             },
@@ -332,6 +391,16 @@ object MachineCoordinator {
             lastLabel = job.label
             lastOutcome = outcome
             if (outcome !is Outcome.Superseded) Log.i(TAG, "${job.label} -> $outcome")
+            // Before the general listeners, and individually guarded: this is how a caller learns
+            // its own command failed, and a caller that throws must not cost every other listener
+            // its notification.
+            job.onDone?.let {
+                try {
+                    it(outcome)
+                } catch (t: Throwable) {
+                    Log.w(TAG, "${job.label} completion handler failed", t)
+                }
+            }
             notifyListeners()
         }
     }

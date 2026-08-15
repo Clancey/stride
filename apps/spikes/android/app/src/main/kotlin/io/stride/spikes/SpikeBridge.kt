@@ -141,6 +141,7 @@ class SpikeBridge(private val context: Context) : MethodChannel.MethodCallHandle
                 "workoutPause" -> result.success(workoutPause())
                 "workoutResume" -> result.success(workoutResume())
                 "workoutStop" -> result.success(workoutStop())
+                "workoutCancelStart" -> result.success(workoutCancelStart())
                 "volumeGet" -> result.success(systemAudio.snapshot())
                 "volumeSet" -> result.success(volumeSet(call))
                 "machineSnapshot" -> result.success(machineSnapshot())
@@ -582,6 +583,19 @@ class SpikeBridge(private val context: Context) : MethodChannel.MethodCallHandle
     }
 
     private fun workoutStop(): Int = WorkoutSession.stop().toChannelInt()
+
+    /**
+     * Call off a start that has not been answered yet.
+     *
+     * Distinct from [workoutStop] in the way that matters to the rider: the goal they set survives.
+     * A start the treadmill never acknowledged is not a workout they completed, so wiping their
+     * target would punish them for the machine being slow.
+     */
+    private fun workoutCancelStart(): Boolean {
+        if (WorkoutSession.state != WorkoutSession.State.STARTING) return false
+        WorkoutSession.abandon()
+        return true
+    }
 
     private fun volumeSet(call: MethodCall): Boolean {
         val level = call.argument<Number>("level")?.toInt() ?: return false

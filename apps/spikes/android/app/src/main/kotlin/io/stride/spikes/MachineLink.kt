@@ -3,6 +3,8 @@ package io.stride.spikes
 import android.content.Context
 import android.os.Handler
 import android.os.HandlerThread
+import android.os.SystemClock
+import android.util.Log
 
 /**
  * Everything Stride knows about the physical machine.
@@ -68,6 +70,28 @@ object MachineLink {
         "The treadmill won't change speed or incline until a workout is running. Start one first."
 
     /**
+     * What a control says when GlassOS is answering but has no machine attached to it.
+     *
+     * Its own state, not a guess: the console reports [GlassOsClient.ConsoleState.DISCONNECTED]
+     * and every RPC that would move something blocks until it times out. Distinct from
+     * [CONTROL_LOCKED_NOTICE] because the fix is different — nothing about Stride or the app will
+     * recover this, only the machine coming back will.
+     */
+    const val CONSOLE_DETACHED_NOTICE: String =
+        "The console has lost its connection to the treadmill. Nothing can reach the belt until " +
+            "the machine is power-cycled at the wall."
+
+    /**
+     * The sentence to show for a console with no machine behind it.
+     *
+     * Deliberately not the "not linked yet" wording: Stride *is* linked, to a daemon that has
+     * nothing to command, and sending a rider to check the app is sending them to the wrong place.
+     */
+    const val CONSOLE_DETACHED_REASON: String =
+        "GlassOS is answering, but the console reports no treadmill attached. Speed, incline and " +
+            "the belt itself are unreachable until the machine is power-cycled at the wall."
+
+    /**
      * The safety sentence to print beside a metric readout, chosen by what is actually true.
      *
      * Printing [CANNOT_READ_NOTICE] next to live numbers would be a visible contradiction, and the
@@ -75,9 +99,10 @@ object MachineLink {
      * the hard case. When we can read, the honest warning is the one about *control*.
      */
     val metricsNotice: String
-        get() = when (status) {
-            Status.LINKED -> SAFETY_KEY_NOTICE
-            Status.DISCONNECTED -> CANNOT_READ_NOTICE
+        get() = when {
+            consoleDetached -> CONSOLE_DETACHED_NOTICE
+            status == Status.LINKED -> SAFETY_KEY_NOTICE
+            else -> CANNOT_READ_NOTICE
         }
 
     enum class Status {
@@ -96,6 +121,60 @@ object MachineLink {
 
     /** How long a reading stays believable after the last successful poll. */
     private const val FRESHNESS_MS = 4_000L
+
+    /** Log tag. */
+    private const val TAG = "MachineLink"
+
+    /**
+     * How long a successful handshake is taken at its word.
+     *
+     * Short, because it is not a cache of the console's state — it is a guard against two callers
+     * racing to shake hands with the same daemon in the same breath. The poll learns a connect
+     * succeeded on its next pass at most two seconds later; until then a start arriving would
+     * otherwise issue a second, redundant handshake and queue behind the first.
+     */
+    private const val CONNECT_SUCCESS_TTL_MS = 2_000L
+
+    /**
+     * What a console handshake produced.
+     *
+     * Typed rather than a nullable state code because three of these were previously conflated as
+     * "not null, so we are attached", and the difference between them is the difference between a
+     * treadmill that starts and one that hangs for a minute before refusing.
+     */
+    sealed class ConnectResult {
+        /** GlassOS handed over a console, in this state. */
+        data class Attached(val state: Int) : ConnectResult()
+
+        /** GlassOS answered, and has no machine to give us. */
+        object Disconnected : ConnectResult()
+
+        /** GlassOS did not answer at all: not running, not listening, or timed out. */
+        object NoAnswer : ConnectResult()
+
+        /** Skipped, because a handshake attached moments ago and still stands. */
+        object AttachedRecently : ConnectResult()
+
+        /** True when the console is ours to command. */
+        val attached: Boolean
+            get() = this is Attached || this is AttachedRecently
+    }
+
+    @Volatile private var connectFailures: Int = 0
+    @Volatile private var nextConnectAt: Long = 0L
+    @Volatile private var lastAttachedAt: Long = 0L
+
+    /**
+     * Whether a handshake is already queued or running.
+     *
+     * Without this the poll posts a fresh attempt every two seconds while one is blocked, and a
+     * handshake against a console that is not answering blocks for twelve. The queue grows faster
+     * than it drains, and the rider's Start — which shares this lock — ends up waiting behind a
+     * backlog of attempts that were all asking the same question.
+     */
+    @Volatile private var connectInFlight: Boolean = false
+
+    private val connectLock = Any()
 
     /**
      * Metres per second to miles per hour. GlassOS reports speed presets as MPS
@@ -116,6 +195,9 @@ object MachineLink {
     private var thread: HandlerThread? = null
     private var handler: Handler? = null
 
+    private var connectThread: HandlerThread? = null
+    private var connectHandler: Handler? = null
+
     /** Null unless we hold a snapshot that is still fresh. Every reading below goes through this. */
     private fun fresh(): GlassOsClient.Snapshot? {
         val s = snapshot ?: return null
@@ -124,7 +206,17 @@ object MachineLink {
     }
 
     val status: Status
-        get() = if (fresh() != null) Status.LINKED else Status.DISCONNECTED
+        get() = if (fresh() != null && !consoleDetached) Status.LINKED else Status.DISCONNECTED
+
+    /**
+     * True when a *fresh* read says the daemon has no machine attached.
+     *
+     * Positive knowledge only. This is the console explicitly reporting DISCONNECTED, never an
+     * absent reply or a stale snapshot, because [MachineCoordinator] refuses commands on it and a
+     * missed poll must not be allowed to lock a rider out of their own belt.
+     */
+    val consoleDetached: Boolean
+        get() = fresh()?.consoleState == GlassOsClient.ConsoleState.DISCONNECTED_NAME
 
     /**
      * Why we are in this state, in words a person on the machine can act on — not an error code.
@@ -133,11 +225,12 @@ object MachineLink {
      * send a rider to the console for something they can do under their thumb.
      */
     val reason: String
-        get() = when (status) {
-            Status.LINKED ->
+        get() = when {
+            consoleDetached -> CONSOLE_DETACHED_REASON
+            status == Status.LINKED ->
                 "Stride is linked to this machine. " +
                     "Speed, incline and fan respond here or on the console."
-            Status.DISCONNECTED -> DISCONNECTED_REASON
+            else -> DISCONNECTED_REASON
         }
 
     /**
@@ -225,7 +318,24 @@ object MachineLink {
         thread = t
         val h = Handler(t.looper)
         handler = h
+        // A second thread purely for the console handshake. Connect against a console with nothing
+        // attached blocks for the full command timeout, and doing that on the poll thread would
+        // stop telemetry for twelve seconds at a stretch — long enough for every reading to go
+        // stale and the whole top strip to fall back to "Not measured" on a machine that is
+        // running fine. The poll must never wait for the recovery of something it only reports on.
+        val c = HandlerThread("machine-connect").also { it.start() }
+        connectThread = c
+        connectHandler = Handler(c.looper)
         h.post(poll)
+        // Shake hands immediately, in parallel with the first poll rather than after it.
+        //
+        // This is the difference between a treadmill that starts when the rider presses Start and
+        // one that starts ten seconds later. GlassOS hands over machine control only to a client
+        // that has called Connect, and there is nothing to learn from a poll first: we have a
+        // client here, so this is the earliest moment the handshake can possibly go out. Waiting
+        // for a reading to come back and say "disconnected" only spent the rider's time confirming
+        // something we were going to do anyway.
+        reconnect()
     }
 
     fun detach() {
@@ -233,12 +343,25 @@ object MachineLink {
         thread?.quitSafely()
         thread = null
         handler = null
+        connectHandler?.removeCallbacksAndMessages(null)
+        connectThread?.quitSafely()
+        connectThread = null
+        connectHandler = null
         client = null
         snapshot = null
         snapshotAt = 0L
         inclinePresetsCache = null
         speedPresetsCache = null
         presetsFetched = false
+        synchronized(connectLock) {
+            connectFailures = 0
+            nextConnectAt = 0L
+            lastAttachedAt = 0L
+            // Any handshake still in flight belongs to a link that no longer exists. Clearing
+            // the flag here rather than waiting for it to finish means a re-attach is never
+            // blocked by the tail of the previous one.
+            connectInFlight = false
+        }
     }
 
     private val poll = object : Runnable {
@@ -257,11 +380,104 @@ object MachineLink {
                 // succeeded means the link is up, so this is the cheapest moment to try.
                 fetchPresetsOnce()
             }
+            if (read?.consoleState == GlassOsClient.ConsoleState.DISCONNECTED_NAME || read == null) {
+                // Also on a read that failed outright, not only on one that came back saying
+                // "disconnected". During boot GlassOS is not listening yet, so the read does not
+                // return an answer — it returns nothing at all, and treating that as "no news"
+                // meant waiting for the daemon to come up *and* for a poll to complete before the
+                // handshake was even attempted. A refused socket fails in about a millisecond, so
+                // retrying on it is nearly free and it is the case that catches GlassOS starting.
+                reconnect()
+            }
             // Poll faster while the machine says it may be moving. There is no reason to hammer a
             // console sitting idle, and no excuse for a laggy readout while someone is running.
             val moving = read?.let { GlassOsClient.ConsoleState.beltMayBeMoving(it.consoleState) }
             handler?.postDelayed(this, if (moving == true) 500L else 2_000L)
         }
+    }
+
+    /**
+     * Ask GlassOS to attach the console.
+     *
+     * Fired at [attach] and again from the poll whenever a reading says nothing is attached, or no
+     * reading comes back at all. Done repeatedly rather than once at startup because the console
+     * can lose the machine at any time — a reboot, a sleep, the iFit app disconnecting when it
+     * exits — and a rider should not have to know that the cure is to open a different app and come
+     * back.
+     *
+     * Runs on its own thread and never blocks the caller. Backed off by [RECONNECT_BACKOFF_MS], so
+     * a console with nothing behind it is not asked twelve seconds' worth of questions every two
+     * seconds. Failures are left to the next attempt: there is nothing to tell the rider that the
+     * machine cell is not already saying.
+     */
+    private fun reconnect() {
+        // Both guards matter, and they are different questions: "is one already running" and "is it
+        // too soon to ask again". Checking only the clock let every poll pile another attempt onto
+        // the connect thread while the first was still blocked.
+        synchronized(connectLock) {
+            if (connectInFlight) return
+            if (SystemClock.elapsedRealtime() < nextConnectAt) return
+            connectInFlight = true
+        }
+        val posted = connectHandler?.post {
+            try {
+                connectNow()
+            } finally {
+                synchronized(connectLock) { connectInFlight = false }
+            }
+        } ?: false
+        // A handler that has gone away (detached, or quitting) would otherwise leave the flag set
+        // and stop every future attempt.
+        if (!posted) synchronized(connectLock) { connectInFlight = false }
+    }
+
+    /**
+     * Perform the console handshake, and report the state it returned.
+     *
+     * Blocking, serialised, and shared by both callers that need a console attached: the poll's
+     * [reconnect] and the start path in [MachineCoordinator]. One entry point rather than two
+     * because they can otherwise fire within the same breath — the poll notices a disconnected
+     * console at the same moment the rider presses Start — and two handshakes racing on one daemon
+     * is strictly worse than one, since the second waits for the first and then repeats its work.
+     *
+     * A handshake that has just attached is taken at its word for [CONNECT_SUCCESS_TTL_MS]. The
+     * snapshot cannot answer this question: it is up to a poll interval old, so immediately after a
+     * successful connect it still reads DISCONNECTED and would send the rider's start into a
+     * pointless second handshake.
+     */
+    fun connectNow(): ConnectResult = synchronized(connectLock) {
+        val now = SystemClock.elapsedRealtime()
+        if (lastAttachedAt != 0L && now - lastAttachedAt < CONNECT_SUCCESS_TTL_MS) {
+            return ConnectResult.AttachedRecently
+        }
+        val state = try {
+            MachineCoordinator.connectConsole()
+        } catch (t: Throwable) {
+            Log.w(TAG, "console connect attempt failed", t)
+            null
+        }
+        // Timed from here, after the call returned, so a handshake that blocked for the full
+        // command timeout is not immediately followed by another.
+        val done = SystemClock.elapsedRealtime()
+        val result = when {
+            state == null -> ConnectResult.NoAnswer
+            // A reply of DISCONNECTED is GlassOS answering politely that it has nothing to give us.
+            // Counting it as success was the subtler half of the original bug: it reset the backoff
+            // and let a start march on into RPCs that can only block for the full timeout and fail.
+            // The call worked. The handshake did not.
+            state == GlassOsClient.ConsoleState.DISCONNECTED -> ConnectResult.Disconnected
+            else -> ConnectResult.Attached(state)
+        }
+        if (result is ConnectResult.Attached) {
+            lastAttachedAt = done
+            connectFailures = 0
+            nextConnectAt = 0L
+        } else {
+            connectFailures++
+            nextConnectAt = done + connectBackoffMs(connectFailures)
+        }
+        Log.i(TAG, "console Connect -> $result after ${done - now}ms")
+        result
     }
 
     /**
@@ -356,6 +572,32 @@ object MachineLink {
     fun canCommandFan(): Boolean = canCommand() && fanWritable != false
 
     /** Why a control is unavailable, in the words to show the rider who just tapped it. */
-    fun unavailableReason(): String =
-        if (canCommand()) CONTROL_NEEDS_WORKOUT_NOTICE else CONTROL_LOCKED_NOTICE
+    fun unavailableReason(): String = when {
+        consoleDetached -> CONSOLE_DETACHED_NOTICE
+        canCommand() -> CONTROL_NEEDS_WORKOUT_NOTICE
+        else -> CONTROL_LOCKED_NOTICE
+    }
+}
+
+/**
+ * Backoff between console connect attempts, in milliseconds, given how many have failed in a row.
+ *
+ * Measured from the *end* of the previous attempt, not the start, because a failed `Connect`
+ * against a console with nothing attached blocks for the full command timeout — timing from the
+ * start would mean the gap had already elapsed by the time we learned the answer, and we would
+ * retry in a tight loop.
+ *
+ * The front of this schedule is what makes a start feel instant. GlassOS finishes coming up at an
+ * unpredictable moment during boot, so what matters is not how often we ask but how soon after it
+ * becomes ready we ask again. A flat ten-second retry made the rider wait an average of five
+ * seconds and up to ten for a console that was ready the whole time; the first few hundred
+ * milliseconds here cost one cheap refused socket each and remove that wait entirely.
+ *
+ * The tail is what keeps it polite: a console that genuinely has nothing attached settles at eight
+ * seconds, so it is not asked twelve seconds' worth of questions every two seconds.
+ */
+internal fun connectBackoffMs(failures: Int): Long {
+    val schedule = longArrayOf(0L, 250L, 500L, 1_000L, 2_000L, 4_000L, 8_000L)
+    if (failures <= 0) return schedule[0]
+    return schedule[failures.coerceAtMost(schedule.size - 1)]
 }

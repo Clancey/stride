@@ -83,7 +83,8 @@ class _FakeWorkoutBridge implements WorkoutBridgeClient {
 
   @override
   Future<bool> workoutStart() async {
-    state = 'running';
+    // Mirrors the host: a start is a request, and the treadmill answers it later.
+    state = 'starting';
     return true;
   }
 
@@ -103,6 +104,13 @@ class _FakeWorkoutBridge implements WorkoutBridgeClient {
   Future<int> workoutStop() async {
     state = 'idle';
     return elapsedMs;
+  }
+
+  @override
+  Future<bool> workoutCancelStart() async {
+    if (state != 'starting') return false;
+    state = 'idle';
+    return true;
   }
 
   @override
@@ -138,6 +146,9 @@ class _ThrowingWorkoutBridge implements WorkoutBridgeClient {
 
   @override
   Future<int> workoutStop() async => _missing();
+
+  @override
+  Future<bool> workoutCancelStart() async => _missing();
 
   @override
   Future<WorkoutVolume> volumeGet() async => _missing();
