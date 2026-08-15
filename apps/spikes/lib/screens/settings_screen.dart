@@ -125,6 +125,11 @@ class _SettingsScreenState extends State<SettingsScreen>
                         setState(() => _advancedOpen = !_advancedOpen),
                     transport: _settings['transport'] as String? ?? 'glassos',
                     onTransport: _setTransport,
+                    directDetail: _settings['directDetail'] as String?,
+                    directLinked: _settings['directLinked'] as bool? ?? false,
+                    directCapabilities:
+                        (_settings['directCapabilities'] as Map?)
+                            ?.cast<String, dynamic>(),
                   ),
                 ],
               ),
@@ -164,9 +169,12 @@ class _SettingsScreenState extends State<SettingsScreen>
       backgroundColor: StrideColors.panelRaised,
       title: const Text('Turn on direct hardware access?'),
       content: const Text(
-        'This bypasses iFit and talks to the treadmill controller directly. '
-        'It is experimental and unfinished: nothing is connected behind it yet, '
-        'so speed, incline and fan will stop responding until you switch back.\n\n'
+        'This bypasses iFit and talks to the treadmill controller directly '
+        'over USB or Bluetooth.\n\n'
+        'It is experimental. Stride will ask the treadmill which controls it '
+        'has and only offer those, so what works depends on your machine — and '
+        'if nothing answers, speed, incline and fan stop responding until you '
+        'switch back.\n\n'
         'The safety key remains the only emergency stop either way.',
       ),
       actions: [
@@ -398,6 +406,9 @@ class _AdvancedSection extends StatelessWidget {
     required this.onToggle,
     required this.transport,
     required this.onTransport,
+    this.directDetail,
+    this.directLinked = false,
+    this.directCapabilities,
   });
 
   final bool open;
@@ -405,9 +416,42 @@ class _AdvancedSection extends StatelessWidget {
   final String transport;
   final ValueChanged<bool> onTransport;
 
+  /// What the handshake concluded, written for a rider. Null before it has run.
+  final String? directDetail;
+
+  /// Whether a direct session is actually bound right now.
+  final bool directLinked;
+
+  /// The machine's own answer about which controls it implements, or null if
+  /// it was never asked. Each value may itself be null, meaning "unknown".
+  final Map<String, dynamic>? directCapabilities;
+
+  /// What to say about the direct path.
+  ///
+  /// Every branch reports something that has actually been established rather
+  /// than asserting in advance what will not work. The old copy said flatly
+  /// that speed, incline and fan would not respond, which was written when
+  /// nothing was wired behind the switch; on a machine that implements them it
+  /// was simply untrue, and telling a rider their controls are dead when they
+  /// are live is the wrong direction to be wrong in.
+  String _summary() {
+    if (!direct) {
+      return 'Bypass iFit and drive the controller directly over USB or '
+          'Bluetooth. Stride asks the treadmill what it supports.';
+    }
+    final detail = directDetail;
+    if (detail != null && !directLinked) return detail;
+    if (directLinked) {
+      return 'On, and the treadmill answered. Stride is using the controls it '
+          'said it has.';
+    }
+    return 'On. Stride is looking for the treadmill over USB and Bluetooth.';
+  }
+
+  bool get direct => transport == 'direct';
+
   @override
   Widget build(BuildContext context) {
-    final direct = transport == 'direct';
     return Column(
       crossAxisAlignment: CrossAxisAlignment.start,
       children: [
@@ -421,8 +465,8 @@ class _AdvancedSection extends StatelessWidget {
           _Section(
             title: 'Machine connection',
             subtitle:
-                'Stride talks to the treadmill through iFit, which is the only path that works '
-                'today.',
+                'Stride talks to the treadmill through iFit by default. Direct '
+                'access skips iFit and speaks to the controller itself.',
             child: Container(
               padding: const EdgeInsets.all(StrideSpace.md),
               decoration: BoxDecoration(
@@ -451,13 +495,13 @@ class _AdvancedSection extends StatelessWidget {
                         ),
                         const SizedBox(height: StrideSpace.xxs),
                         Text(
-                          direct
-                              ? 'On. Speed, incline and fan will not respond until you turn this '
-                                    'back off.'
-                              : 'Bypass iFit and drive the controller directly. Unfinished — '
-                                    'nothing is connected behind it yet.',
+                          _summary(),
                           style: Theme.of(context).textTheme.bodyMedium,
                         ),
+                        if (direct && directLinked) ...[
+                          const SizedBox(height: StrideSpace.xs),
+                          _CapabilityList(capabilities: directCapabilities),
+                        ],
                       ],
                     ),
                   ),
@@ -468,6 +512,68 @@ class _AdvancedSection extends StatelessWidget {
           ),
         ],
       ],
+    );
+  }
+}
+
+/// The machine's own answer about which controls it implements.
+///
+/// Sourced from the supported-register bitmask the treadmill returns during the
+/// direct handshake, so this is reporting what the hardware said rather than
+/// predicting what it will do. Three states, not two: a control the machine did
+/// not list is genuinely absent, but one we could not ask about is unknown, and
+/// showing those the same way is how the previous copy came to be wrong.
+class _CapabilityList extends StatelessWidget {
+  const _CapabilityList({required this.capabilities});
+
+  final Map<String, dynamic>? capabilities;
+
+  @override
+  Widget build(BuildContext context) {
+    final caps = capabilities;
+    if (caps == null) return const SizedBox.shrink();
+    const labels = {'speed': 'Speed', 'incline': 'Incline', 'fan': 'Fan'};
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        for (final entry in labels.entries)
+          _CapabilityRow(
+            label: entry.value,
+            supported: caps[entry.key] as bool?,
+          ),
+      ],
+    );
+  }
+}
+
+class _CapabilityRow extends StatelessWidget {
+  const _CapabilityRow({required this.label, required this.supported});
+
+  final String label;
+  final bool? supported;
+
+  @override
+  Widget build(BuildContext context) {
+    final (icon, colour, text) = switch (supported) {
+      true => (Icons.check_circle_outline, StrideColors.accent, 'Available'),
+      false => (
+        Icons.remove_circle_outline,
+        StrideColors.textMuted,
+        'Not on this treadmill',
+      ),
+      // Unknown stays visually distinct from unsupported. The rider should be
+      // able to tell "your machine hasn't got one" from "we couldn't ask".
+      null => (Icons.help_outline, StrideColors.textMuted, 'Unknown'),
+    };
+    return Padding(
+      padding: const EdgeInsets.only(top: StrideSpace.xxs),
+      child: Row(
+        children: [
+          Icon(icon, size: 16, color: colour),
+          const SizedBox(width: StrideSpace.xs),
+          Text('$label — $text', style: Theme.of(context).textTheme.bodySmall),
+        ],
+      ),
     );
   }
 }

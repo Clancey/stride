@@ -281,6 +281,13 @@ class GlassOsClient(private val context: Context) {
         val speedWritable: Boolean?,
         val inclineWritable: Boolean?,
         val fanWritable: Boolean?,
+        /**
+         * Fan level, 0..[MachineLink.FAN_MAX], or null when unknown.
+         *
+         * Defaulted so the GlassOS path — which does not read the fan — keeps saying "unknown"
+         * rather than inventing a zero. The direct path fills it in from `FAN_STATE`.
+         */
+        val fanLevel: Int? = null,
     )
 
     /**
@@ -394,9 +401,34 @@ class GlassOsClient(private val context: Context) {
             else -> null
         }
 
-        /** True when the machine is in a state where the belt may be under power. */
-        fun beltMayBeMoving(name: String?): Boolean =
-            name == "WORKOUT" || name == "WARM_UP" || name == "COOL_DOWN" || name == "RESUME"
+        /**
+         * The number for a name produced by [name], or null if it is not one of ours.
+         *
+         * The inverse of [name], derived from it rather than written out a second time, so the two
+         * cannot drift apart. The direct path needs it: FitPro reports a workout mode, Stride
+         * translates that to a console-state *name*, and callers that compare numbers — including
+         * [MachineLink.connectNow]'s DISCONNECTED test — need the number that name stands for.
+         */
+        fun code(name: String): Int? = (0..13).firstOrNull { name(it) == name }
+
+        /**
+         * True when the machine is in a state where the belt may be under power.
+         *
+         * Null when the console state is unknown — either it never reported one or it reported a
+         * value this build does not recognise. That is deliberately *not* folded into `false`: this
+         * predicate exists to decide whether motion is possible, and answering "no" for a state we
+         * cannot read is the one wrong answer that matters. Callers already treat null as "assume
+         * it might be", and `== true` is the idiom for "definitely moving".
+         */
+        fun beltMayBeMoving(name: String?): Boolean? = when (name) {
+            "WORKOUT", "WARM_UP", "COOL_DOWN", "RESUME" -> true
+            "IDLE", "PAUSED", "WORKOUT_RESULTS", "SAFETY_KEY_REMOVED", "LOCKED", "SLEEP" -> false
+            // DISCONNECTED, CONSOLE_STATE_UNKNOWN, DEMO, ERROR and anything unrecognised fall
+            // through to null on purpose. A demo routine can drive the belt, an errored console has
+            // not told us what it is doing, and a state this build does not know is by definition
+            // not one it can rule motion out from.
+            else -> null
+        }
     }
 
     /**

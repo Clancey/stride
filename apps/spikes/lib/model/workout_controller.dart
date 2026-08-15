@@ -88,6 +88,12 @@ class MachineSnapshot {
     required this.canCommand,
     required this.noReadingLabel,
     required this.metricsNotice,
+    this.canCommandSpeed = false,
+    this.canCommandIncline = false,
+    this.canCommandFan = false,
+    this.speedNotice,
+    this.inclineNotice,
+    this.fanNotice,
     this.speedMph,
     this.inclinePercent,
     this.distanceMiles,
@@ -109,6 +115,12 @@ class MachineSnapshot {
       paceMinPerMile: _asDoubleOrNull(map['paceMinPerMile']),
       fanLevel: map['fanLevel'] == null ? null : _asInt(map['fanLevel']),
       canCommand: map['canCommand'] == true,
+      canCommandSpeed: map['canCommandSpeed'] == true,
+      canCommandIncline: map['canCommandIncline'] == true,
+      canCommandFan: map['canCommandFan'] == true,
+      speedNotice: _asNonEmptyString(map['speedNotice']),
+      inclineNotice: _asNonEmptyString(map['inclineNotice']),
+      fanNotice: _asNonEmptyString(map['fanNotice']),
       noReadingLabel:
           _asNonEmptyString(map['noReading'] ?? map['noReadingLabel']) ??
           'Not measured',
@@ -136,6 +148,25 @@ class MachineSnapshot {
   final double? paceMinPerMile;
   final int? fanLevel;
   final bool canCommand;
+
+  /// Whether each individual control can be used right now.
+  ///
+  /// Separate from [canCommand] because they answer different questions.
+  /// [canCommand] is about Stride's link; these are about whether this machine
+  /// accepts that particular setpoint at this moment — a treadmill with no
+  /// incline motor never will, and one sitting idle will not until a workout
+  /// starts. A control that fails either must be drawn unavailable rather than
+  /// left live to silently do nothing.
+  final bool canCommandSpeed;
+  final bool canCommandIncline;
+  final bool canCommandFan;
+
+  /// What to say when each control is tapped while unavailable. Resolved by the
+  /// host, which owns every safety sentence; a second copy of the rule here
+  /// would be a second thing to get wrong.
+  final String? speedNotice;
+  final String? inclineNotice;
+  final String? fanNotice;
 
   /// The safety sentence to print beside these metrics, chosen by the host from what is actually
   /// true right now. Never concatenate the read and control warnings: claiming both at once is a

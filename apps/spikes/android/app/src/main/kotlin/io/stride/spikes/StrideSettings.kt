@@ -111,13 +111,24 @@ object StrideSettings {
     /**
      * True when the direct register path is selected.
      *
-     * Read this as "the rider has opted in", never as "the direct path is working". Nothing is
-     * connected behind it yet, and any caller that treats this as a capability check will be wrong.
+     * Read this as "the rider has opted in", never as "the direct path is working". Whether it is
+     * working is a question only the handshake can answer — `MachineLink.directLinked` and
+     * `MachineLink.directCapabilities()` hold that answer, and it varies by machine. Any caller
+     * that treats this as a capability check will be wrong.
      */
     val directHardwareAccess: Boolean
         get() = transport == Transport.DIRECT
 
-    /** Whether a transport actually exists behind [transport]. Only GlassOS is implemented. */
+    /**
+     * Whether code exists behind the selected transport.
+     *
+     * Both transports are implemented now, so this is constant — kept because the settings screen
+     * reads it and because a future third option would need it again. It says nothing about whether
+     * the selected transport is currently *connected*: the direct path depends on a cable or a
+     * paired radio being present, and a machine that is not plugged in is a link failure, not an
+     * unimplemented feature. Those two were conflated while the direct path was a stub, and the
+     * screen inherited the confusion.
+     */
     val transportImplemented: Boolean
-        get() = transport == Transport.GLASSOS
+        get() = true
 }
