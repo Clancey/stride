@@ -982,6 +982,7 @@ class _StatePill extends StatelessWidget {
   Widget build(BuildContext context) {
     final running = state == 'running';
     final paused = state == 'paused';
+    final starting = state == 'starting';
     return Container(
       constraints: const BoxConstraints(minHeight: 44),
       padding: const EdgeInsets.symmetric(
@@ -991,7 +992,7 @@ class _StatePill extends StatelessWidget {
       decoration: BoxDecoration(
         color: running
             ? StrideColors.accent
-            : paused
+            : paused || starting
             ? StrideColors.warning
             : StrideColors.panelHigh,
         borderRadius: BorderRadius.circular(StrideRadius.xl),
@@ -1002,9 +1003,13 @@ class _StatePill extends StatelessWidget {
               ? 'RUNNING'
               : paused
               ? 'PAUSED'
+              : starting
+              ? 'STARTING'
               : 'READY',
           style: Theme.of(context).textTheme.labelMedium?.copyWith(
-            color: running || paused ? StrideColors.ink : StrideColors.text,
+            color: running || paused || starting
+                ? StrideColors.ink
+                : StrideColors.text,
             fontWeight: FontWeight.w900,
           ),
         ),
@@ -1178,6 +1183,29 @@ class _WorkoutActions extends StatelessWidget {
         onPressed: onStart,
         icon: const Icon(Icons.play_arrow_rounded, size: 34),
         label: const _ButtonLabel('Start workout'),
+      );
+    }
+
+    if (controller.isStarting) {
+      // The rider asked and the treadmill has not answered. Still tappable, as a cancel: a
+      // disabled button here would leave someone standing on a machine that may be about to move
+      // with nothing to press.
+      return FilledButton.icon(
+        style: FilledButton.styleFrom(
+          minimumSize: const Size(double.infinity, StrideSpace.minTouch),
+          backgroundColor: StrideColors.warning,
+          foregroundColor: StrideColors.ink,
+        ),
+        onPressed: () => controller.cancelStart(),
+        icon: const SizedBox(
+          width: 26,
+          height: 26,
+          child: CircularProgressIndicator(
+            strokeWidth: 3,
+            color: StrideColors.ink,
+          ),
+        ),
+        label: const _ButtonLabel('Starting…'),
       );
     }
 

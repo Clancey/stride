@@ -12,6 +12,7 @@ abstract class WorkoutBridgeClient {
   Future<bool> workoutPause();
   Future<bool> workoutResume();
   Future<int> workoutStop();
+  Future<bool> workoutCancelStart();
   Future<WorkoutVolume> volumeGet();
   Future<bool> volumeSet(int level);
   Future<MachineSnapshot> machineSnapshot();
@@ -37,6 +38,9 @@ class MethodChannelWorkoutBridge implements WorkoutBridgeClient {
 
   @override
   Future<int> workoutStop() => SpikeBridge.workoutStop();
+
+  @override
+  Future<bool> workoutCancelStart() => SpikeBridge.workoutCancelStart();
 
   @override
   Future<WorkoutVolume> volumeGet() async =>
@@ -172,6 +176,12 @@ class WorkoutController extends ChangeNotifier {
   bool get isPaused => _state == 'paused';
   bool get isIdle => _state == 'idle';
 
+  /// The rider has asked to start and the treadmill has not answered yet.
+  ///
+  /// Its own state rather than a flavour of running, because nothing is running: the belt is still,
+  /// the clock has not begun, and the only honest thing to show is that we are waiting.
+  bool get isStarting => _state == 'starting';
+
   Future<void> load() async {
     await _refreshWorkout();
     await refreshVolume();
@@ -181,7 +191,10 @@ class WorkoutController extends ChangeNotifier {
   Future<bool> startWorkout() async {
     final ok = await _safe(() => _bridge.workoutStart(), false);
     if (!ok) return false;
-    _state = 'running';
+    // Not 'running'. The host is the only thing that knows whether the treadmill agreed, and it
+    // says so on the state channel; claiming it here would put the launcher back to showing a
+    // workout in progress over a stationary belt, which is the bug this state exists to fix.
+    _state = 'starting';
     await _refreshAfterControl();
     return true;
   }
@@ -199,6 +212,22 @@ class WorkoutController extends ChangeNotifier {
     if (!ok) return false;
     _state = 'running';
     await _refreshAfterControl();
+    return true;
+  }
+
+  /// Call off a start the treadmill has not answered yet.
+  ///
+  /// Kept apart from [finishWorkout] because the goal survives a cancelled start: the rider set a
+  /// target moments ago and never got a workout, so taking it away would charge them for the
+  /// machine's delay.
+  Future<bool> cancelStart() async {
+    final ok = await _safe(() => _bridge.workoutCancelStart(), false);
+    if (!ok) return false;
+    _state = 'idle';
+    _elapsedMs = 0;
+    _syncTicker();
+    _notify();
+    unawaited(refreshMachine());
     return true;
   }
 
@@ -264,7 +293,10 @@ class WorkoutController extends ChangeNotifier {
   }
 
   void _syncTicker() {
-    if (_state != 'running') {
+    // Also ticks while starting. The host owns this state and announces the change, but a missed
+    // event would otherwise leave the launcher showing "Starting…" forever with no poll to correct
+    // it — so the pending state re-reads the host rather than trusting one notification.
+    if (_state != 'running' && _state != 'starting') {
       _ticker?.cancel();
       _ticker = null;
       return;
@@ -276,6 +308,16 @@ class WorkoutController extends ChangeNotifier {
     if (_tickInFlight) return;
     _tickInFlight = true;
     try {
+      if (_state == 'starting') {
+        // The one thing worth knowing while starting is whether it still is.
+        final hostState = await _safe(() => _bridge.workoutState(), _state);
+        if (_disposed) return;
+        final next = _normalizeState(hostState);
+        if (next != _state) {
+          _state = next;
+          _syncTicker();
+        }
+      }
       final nextElapsed = await _safe(
         () => _bridge.workoutElapsedMs(),
         _elapsedMs,
@@ -326,6 +368,7 @@ class WorkoutController extends ChangeNotifier {
 
 String _normalizeState(String state) {
   return switch (state) {
+    'starting' => 'starting',
     'running' => 'running',
     'paused' => 'paused',
     _ => 'idle',

@@ -357,9 +357,13 @@ class StrideAppstoreService : Service() {
         )
         channel.setShowBadge(false)
         nm.createNotificationChannel(channel)
+        // Deliberately says nothing about motor control. It used to read "no motor control", which
+        // was false: checking a catalog and downloading an APK never touches the machine link, and
+        // only the install itself interrupts anything. Telling a rider their controls are gone
+        // while they still work teaches them to distrust the one notice that will matter.
         val notification: Notification = Notification.Builder(this, CHANNEL_ID)
             .setContentTitle("Stride updates")
-            .setContentText("Checking for app updates - no motor control")
+            .setContentText("Checking for app updates")
             .setSmallIcon(android.R.drawable.stat_sys_download_done)
             .setOngoing(true)
             .build()

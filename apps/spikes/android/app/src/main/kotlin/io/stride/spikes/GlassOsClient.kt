@@ -287,11 +287,21 @@ class GlassOsClient(private val context: Context) {
      * Read everything at once. Blocking; call from a background thread.
      *
      * Returns null when not linked, which is distinct from a linked machine reporting nothing.
+     *
+     * "Linked" used to mean only that credentials parsed, so a console whose daemon never answered
+     * still produced a Snapshot full of nulls and left [MachineLink] reporting LINKED. That is the
+     * failure this returns null for now: `GetConsoleState` not answering at all means we are not
+     * talking to GlassOS, and saying otherwise puts "Stride is linked to this machine" on screen
+     * beside a machine nothing can reach.
      */
     fun read(): Snapshot? {
         if (!isLinked()) return null
 
-        val console = call("ConsoleService", "GetConsoleState")?.enum(1)
+        // Kept as the whole message rather than the decoded enum, because proto3 omits a zero and
+        // DISCONNECTED *is* zero: `enum(1)` returns null both for "the console is disconnected"
+        // and for "the daemon never replied", and those two must not collapse into one.
+        val consoleReply = call("ConsoleService", "GetConsoleState") ?: return null
+        val console = consoleReply.enum(1) ?: ConsoleState.DISCONNECTED
         val distance = call("DistanceService", "GetDistance")
         val speed = call("SpeedService", "GetSpeed")
         val incline = call("InclineService", "GetIncline")
@@ -352,9 +362,22 @@ class GlassOsClient(private val context: Context) {
      * extracted protos exist to prevent. Re-extract and diff rather than editing by hand.
      */
     object ConsoleState {
+        /**
+         * No machine behind the daemon.
+         *
+         * Zero, and therefore omitted from the wire, which is why [GlassOsClient.read] keeps the
+         * raw reply. Observed for real: after a console reboot GlassOS answered every read while
+         * `GetConsole` came back empty and `Connect` never returned — the head unit had lost its
+         * link to the lower board. Every motion RPC blocked until it timed out.
+         */
+        const val DISCONNECTED = 0
+
+        /** The name for [DISCONNECTED], compared by callers that only hold the display string. */
+        const val DISCONNECTED_NAME = "DISCONNECTED"
+
         fun name(raw: Int?): String? = when (raw) {
             null -> null
-            0 -> "DISCONNECTED"
+            0 -> DISCONNECTED_NAME
             1 -> "CONSOLE_STATE_UNKNOWN"
             2 -> "IDLE"
             3 -> "WORKOUT"
