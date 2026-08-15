@@ -102,8 +102,9 @@ class FitProProbe {
         transport: FitProTransport,
         reference: Reference? = null,
         address: Int = FitProCodec.ADDRESS_MAIN,
+        supports: ((FitProCodec.Register) -> Boolean?)? = null,
     ): Result {
-        val outcome = runCatching { attempt(transport, reference, address) }
+        val outcome = runCatching { attempt(transport, reference, address, supports) }
             .getOrElse { Result(Stage.UNCONFIRMED, "check failed: ${it.message ?: it::class.java.simpleName}") }
         stage = outcome.stage
         detail = outcome.detail
@@ -111,12 +112,28 @@ class FitProProbe {
         return outcome
     }
 
-    private fun attempt(transport: FitProTransport, reference: Reference?, address: Int): Result {
-        val body = FitProCodec.readWriteBody(writes = emptyList(), reads = PROBE_READS)
+    private fun attempt(
+        transport: FitProTransport,
+        reference: Reference?,
+        address: Int,
+        supports: ((FitProCodec.Register) -> Boolean?)?,
+    ): Result {
+        // Ask only for registers this console said it has. Values come back packed with nothing to
+        // identify them, so a reply missing one register decodes every later value at the wrong
+        // offset and is rejected wholesale — meaning a treadmill without incline could not confirm
+        // its link at all, and so could not be given speed control either. `!= false` keeps a
+        // console that never answered DEVICE_INFO from having its whole probe list emptied.
+        val reads = PROBE_READS.filter { supports?.invoke(it) != false }
+        val inclineAsked = FitProCodec.Register.ACTUAL_INCLINE in reads && FitProCodec.Register.MAX_GRADE in reads
+        if (FitProCodec.Register.ACTUAL_KPH !in reads || FitProCodec.Register.MAX_KPH !in reads) {
+            return Result(Stage.UNCONFIRMED, "the machine doesn't report its speed")
+        }
+
+        val body = FitProCodec.readWriteBody(writes = emptyList(), reads = reads)
         val reply = transport.exchange(FitProCodec.frame(body, address = address))
             ?: return Result(Stage.UNCONFIRMED, "the machine didn't answer")
 
-        val response = FitProCodec.parseResponse(reply, PROBE_READS)
+        val response = FitProCodec.parseResponse(reply, reads)
             ?: return Result(Stage.UNCONFIRMED, "the reply wasn't a valid frame")
 
         if (response.status != FitProCodec.Status.DONE) {
@@ -133,7 +150,13 @@ class FitProProbe {
         val actualKph = response.value(FitProCodec.Register.ACTUAL_KPH)?.let(FitProCodec::decodeSpeed)
         val actualGrade = response.value(FitProCodec.Register.ACTUAL_INCLINE)?.let(FitProCodec::decodeIncline)
 
-        if (maxKph == null || maxGrade == null || actualKph == null || actualGrade == null) {
+        if (maxKph == null || actualKph == null) {
+            return Result(Stage.UNCONFIRMED, "the reply was too short to hold every value we asked for")
+        }
+        // Only demanded from a console that claims to have incline. One that does not is a flat
+        // treadmill, not a broken link, and refusing it here would leave it with no speed control
+        // either — the probe is what licenses writing at all.
+        if (inclineAsked && (maxGrade == null || actualGrade == null)) {
             return Result(Stage.UNCONFIRMED, "the reply was too short to hold every value we asked for")
         }
 
@@ -143,25 +166,33 @@ class FitProProbe {
         if (maxKph !in PLAUSIBLE_MAX_KPH) {
             return Result(Stage.UNCONFIRMED, "it reported a top speed of ${"%.1f".format(maxKph)} km/h, which isn't a treadmill")
         }
-        if (maxGrade !in PLAUSIBLE_MAX_GRADE) {
+        if (maxGrade != null && maxGrade !in PLAUSIBLE_MAX_GRADE) {
             return Result(Stage.UNCONFIRMED, "it reported a maximum incline of ${"%.1f".format(maxGrade)}%, which isn't a treadmill")
         }
         if (actualKph < -0.5 || actualKph > maxKph + SPEED_HEADROOM_KPH) {
             return Result(Stage.UNCONFIRMED, "it reported a current speed of ${"%.1f".format(actualKph)} km/h against its own ${"%.1f".format(maxKph)} km/h limit")
         }
-        if (actualGrade > maxGrade + GRADE_HEADROOM || actualGrade < (minGrade ?: 0.0) - GRADE_HEADROOM) {
+        if (maxGrade != null && actualGrade != null &&
+            (actualGrade > maxGrade + GRADE_HEADROOM || actualGrade < (minGrade ?: 0.0) - GRADE_HEADROOM)
+        ) {
             return Result(Stage.UNCONFIRMED, "it reported a current incline of ${"%.1f".format(actualGrade)}% outside its own limits")
         }
 
         limits = MachineLimits(
             minSpeedKph = minKph ?: 0.0,
             maxSpeedKph = maxKph,
+            // Both zero on a machine with no incline, which is the honest range: the preset ladder
+            // renders it as no incline options rather than inventing a default span.
             minInclinePercent = minGrade ?: 0.0,
-            maxInclinePercent = maxGrade,
+            maxInclinePercent = maxGrade ?: 0.0,
         )
 
-        val linkDetail = "reads ${"%.1f".format(actualKph)} km/h at ${"%.1f".format(actualGrade)}%, " +
-            "limits ${"%.1f".format(maxKph)} km/h and ${"%.1f".format(maxGrade)}%"
+        val linkDetail = if (maxGrade == null || actualGrade == null) {
+            "reads ${"%.1f".format(actualKph)} km/h, limit ${"%.1f".format(maxKph)} km/h; no incline"
+        } else {
+            "reads ${"%.1f".format(actualKph)} km/h at ${"%.1f".format(actualGrade)}%, " +
+                "limits ${"%.1f".format(maxKph)} km/h and ${"%.1f".format(maxGrade)}%"
+        }
 
         val mismatch = crossCheck(reference, actualKph, actualGrade)
         return when {
@@ -181,7 +212,7 @@ class FitProProbe {
      * just under 1 km/h. Tightening this tolerance would fail the check against a machine that is
      * working perfectly.
      */
-    private fun crossCheck(reference: Reference?, actualKph: Double, actualGrade: Double): String? {
+    private fun crossCheck(reference: Reference?, actualKph: Double, actualGrade: Double?): String? {
         if (reference == null) return null
 
         reference.speedMph?.let { referenceMph ->
@@ -190,6 +221,9 @@ class FitProProbe {
                 return "we read ${"%.1f".format(ourMph)} mph where iFit reads ${"%.1f".format(referenceMph)} mph"
             }
         }
+        // Nothing to cross-check on a machine with no incline; iFit reporting a percent for one
+        // that has none is iFit's business, not evidence our decode is wrong.
+        if (actualGrade == null) return null
         reference.inclinePercent?.let { referencePercent ->
             if (kotlin.math.abs(actualGrade - referencePercent) > GRADE_TOLERANCE) {
                 return "we read ${"%.1f".format(actualGrade)}% incline where iFit reads ${"%.1f".format(referencePercent)}%"

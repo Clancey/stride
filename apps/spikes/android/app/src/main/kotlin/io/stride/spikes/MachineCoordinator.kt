@@ -59,7 +59,8 @@ object MachineCoordinator {
      * reporting a 20 mph ceiling does not raise ours.
      */
     @Volatile
-    private var machineLimits: MachineLimits? = null
+    var machineLimits: MachineLimits? = null
+        private set
 
     /**
      * Record the connected machine's own limits, or clear them.
@@ -378,6 +379,27 @@ object MachineCoordinator {
      * from us is a console we have no way of stopping once the belt is moving, and arming it is
      * exactly the situation the rest of this file exists to prevent.
      */
+    /**
+     * Ends whatever workout the console is already in, so a start begins a session rather than
+     * colliding with one.
+     *
+     * **Returns true only for a console that positively said IDLE.** Every other ending — a stop
+     * that went unanswered, a state we could not re-read, a console that did not move, or attempts
+     * running out — is false.
+     *
+     * That asymmetry is deliberate and it is the opposite of the `!= false` rule used for
+     * capabilities elsewhere. There, unknown must not disable a control the machine never denied.
+     * Here, the next thing that happens is the one command that can set a belt in motion, and the
+     * caller has already refused to start when it could not read the state at all, saying that
+     * starting blind means issuing a start against a console whose session we could not clear.
+     * Returning true on an unconfirmed clear would do precisely that, one call later — so the two
+     * halves of the decision have to agree, and this is the half that was disagreeing.
+     *
+     * The concrete case: a paused console with the belt stopped and a rider standing on it. If the
+     * stop went unacknowledged, a start resumes the belt underneath them. A rider who is told the
+     * console would not end its previous workout can press Start again; one who is not told cannot
+     * un-stand on a moving belt.
+     */
     private fun clearWorkout(commands: MachineCommands, initial: Int?): Boolean {
         var state = initial
         var attempts = 0
@@ -391,11 +413,23 @@ object MachineCoordinator {
             }
             if (!settle()) return false
             val next = commands.workoutState()
+            if (next == null) {
+                // The stop may well have landed — an unanswered command is not a rejected one — but
+                // "probably cleared" is not a basis for moving a belt.
+                Log.w(TAG, "console did not report its state after a stop; not starting")
+                return false
+            }
             if (next == state) {
-                Log.w(TAG, "console stayed in state $state after a stop; starting anyway")
-                return true
+                Log.w(TAG, "console stayed in state $state after a stop; not starting")
+                return false
             }
             state = next
+        }
+        // Covers the loop running out of attempts as well as an initial state that was already
+        // idle. Anything still not idle here was never cleared.
+        if (state != GlassOsCommands.WORKOUT_IDLE) {
+            Log.w(TAG, "console did not reach idle after $attempts stop attempts; not starting")
+            return false
         }
         return true
     }
@@ -493,14 +527,24 @@ object MachineCoordinator {
      * starts is worse than a fan that comes on a moment late.
      *
      * A remembered setting always wins; Auto is only the fallback for a rider who has never chosen.
+     *
+     * Auto is attempted whenever the console has not specifically said no. GlassOS can answer this
+     * question outright because it reads a per-console configuration blob; the direct path has no
+     * equivalent and can only find out by asking, so an unknown answer is treated as "worth trying
+     * once". A machine that refuses is not an error — it is a machine without an automatic fan, and
+     * it has just told us so, which is why the refusal is swallowed here and remembered there.
      */
     fun restoreFan(remembered: Int?) {
         submit("Restore fan") { commands ->
+            val speculative = remembered == null
             val target = remembered
-                ?: if (commands.autoFanSupported() == true) GlassOsCommands.FAN_AUTO else null
+                ?: if (commands.autoFanSupported() != false) GlassOsCommands.FAN_AUTO else null
                 ?: return@submit Outcome.Ok
-            lastFanState = target
-            commands.setFanState(target).toOutcome()
+            val ack = commands.setFanState(target)
+            // Only remember a state the machine actually took. Recording a speculative Auto that was
+            // refused would make every later restore replay a command this console has rejected.
+            if (ack is MachineAck.Ok || !speculative) lastFanState = target
+            if (speculative && ack is MachineAck.Refused) Outcome.Ok else ack.toOutcome()
         }
     }
 

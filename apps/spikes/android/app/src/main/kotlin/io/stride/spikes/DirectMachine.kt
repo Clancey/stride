@@ -85,6 +85,23 @@ class DirectMachineSession(
     var fanRegister: FitProCodec.Register? = null
         private set
 
+    /**
+     * Whether this console accepted `AUTO` as a fan state, once we have actually tried it.
+     *
+     * Null until the question has been settled by a write. There is deliberately no inference behind
+     * this: GlassOS answers the same question from `IsAutoFanStateSupported`, which it resolves from
+     * a per-console configuration blob (`FanFeature`, with its own `AutoFanSupported` field, in
+     * `ak/k0`) rather than from anything the machine says over the wire. No FitPro register carries
+     * it. So a console can implement a fan register and still have no automatic mode, and the
+     * presence of that register — which is what this used to be inferred from — proves nothing.
+     *
+     * Asking the machine is the only honest way to find out, and the cost of asking is a fan command
+     * that gets refused.
+     */
+    @Volatile
+    var autoFanAccepted: Boolean? = null
+        private set
+
     val transportName: String get() = transport.name
 
     /** Whether the wire is still up. False once the cable is unplugged or the radio drops. */
@@ -228,7 +245,9 @@ class DirectMachineSession(
                 .orEmpty()
         }.getOrDefault(emptySet())
 
-        val probeResult = probe.confirm(transport, reference, address)
+        // The probe reads registers too, so it needs the same supported-register filter — see
+        // FitProProbe.attempt. deviceInfo is set above, so `supports` can answer by now.
+        val probeResult = probe.confirm(transport, reference, address) { info.supports(it) }
         return ConnectResult(
             deviceInfo = info,
             supportedCommands = supportedCommands,
@@ -271,9 +290,10 @@ class DirectMachineSession(
             val info = FitProCodec.parseDeviceInfo(reply)?.copy(address = candidate) ?: continue
             Log.i(
                 TAG,
-                "device at $candidate: ${info.brand} model ${info.modelNumber} " +
-                    "hw ${info.hardwareVersion} fw ${info.firmwareVersion}, " +
-                    "${info.supportedFieldIds.size} registers",
+                "device at $candidate: ${info.brand} serial ${info.serialNumber} " +
+                    "sw ${info.softwareVersion} hw ${info.hardwareVersion}, " +
+                    "${info.supportedFieldIds.size} registers" +
+                    if (info.requiresSecurity) " (software > ${FitProCodec.SECURITY_REQUIRED_ABOVE}: may demand VERIFY_SECURITY)" else "",
             )
             return info
         }
@@ -287,7 +307,15 @@ class DirectMachineSession(
             missing.isEmpty() -> ""
             else -> " It doesn't offer ${missing.joinToString(" or ") { it.name.lowercase() }}."
         }
-        return "Found a $brand machine on ${transport.name}. ${probeResult.detail}.$caveat"
+        // Only worth saying when the probe could not get a write accepted: on a console that took
+        // our writes, the security version is trivia, but on one that refused them it is the answer.
+        val security = when {
+            info.requiresSecurity && probeResult.stage == FitProProbe.Stage.UNCONFIRMED ->
+                " Its software version (${info.softwareVersion}) is one that asks for a security" +
+                    " handshake Stride can't perform, which may be why."
+            else -> ""
+        }
+        return "Found a $brand machine on ${transport.name}. ${probeResult.detail}.$caveat$security"
     }
 
     /**
@@ -324,11 +352,35 @@ class DirectMachineSession(
                     Log.i(TAG, "fan answers on ${register.name} (field ${register.fieldId})")
                     fanRegister = register
                 }
+                if (state == FitProCodec.FanState.AUTO) autoFanAccepted = true
                 return ack
             }
             last = ack
         }
+        // Only an explicit refusal answers the question. A silent link says nothing about whether
+        // this console has an automatic mode, and recording false for it would permanently disable
+        // a feature the machine may well have.
+        if (state == FitProCodec.FanState.AUTO && last is MachineAck.Refused) autoFanAccepted = false
         return last
+    }
+
+    /**
+     * Forget the handshake so the next [connect] performs it again, without closing the transport.
+     *
+     * Distinct from [close]: the device is still there and still open, we have simply stopped
+     * believing what it told us. Used when the link is enumerated but has gone silent — a console
+     * that slept behind a live USB connection, say — where the only route back is a fresh
+     * handshake, and where leaving [deviceInfo] set would mean never attempting one.
+     */
+    fun invalidateHandshake() {
+        synchronized(wire) {
+            lastConnect = null
+            probe.reset()
+            deviceInfo = null
+            supportedCommands = emptySet()
+            fanRegister = null
+            address = FitProCodec.ADDRESS_MAIN
+        }
     }
 
     override fun close() {
@@ -491,10 +543,22 @@ class DirectMachineClient(private val session: DirectMachineSession) {
      * straddle a state change and describe a machine that never existed.
      */
     fun read(): GlassOsClient.Snapshot? {
-        // The fan register is whichever one this console said it implements, so the read list is
-        // built per machine rather than fixed. It sorts into place by field id like everything else.
+        // Ask only for what this console said it implements.
+        //
+        // This is not an optimisation. A reply carries values packed contiguously with nothing to
+        // say which register each came from, so `parseResponse` requires them to fill the frame
+        // exactly — if the machine omits one register it does not have, every remaining value
+        // decodes at the wrong offset and the whole response is rejected. One absent register
+        // therefore costs the entire poll, not one field. On a treadmill without incline that is
+        // all telemetry, permanently.
+        //
+        // `!= false` because before the handshake `supports` answers null for everything, and
+        // dropping the whole list then would mean never reading anything. Unknown is not refusal;
+        // only a console that positively said it lacks a register is excluded.
         val fan = session.fanRegister
-        val reads = if (fan == null) TELEMETRY else TELEMETRY + fan
+        val reads = (if (fan == null) TELEMETRY else TELEMETRY + fan)
+            .filter { session.supports(it) != false }
+        if (reads.isEmpty()) return null
         val response = session.exchange(reads = reads) ?: return null
         if (!response.accepted) return null
 
@@ -692,7 +756,28 @@ class DirectMachineCommands(private val session: DirectMachineSession) : Machine
 
     override fun pause(): MachineAck = setMode(FitProCodec.WorkoutMode.PAUSE, "pause")
 
-    override fun resume(): MachineAck = setMode(FitProCodec.WorkoutMode.RUNNING, "resume")
+    /**
+     * Resume from pause.
+     *
+     * Writes `RESUME` (13), not `RUNNING` (2), because that is what GlassOS writes. Its console-state
+     * translation (`xh/n0.p0`) is a straight 1:1 map from its own `ConsoleState` to FitPro's
+     * `WorkoutMode`, and `ConsoleState.RESUME` maps to `WorkoutMode.RESUME` like every other pair.
+     *
+     * The value is transient: GlassOS deliberately refuses to *publish* RESUME as a console state
+     * (`vh/f.m` returns early for exactly this register/value pair), so a machine that has resumed
+     * reports itself as RUNNING immediately afterwards. That is why the read side maps RESUME onto
+     * running rather than treating it as a state of its own.
+     *
+     * Falls back to RUNNING if the console refuses RESUME. A refusal here is not fatal — it means
+     * this machine has no distinct resume transition — and failing to restart a belt the rider has
+     * asked to restart is a much worse outcome than sending the blunter value.
+     */
+    override fun resume(): MachineAck {
+        val ack = setMode(FitProCodec.WorkoutMode.RESUME, "resume")
+        if (ack !is MachineAck.Refused) return ack
+        Log.i(TAG, "console refused RESUME; falling back to RUNNING")
+        return setMode(FitProCodec.WorkoutMode.RUNNING, "resume")
+    }
 
     /**
      * Stop the belt and end the session in a single frame.
@@ -758,9 +843,27 @@ class DirectMachineCommands(private val session: DirectMachineSession) : Machine
             if (!result.connected) return GlassOsClient.ConsoleState.DISCONNECTED
         }
 
-        val mode = runCatching { readWorkoutMode() }.getOrNull()
-            ?: return GlassOsClient.ConsoleState.code("CONSOLE_STATE_UNKNOWN")
-        return FitProValues.consoleState(mode)
+        val mode = runCatching { readWorkoutMode() }.getOrNull() ?: ModeRead.Silent
+        return when (mode) {
+            // The console answered, just not with a mode we could use — it is present and talking,
+            // so "unknown state" is the honest report.
+            is ModeRead.AnsweredWithoutMode -> GlassOsClient.ConsoleState.code("CONSOLE_STATE_UNKNOWN")
+            is ModeRead.Mode -> FitProValues.consoleState(mode.value)
+            // Nothing came back at all. Reporting CONSOLE_STATE_UNKNOWN here would be read as
+            // attached by MachineLink.connectNow, which treats anything that is not DISCONNECTED as
+            // a live console — so a device that is still enumerated but has stopped answering (a
+            // console asleep behind a live USB link, a BLE peer that dropped without a disconnect)
+            // would read as attached forever. Worse, deviceInfo would stay non-null and the
+            // handshake above would never run again, so it could never recover on its own.
+            //
+            // So: discard the handshake and report no answer. The next connect redoes the full
+            // sequence, which is what actually re-establishes the link when the console wakes.
+            ModeRead.Silent -> {
+                Log.w(TAG, "direct link enumerated but not answering; dropping the handshake")
+                session.invalidateHandshake()
+                null
+            }
+        }
     }
 
     /**
@@ -804,21 +907,38 @@ class DirectMachineCommands(private val session: DirectMachineSession) : Machine
     /**
      * Whether the console can match fan speed to effort itself.
      *
-     * Answered from the handshake where possible: the wire enum includes `AUTO` (`hj/f`), so a
-     * console that implements a fan register accepts that value. Falls back to whether a fan write
-     * has actually succeeded, and null when we genuinely have not asked.
+     * Null until a fan write has actually settled it — see [DirectMachineSession.autoFanAccepted]
+     * for why this cannot be inferred from the handshake. Returning null rather than a guess is what
+     * makes [MachineCoordinator.restoreFan] willing to try Auto once and believe the answer.
      */
-    override fun autoFanSupported(): Boolean? {
-        session.deviceInfo?.let { info ->
-            return DirectMachineSession.FAN_REGISTERS.any(info::supports)
-        }
-        return if (session.fanRegister != null) true else null
+    override fun autoFanSupported(): Boolean? = session.autoFanAccepted
+
+    /**
+     * The three outcomes of a mode read, which [connect] must tell apart.
+     *
+     * Collapsing [Silent] into [AnsweredWithoutMode] is the bug this exists to prevent: one means
+     * the link is dead, the other means the console is fine and did not send that register, and
+     * they lead to opposite conclusions about whether we are attached.
+     */
+    private sealed interface ModeRead {
+        /** No reply, or one that did not parse. The link is not answering. */
+        data object Silent : ModeRead
+
+        /** A reply arrived, but carried no usable mode. The console is there. */
+        data object AnsweredWithoutMode : ModeRead
+
+        data class Mode(val value: FitProCodec.WorkoutMode) : ModeRead
     }
 
-    private fun readWorkoutMode(): FitProCodec.WorkoutMode? {
-        val response = session.exchange(reads = listOf(FitProCodec.Register.WORKOUT_MODE)) ?: return null
-        if (!response.accepted) return null
-        return response.value(FitProCodec.Register.WORKOUT_MODE)?.let(FitProCodec::decodeWorkoutMode)
+    private fun readWorkoutMode(): ModeRead {
+        // A reply of any status means something is on the other end and talking, even if it is
+        // refusing; only a null is silence. `accepted` is about the answer, not about the link.
+        val response = session.exchange(reads = listOf(FitProCodec.Register.WORKOUT_MODE))
+            ?: return ModeRead.Silent
+        if (!response.accepted) return ModeRead.AnsweredWithoutMode
+        val mode = response.value(FitProCodec.Register.WORKOUT_MODE)?.let(FitProCodec::decodeWorkoutMode)
+            ?: return ModeRead.AnsweredWithoutMode
+        return ModeRead.Mode(mode)
     }
 
     private fun setMode(mode: FitProCodec.WorkoutMode, label: String): MachineAck =
@@ -853,30 +973,57 @@ class DirectMachineCommands(private val session: DirectMachineSession) : Machine
         const val TAG = "DirectMachine"
 
         /**
-         * Whole-[step] values within a range, highest first, capped so a nonsense range cannot
-         * produce a nonsense list.
+         * Whole-[step] values within a range, highest first, with both ends always present.
          *
-         * Descending to match the GlassOS preset order, which the UI lays out top-down. The cap
-         * exists because these bounds come off a wire: a machine that reports a 0–3000 range through
-         * a decoding error would otherwise hand the UI three thousand buttons.
+         * Descending to match the GlassOS preset order, which the UI lays out top-down.
+         *
+         * The two ends are included explicitly rather than left to the step arithmetic, because a
+         * range rarely lands on step boundaries and both ends matter more than the middle: the
+         * fastest speed a machine offers is the one riders reach for, and the slowest is the one
+         * they need to walk. A pure step walk from the floor drops the maximum whenever the range
+         * is not a whole number of steps, and produces *nothing at all* for a range too narrow to
+         * contain a step — a 2.5 to 2.7 incline would leave a rider with no buttons.
+         *
+         * Ends are rounded inward to one decimal, never outward: a button that asks for slightly
+         * less than the machine's minimum is a button that gets clamped or refused, which looks
+         * like a broken control rather than a rounded one.
+         *
+         * The cap exists because these bounds come off a wire: a machine that reports a 0-3000
+         * range through a decoding error would otherwise hand the UI three thousand buttons.
          */
         fun ladder(min: Double, max: Double, step: Double): List<Double> {
             if (!min.isFinite() || !max.isFinite() || max < min) return emptyList()
-            val out = mutableListOf<Double>()
+            if (!step.isFinite() || step <= 0.0) return emptyList()
+
+            val floor = ceil1(min)
+            val ceiling = floor1(max)
+            // Rounding inward can cross the bounds over on a range narrower than 0.1; there is no
+            // honest button to offer in that case, so offer the one value both ends agree on.
+            if (ceiling < floor) return listOf(round1(min))
+
+            val out = sortedSetOf<Double>(reverseOrder())
+            out += floor
+            out += ceiling
             var v = kotlin.math.ceil(min / step) * step
+            // Both ends are already in the set, so they survive the cap regardless of where it
+            // bites — a truncated ladder that has lost its extremes is worse than one that has
+            // lost part of its middle.
             while (v <= max + 1e-9 && out.size < MAX_PRESETS) {
-                out += round1(v)
+                val rounded = round1(v)
+                if (rounded in floor..ceiling) out += rounded
                 v += step
             }
-            // A floor that is not itself a step — a 0.5 mph minimum — is still a speed the machine
-            // offers, and dropping it would put the lowest button above the slowest walk.
-            val floor = round1(min)
-            if (out.isNotEmpty() && floor < out.first() && floor !in out) out.add(0, floor)
-            return out.distinct().sortedDescending()
+            return out.toList()
         }
 
         const val MAX_PRESETS = 40
 
         fun round1(v: Double): Double = kotlin.math.round(v * 10.0) / 10.0
+
+        /** One decimal place, never rounding below [v] — used for a range's lower bound. */
+        fun ceil1(v: Double): Double = kotlin.math.ceil(v * 10.0 - 1e-9) / 10.0
+
+        /** One decimal place, never rounding above [v] — used for a range's upper bound. */
+        fun floor1(v: Double): Double = kotlin.math.floor(v * 10.0 + 1e-9) / 10.0
     }
 }

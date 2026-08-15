@@ -182,12 +182,74 @@ class DirectPresetLadderTest {
     fun `a wildly decoded range is capped rather than handed to the UI whole`() {
         // The guard against a decoding error: a range read as 0-3000 must not produce a list the
         // UI would try to lay out.
-        assertTrue(ladder(0.0, 3000.0).size <= 40)
+        val out = ladder(0.0, 3000.0)
+        assertTrue(out.size <= 40)
+        // The cap must not cost the extremes: both ends are seeded before the walk begins.
+        assertEquals(3000.0, out.first(), 1e-9)
+        assertEquals(0.0, out.last(), 1e-9)
     }
 
     @Test
-    fun `a range narrower than one step still offers the floor`() {
-        assertEquals(listOf(2.0), ladder(2.0, 2.4))
+    fun `a range narrower than one step still offers both of its ends`() {
+        // Previously this produced only the floor, because the ladder was a pure step walk and the
+        // machine's actual maximum was never a step. The top of the range is the more useful of the
+        // two, so losing it was the worse half of the bug.
+        assertEquals(listOf(2.4, 2.0), ladder(2.0, 2.4))
+    }
+
+    @Test
+    fun `a range containing no step at all still offers buttons`() {
+        // The case that produced an empty list: no whole number lies between 2.5 and 2.7, so the
+        // step walk never ran and a rider got no quick picks whatsoever.
+        assertEquals(listOf(2.7, 2.5), ladder(2.5, 2.7))
+    }
+
+    @Test
+    fun `the machine's maximum is always reachable`() {
+        // 12.5 is not a whole step from 1.0, and a pure step walk stops at 12.0 — leaving the
+        // treadmill's top speed off the one control built to reach it.
+        val out = ladder(1.0, 12.5)
+        assertEquals(12.5, out.first(), 1e-9)
+        assertEquals(1.0, out.last(), 1e-9)
+        assertTrue("whole steps still fill the middle", out.contains(12.0) && out.contains(6.0))
+    }
+
+    @Test
+    fun `bounds are rounded inward so no button falls outside the machine's range`() {
+        // Rounding 0.549 to 0.5 would offer a speed below the slowest the machine accepts, which
+        // reads to a rider as a button that does nothing rather than one that was rounded.
+        val out = ladder(0.549, 4.449)
+        assertEquals("floor must not round below the minimum", 0.6, out.last(), 1e-9)
+        assertEquals("ceiling must not round above the maximum", 4.4, out.first(), 1e-9)
+    }
+
+    @Test
+    fun `a zero or negative step is refused rather than looping`() {
+        assertTrue(ladder(1.0, 10.0, 0.0).isEmpty())
+        assertTrue(ladder(1.0, 10.0, -1.0).isEmpty())
+    }
+
+    @Test
+    fun `a range too narrow to have two distinct ends still offers one button`() {
+        // Inward rounding can cross the bounds over; the honest answer is the single value they
+        // agree on, not an empty rail.
+        assertEquals(listOf(2.5), ladder(2.48, 2.52))
+    }
+
+    /**
+     * The GlassOS wire enum for `Control.type`, pinned to the protobuf definition in `pb/e.java`.
+     *
+     * The same APK contains a *second* control-type enum — the Kotlin SDK's `IFitControlType`
+     * (`vf/a.java`), ordered `unknown, gear, incline, mps, …`, which makes incline 2 and mps 3.
+     * Reconciling Stride against that one would look like fixing an off-by-one and would actually
+     * swap the speed and incline rails, with no error anywhere: `shapePresets` filters by equality,
+     * so a wrong constant yields an empty or wrong list rather than a failure.
+     */
+    @Test
+    fun controlTypeMatchesTheProtobufEnumNotTheSdkEnum() {
+        assertEquals("CONTROL_TYPE_UNKNOWN", 0, GlassOsClient.ControlType.UNKNOWN)
+        assertEquals("CONTROL_TYPE_INCLINE", 1, GlassOsClient.ControlType.INCLINE)
+        assertEquals("CONTROL_TYPE_MPS", 2, GlassOsClient.ControlType.MPS)
     }
 
     private fun invokeLadder(min: Double, max: Double, step: Double): List<Double> {

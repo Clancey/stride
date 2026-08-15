@@ -646,6 +646,25 @@ Three decisions carry the design:
 It also settles a question open since Revision 1: **distance is a register the machine reports
 (`CURRENT_DISTANCE`, `ACTUAL_DISTANCE`), not something the console integrates.**
 
+A second verification pass against the same APK found three more defects and one false alarm, which
+is roughly the ratio to expect when the source of truth is a decompiler rather than a datasheet.
+`resume()` was writing `RUNNING` where GlassOS writes `RESUME`; `autoFanSupported()` inferred auto-fan
+capability from the fan register being present, which nothing on the wire supports — GlassOS reads it
+from a per-console config blob, so the only honest answer is to try it once and believe the refusal;
+and the `DEVICE_INFO` version bytes were labelled in the wrong order, which was harmless while they
+were only logged and stopped being harmless the moment one of them acquired a meaning.
+
+That meaning is `VERIFY_SECURITY`. Consoles reporting software version **above 75** are sent a
+challenge Stride cannot answer. This is not implemented, because it cannot be — it is *detected*, so
+that a machine which completes the handshake and then refuses every write says so instead of looking
+like a broken cable. Knowing the boundary is worth more than guessing at the blob.
+
+The false alarm is the more useful lesson. `ControlType` looked off by one against an enum in the
+decompiled SDK and was in fact already correct — the SDK type never reaches the socket, and the real
+wire enum is the protobuf's. "Fixing" it would have swapped the speed and incline rails silently,
+because presets are separated by filtering on that value and nothing would have thrown. It now
+carries a comment and a test that exist purely to stop the next reader from making the correction.
+
 Not yet run against real hardware. What remains is a sanity readback, not a search.
 
 ### 3.11 Updates — how anything ever reaches a console again

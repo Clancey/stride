@@ -468,6 +468,17 @@ class GlassOsClient(private val context: Context) {
      * than coerced — a resistance level is not a treadmill speed, and forcing it into one would
      * invent buttons the machine never offered.
      */
+    /**
+     * `Control.type`, from the gRPC enum `pb.e` in GlassOS. VERIFIED.
+     *
+     * **There is a second, differently numbered ControlType in the same APK** — the Kotlin SDK's
+     * `IFitControlType` (`vf/a`), whose order is `unknown, gear, incline, mps, …`, making incline 2
+     * and mps 3. That one is an internal SDK type and is *not* what crosses the wire. The wire enum
+     * is the protobuf one below, reached from `Control.type_` via `pb.e.b(int)`.
+     *
+     * Reconciling these two the wrong way would not fail: it would silently filter the speed presets
+     * out of the incline rail and vice versa.
+     */
     object ControlType {
         const val UNKNOWN = 0
         const val INCLINE = 1

@@ -80,6 +80,15 @@ object MachineLink {
             "using the console."
 
     /**
+     * How often the poll retries direct discovery when nothing is attached.
+     *
+     * Long enough that a console with no treadmill wired to it is not enumerating USB forever, short
+     * enough that powering the treadmill on, finishing a pairing, or granting the USB dialog is
+     * picked up while the rider is still looking at the screen.
+     */
+    private const val DIRECT_REOPEN_INTERVAL_MS = 5_000L
+
+    /**
      * What a control says when GlassOS is answering but has no machine attached to it.
      *
      * Its own state, not a guess: the console reports [GlassOsClient.ConsoleState.DISCONNECTED]
@@ -228,7 +237,15 @@ object MachineLink {
     @Volatile private var inclinePresetsCache: List<Double>? = null
     @Volatile private var speedPresetsCache: List<Double>? = null
     // Distinct from the caches being null: null there means "no presets", this means "not asked".
-    @Volatile private var presetsFetched: Boolean = false
+    @Volatile private var inclinePresetsFetched: Boolean = false
+    @Volatile private var speedPresetsFetched: Boolean = false
+
+    /**
+     * Bumped whenever a preset answer lands. The overlay builds its rails once, before any machine
+     * has been asked anything, so without a signal that the answers have arrived it would show the
+     * fallback ladder for the life of the window.
+     */
+    val presetsGeneration = java.util.concurrent.atomic.AtomicInteger(0)
 
     private var thread: HandlerThread? = null
     private var handler: Handler? = null
@@ -421,6 +438,10 @@ object MachineLink {
         val app = appContext ?: return
         handler?.post {
             closeTransport()
+            // The rider just asked for this transport, so a permission dialog is expected rather
+            // than a surprise, and a previous denial should not silence it forever.
+            usbPermissionAsked = false
+            nextDirectOpenAt = 0L
             openTransport(app)
             // Connect immediately rather than waiting for a poll to notice. A rider who flips the
             // switch is watching the screen right then, and the difference between "controls live
@@ -473,6 +494,17 @@ object MachineLink {
         }
         if (transport == null) {
             openFailure = DIRECT_NO_TRANSPORT
+            // A console whose USB device is present but ungranted looks exactly like one that is
+            // absent, and the grant can only come from a dialog somebody has to raise. Nothing
+            // raised it, so direct-over-USB could never open on a fresh install however many times
+            // the rider tried. Asked once per rider action rather than once per retry: this also
+            // runs from the poll's discovery retry, and a permission dialog every two seconds is
+            // its own kind of broken.
+            if (!usbPermissionAsked) {
+                usbPermissionAsked = true
+                runCatching { UsbSerialTransport.requestPermission(app) }
+                    .onFailure { Log.w(TAG, "requesting USB permission failed", it) }
+            }
             MachineCoordinator.rebind(null)
             return
         }
@@ -504,6 +536,15 @@ object MachineLink {
         MachineCoordinator.rebind(DirectMachineCommands(session))
     }
 
+    /**
+     * Throttles [reopenDirectIfDropped]'s discovery retry. Cleared by [closeTransport] and
+     * [retarget] so a deliberate switch is never made to wait out the previous one's backoff.
+     */
+    private var nextDirectOpenAt = 0L
+
+    /** Whether this rider action has already raised the USB permission dialog. */
+    private var usbPermissionAsked = false
+
     private fun closeTransport() {
         MachineCoordinator.rebind(null)
         direct = null
@@ -519,7 +560,10 @@ object MachineLink {
         snapshotAt = 0L
         inclinePresetsCache = null
         speedPresetsCache = null
-        presetsFetched = false
+        inclinePresetsFetched = false
+        speedPresetsFetched = false
+        presetsGeneration.incrementAndGet()
+        nextDirectOpenAt = 0L
         synchronized(connectLock) {
             connectFailures = 0
             nextConnectAt = 0L
@@ -658,11 +702,35 @@ object MachineLink {
      * previously requested speed can survive the gap. That is checklist item 7 — reconnection must
      * not replay a target — enforced by construction rather than by remembering to.
      */
+    /**
+     * Reopen the direct link when it has dropped — **or when there was never one to drop.**
+     *
+     * The second half is the important one. `openDirect` leaves no session at all if no device
+     * answered, so guarding on an existing session meant that selecting DIRECT before the console
+     * was reachable produced a dead setting that could only be revived by toggling it again. Every
+     * ordinary way that happens — the treadmill powered on afterwards, a BLE console still pairing,
+     * a USB cable seated late, the permission grant arriving from the dialog we raise below — is a
+     * few seconds of waiting, which is exactly the case that used to require the rider to know the
+     * cure was to flip the switch twice.
+     *
+     * Rate-limited because, unlike the dropped-session case, this runs when nothing is attached at
+     * all, and USB enumeration plus a handshake attempt on every poll is real work to do forever on
+     * a console that simply has no treadmill wired to it.
+     */
     private fun reopenDirectIfDropped() {
-        val session = directSession ?: return
-        if (session.connected) return
         val app = appContext ?: return
-        Log.i(TAG, "direct transport dropped; re-running handshake")
+        if (StrideSettings.transport != StrideSettings.Transport.DIRECT) return
+        val session = directSession
+        if (session != null && session.connected) return
+
+        val now = SystemClock.elapsedRealtime()
+        if (now < nextDirectOpenAt) return
+        nextDirectOpenAt = now + DIRECT_REOPEN_INTERVAL_MS
+
+        Log.i(
+            TAG,
+            if (session == null) "no direct transport yet; retrying discovery" else "direct transport dropped; re-running handshake",
+        )
         closeTransport()
         openTransport(app)
     }
@@ -676,17 +744,35 @@ object MachineLink {
      * `MIN_GRADE`/`MAX_GRADE` registers. The rider gets quick picks either way, and this function
      * does not know or care which happened.
      *
-     * A null answer means the question could not be asked, and leaves [presetsFetched] false so a
-     * later poll retries. Only a real list — even an empty one — counts as fetched. An empty list is
-     * stored as null so callers see one "no presets" signal rather than two.
+     * A null answer means the question could not be asked, and leaves that axis unfetched so a later
+     * poll retries it. The two axes are fetched **independently**: a machine that answers about speed
+     * but not incline — a flat treadmill, or a console whose incline control list is missing — must
+     * still get its speed rail, and coupling them meant one null answer suppressed both.
+     *
+     * An empty list is a real answer and is kept as one. It means "this machine offers no presets on
+     * this axis", which is not the same as "we have not asked yet", and collapsing the two is what
+     * let the overlay fall back to a hardcoded ladder for a machine that had positively said it had
+     * nothing to offer.
+     *
+     * [presetsGeneration] is bumped whenever an answer lands so the overlay can rebuild rails that
+     * were built before the machine had told us anything.
      */
     private fun fetchPresetsOnce() {
-        if (presetsFetched) return
-        val incline = MachineCoordinator.ask { it.inclinePresets() } ?: return
-        val speed = MachineCoordinator.ask { it.speedPresetsMph() } ?: return
-        inclinePresetsCache = incline.takeIf { it.isNotEmpty() }
-        speedPresetsCache = speed.takeIf { it.isNotEmpty() }
-        presetsFetched = true
+        if (inclinePresetsFetched && speedPresetsFetched) return
+        if (!inclinePresetsFetched) {
+            MachineCoordinator.ask { it.inclinePresets() }?.let {
+                inclinePresetsCache = it
+                inclinePresetsFetched = true
+                presetsGeneration.incrementAndGet()
+            }
+        }
+        if (!speedPresetsFetched) {
+            MachineCoordinator.ask { it.speedPresetsMph() }?.let {
+                speedPresetsCache = it
+                speedPresetsFetched = true
+                presetsGeneration.incrementAndGet()
+            }
+        }
     }
 
     /**

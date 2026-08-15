@@ -278,8 +278,8 @@ class FitProCodecTest {
     fun parseDeviceInfoDecodesTheSupportedRegisterMask() {
         val reply = bytes(
             0x02, 0x11, 0x81, 0x02, // addr, len 17, DEVICE_INFO, DONE
-            0x05, 0x07, // hardware 5, firmware 7
-            0xE5, 0x42, 0x00, 0x00, // model 17125, little-endian
+            0x05, 0x07, // software 5, hardware 7
+            0xE5, 0x42, 0x00, 0x00, // serial 17125, little-endian
             0x04, 0x00, // brand 4 = NORDIC_TRACK
             0x03, // three mask bytes
             0x03, 0x00, 0x03, // fields 0,1 and 16,17
@@ -287,9 +287,9 @@ class FitProCodecTest {
         )
         val info = FitProCodec.parseDeviceInfo(reply)
         assertNotNull(info)
-        assertEquals(5, info!!.hardwareVersion)
-        assertEquals(7, info.firmwareVersion)
-        assertEquals(17125, info.modelNumber)
+        assertEquals(5, info!!.softwareVersion)
+        assertEquals(7, info.hardwareVersion)
+        assertEquals(17125, info.serialNumber)
         assertEquals(FitProCodec.Brand.NORDIC_TRACK, info.brand)
         assertTrue(info.supports(FitProCodec.Register.KPH))
         assertTrue(info.supports(FitProCodec.Register.GRADE))
@@ -297,6 +297,44 @@ class FitProCodecTest {
         // Not in the mask, so the honest answer is "this machine has no controllable fan".
         assertFalse(info.supports(FitProCodec.Register.FAN_STATE))
         assertFalse(info.supports(FitProCodec.Register.FAN_SPEED))
+        // Software 5 is far below the threshold, so this console would never be asked for security.
+        assertFalse("low software version must not demand security", info.requiresSecurity)
+    }
+
+    /**
+     * GlassOS only performs the `VERIFY_SECURITY` exchange when the console's *software* version is
+     * above 75 (`xh/n0.smali`: `const/16 v13, 0x4b` guarding the call). Stride cannot perform that
+     * exchange at all, so this boundary is the line between "direct control will work on this
+     * machine" and "writes may be refused for a reason no log would otherwise explain".
+     *
+     * Pinned because the two version bytes are adjacent and were previously labelled the other way
+     * round: reading byte 5 instead of byte 4 here would test the hardware version and silently give
+     * the wrong answer on every machine.
+     */
+    @Test
+    fun deviceInfoFlagsConsolesThatWouldDemandSecurity() {
+        fun infoWithSoftware(software: Int, hardware: Int): FitProCodec.DeviceInfo {
+            val reply = bytes(
+                0x02, 0x0F, 0x81, 0x02,
+                software, hardware,
+                0x00, 0x00, 0x00, 0x00,
+                0x04, 0x00,
+                0x01,
+                0x03,
+                0x00,
+            )
+            return requireNotNull(FitProCodec.parseDeviceInfo(reply))
+        }
+
+        assertEquals(75, FitProCodec.SECURITY_REQUIRED_ABOVE)
+        // The guard is `<=`, so 75 itself is still in the clear.
+        assertFalse("75 is at the limit, not past it", infoWithSoftware(75, 0).requiresSecurity)
+        assertTrue("76 is past the limit", infoWithSoftware(76, 0).requiresSecurity)
+        // A high hardware version must not trigger it: only byte 4 counts.
+        assertFalse(
+            "hardware version must not be mistaken for software version",
+            infoWithSoftware(10, 200).requiresSecurity,
+        )
     }
 
     @Test

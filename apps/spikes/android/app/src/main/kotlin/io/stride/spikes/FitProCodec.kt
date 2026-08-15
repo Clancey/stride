@@ -71,6 +71,13 @@ object FitProCodec {
     const val FRAME_OVERHEAD: Int = 4
 
     /**
+     * The software version above which a console demands `VERIFY_SECURITY` before it will accept
+     * writes. VERIFIED (`xh/n0.smali`: `const/16 v13, 0x4b` then `if-le … :cond_c`, skipping the
+     * security branch for anything at or below it).
+     */
+    const val SECURITY_REQUIRED_ABOVE: Int = 75
+
+    /**
      * Offset of the first read value in a response.
      *
      * Three header bytes then the status byte, so values begin at 4 — the same number as
@@ -743,9 +750,9 @@ object FitProCodec {
     data class DeviceInfo(
         /** The address to use for every subsequent frame. */
         val address: Int,
+        val softwareVersion: Int,
         val hardwareVersion: Int,
-        val firmwareVersion: Int,
-        val modelNumber: Int,
+        val serialNumber: Int,
         val brand: Brand,
         val supportedFieldIds: Set<Int>,
     ) {
@@ -754,14 +761,32 @@ object FitProCodec {
             get() = Register.entries.filter { it.fieldId in supportedFieldIds }.toSet()
 
         fun supports(register: Register): Boolean = register.fieldId in supportedFieldIds
+
+        /**
+         * Whether this console would demand `VERIFY_SECURITY` before honouring writes. VERIFIED
+         * (`xh/n0.smali` ~line 610: `if-le softwareVersion, 0x4b` skips the security call).
+         *
+         * Stride cannot satisfy that exchange, so this is not a gate we can pass — it is a flag that
+         * tells us *why* a machine might accept the handshake and then refuse every write, which is
+         * otherwise an almost undiagnosable symptom.
+         */
+        val requiresSecurity: Boolean get() = softwareVersion > SECURITY_REQUIRED_ABOVE
     }
 
     /**
-     * Parses a `DEVICE_INFO` reply. VERIFIED (`vh/e.a`, case 0).
+     * Parses a `DEVICE_INFO` reply. VERIFIED (`vh/e.a`, case 0, against the field names that
+     * `yh/b.toString()` spells out).
      *
-     * Layout after the 4-byte header: hardware version, firmware version, a 4-byte little-endian
-     * model number, a 2-byte little-endian brand, a mask-byte count, then that many mask bytes whose
-     * set bits are supported field ids.
+     * Layout after the 4-byte header: software version, hardware version, a 4-byte little-endian
+     * serial number, a 2-byte little-endian manufacturer, a mask-byte count, then that many mask
+     * bytes whose set bits are supported field ids.
+     *
+     * The first two bytes were previously labelled the other way round here, and byte 6 was called a
+     * model number. `yh/b`'s constructor is `(device, softwareVersion, hardwareVersion, serialNumber,
+     * manufacturer, sections, …)` and `vh/e` fills it in exactly that order, so the names above are
+     * the machine's, not a guess. Only the mask is load-bearing, but the software version decides
+     * whether a console demands security (see [DeviceInfo.requiresSecurity]) — so having these two
+     * swapped would have made that test read the wrong byte.
      *
      * Note this reads the multi-byte fields as unsigned where iFit's own decoder sign-extends them
      * (`bArr[6] + (bArr[7] << 8)` on Java's signed bytes). Those fields are informational, so being
@@ -781,9 +806,9 @@ object FitProCodec {
         }
         return DeviceInfo(
             address = bytes[0].toInt() and 0xFF,
-            hardwareVersion = bytes[4].toInt() and 0xFF,
-            firmwareVersion = bytes[5].toInt() and 0xFF,
-            modelNumber = leToInt(bytes.copyOfRange(6, 10), 4),
+            softwareVersion = bytes[4].toInt() and 0xFF,
+            hardwareVersion = bytes[5].toInt() and 0xFF,
+            serialNumber = leToInt(bytes.copyOfRange(6, 10), 4),
             brand = Brand.fromValue(leToInt(bytes.copyOfRange(10, 12), 2)),
             supportedFieldIds = fields,
         )

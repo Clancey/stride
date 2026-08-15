@@ -156,18 +156,48 @@ labels them "Fake field, exist only in values array". Connecting is a handshake,
 
 ### DEVICE_INFO reply layout
 
+Names taken from `yh/b.toString()`, which spells out its own constructor order, and matched against
+the fill order in `vh/e.a` case 0.
+
 | Bytes | Meaning |
 |-------|---------|
-| `[4]` | hardware version |
-| `[5]` | firmware version |
-| `[6..9]` | model, int32 LE |
-| `[10..11]` | brand, int16 LE |
+| `[4]` | **software** version |
+| `[5]` | **hardware** version |
+| `[6..9]` | **serial number**, int32 LE |
+| `[10..11]` | manufacturer, int16 LE |
 | `[12]` | supported-register mask byte count |
 | `[13..]` | supported-register mask |
+
+An earlier revision of this document had the first two the other way round and called `[6..9]` a
+model number. That was harmless while the versions were only logged, and stopped being harmless the
+moment the software version acquired a meaning — see the security note below.
 
 **That mask is how the machine answers "does incline work? does the fan work?"** — which is exactly
 the question the settings screen used to answer with a hardcoded guess. It is now capability-driven:
 the console says what it implements and the UI reports that.
+
+The mask is indexed by **field id**, not by ordinal: `vh/e` sets bit `(i * 8) + bit` and matches it
+against `sh.a.D`, which is the field id. This is what makes it safe to use the mask to filter read
+lists, which the direct path must do — values are packed contiguously with no per-value tags, so a
+single unsupported register in a read list makes the whole response unparseable.
+
+### VERIFY_SECURITY — the one thing the direct path cannot do
+
+GlassOS sends `VERIFY_SECURITY` (command `0x90`, a 36-byte body: a 32-byte blob plus a 4-byte LE bit
+count) **only when the console's software version is above 75**. The guard is explicit in
+`xh/n0.smali`:
+
+```
+iget v5, v0, Lyh/b;->b:I    # softwareVersion
+const/16 v13, 0x4b          # 75
+if-le v5, v13, :cond_c      # <= 75 skips the security branch entirely
+```
+
+The blob is built by an XOR loop over a seed rather than by real cryptography, but it is still a
+secret Stride has no legitimate way to hold. So this is not a gate the direct path can pass — it is
+recorded as `DeviceInfo.requiresSecurity` purely so that a console which completes the handshake and
+then refuses every write has a visible explanation, instead of presenting as an inexplicably dead
+link. Machines at or below software 75 are unaffected, which is why direct control works at all.
 
 ### Addressing
 
@@ -243,6 +273,33 @@ FitPro's `RUNNING` (2) is GlassOS's `IDLE` (2's neighbour in the other enum). Ca
 that boundary would silently report a running treadmill as idle. `FitProValues` converts explicitly
 in both directions and `DirectTransportParityTest` pins the mapping.
 
+### A third pair — and this one is a decoy
+
+`ControlType` in `GlassOsClient` was flagged during review as off-by-one against `vf/a.java`
+(`IFitControlType`: `unknown(0), gear(1), incline(2), mps(3)`). It is not. The **wire** enum is
+`pb/e.java` — `CONTROL_TYPE_UNKNOWN(0), CONTROL_TYPE_INCLINE(1), CONTROL_TYPE_MPS(2)` — reached from
+the `Control` message in `pb/b.java` (`type = 1, at = 2, value = 3`) through `pb.e.b(int)`. Stride
+matches the protobuf exactly. `vf/a` is an internal Kotlin SDK type that never reaches the socket.
+
+This is recorded because "correcting" it would have been invisible: incline and speed presets are
+separated by filtering on this value, so shifting it by one swaps the two rails and throws nothing.
+`DirectTransportParityTest` now pins the values with a comment pointing here.
+
+### `RESUME` is sent, even though GlassOS declines to publish it
+
+`xh/n0.p0()` is a 1:1 translation from GlassOS `ConsoleState` to FitPro `WorkoutMode`, and
+`ConsoleState.RESUME` maps to `WorkoutMode.RESUME` (13) — not to `RUNNING`. Stride was sending
+`RUNNING` on resume.
+
+The confusing part is `vh/f.m()`, which returns early for `(WORKOUT_MODE, RESUME)` and reads like a
+"never send RESUME" guard. It is not: `m()` returns `void` and only touches a metric key, so it is
+the **publisher**. The frame builders are `g()` and `j()`, and neither excludes RESUME. GlassOS puts
+RESUME on the wire and merely declines to surface it as a console state — consistent with the read
+side, which maps RESUME to `WORKOUT_RUNNING`.
+
+`resume()` now writes RESUME and falls back to RUNNING only if the console refuses, so a machine that
+does not implement the mode still resumes.
+
 ## `workoutId` — VERIFIED, and synthesised on the direct path
 
 Every GlassOS metric response carries a `workoutID` in field 1 (`nb/r3` — `GetSpeedResponse`:
@@ -306,9 +363,15 @@ here does not fail loudly — it produces a different, valid command.
 | Payload is `[fieldId] + value` per register | **`[maskCount][mask bytes][values]`** |
 | Checksum unknown, possibly a CRC | **SUM8**, last byte |
 | Fan is register 8 | `FAN_SPEED` is 8, but **`FAN_STATE` = 98** is the one that works |
+| `DEVICE_INFO[4]` is hardware, `[5]` firmware, `[6..9]` model | **`[4]` software, `[5]` hardware, `[6..9]` serial** |
+| `resume()` writes `RUNNING` | **`RESUME` (13)**, with `RUNNING` only as a fallback |
+| Auto fan support is implied by the fan register being present | **Nothing on the wire carries it** — it is a per-console config field, so the only honest answer is to try it once |
 
-That last one is the likely reason the fan appeared not to work, and it is the origin of this whole
+That fan one is the likely reason the fan appeared not to work, and it is the origin of this whole
 piece of work.
+
+One claim was checked and found **already correct**: `ControlType`. It is listed under "two enums
+that look alike" above rather than here, because the trap is that it looks wrong.
 
 ## What is still open
 
@@ -317,3 +380,12 @@ piece of work.
 - Distance and elapsed-time units are inferred (above).
 - `SUPPORTED_DEVICES` is requested during the handshake but the reply is not checked, so there is no
   model or device-type allowlist before commands are bound.
+- **Whether GlassOS's `StartNewWorkout` moves the belt by itself.** The gRPC handler is behind
+  obfuscated coroutine plumbing and was not traced. It matters only as a parity nicety: Stride's
+  `MachineCoordinator.startWorkout` is shared by both transports and sets no speed of its own, so if
+  GlassOS does start the belt internally, the direct path is the quieter of the two. That asymmetry
+  is in the safe direction, and closing it by guessing would mean writing a speed — moving a
+  treadmill — on an assumption, which is the one class of change this document exists to prevent.
+- The preset **ladder step** (1.0) is invented. No preset register exists in FitPro, so the direct
+  path must synthesise the quick picks; the endpoints come from the machine's own MIN/MAX registers,
+  but nothing corroborates the spacing between them.
