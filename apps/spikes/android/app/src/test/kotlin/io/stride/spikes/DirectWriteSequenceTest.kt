@@ -42,6 +42,23 @@ class DirectWriteSequenceTest {
 
         override fun exchange(frame: ByteArray, timeoutMs: Long): ByteArray? {
             if (silent) return null
+            // A real console validates before it acts, and so must this one. Without these checks
+            // the fake answers a frame addressed to the wrong device, carrying the wrong command,
+            // or with a corrupt checksum exactly as happily as a correct one — so a codec that
+            // builds frames correctly (FitProCodecTest) plus a caller that builds them wrongly
+            // would pass both suites. These are the only assertions covering that seam.
+            assertEquals("frames must be addressed to MAIN", FitProCodec.ADDRESS_MAIN, frame[0].toInt() and 0xFF)
+            assertEquals("the length byte must match the frame", frame.size, frame[1].toInt() and 0xFF)
+            assertEquals(
+                "register traffic must use READ_WRITE_DATA",
+                FitProCodec.Command.READ_WRITE_DATA.value,
+                frame[2].toInt() and 0xFF,
+            )
+            assertEquals(
+                "the checksum must cover every byte before it",
+                FitProCodec.checksum(frame, frame.size - 1),
+                frame[frame.size - 1],
+            )
             val body = frame.copyOfRange(3, frame.size - 1)
             var i = 0
             val writeMaskLen = body[i].toInt() and 0xFF
