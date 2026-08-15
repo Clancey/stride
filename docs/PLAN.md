@@ -569,7 +569,7 @@ The console is 1920x1080 at density 160, so 1 dp is 1 px and every number below 
 | Metric strip | top, full width, 186 px | chrome visible; toggleable ("Metrics") |
 | Speed / incline rails | left and right, 132 dp, scrollable presets | chrome visible; toggleable per side |
 | Bottom bar | bottom, 132 px — Back / Home / Recents, timer transport, volume, fan, toggles | always, while chrome visible |
-| Track floor | bottom centre, 1020 x 300 dp, perspective oval | a workout exists, no video playing, not over Stride's own launcher; toggleable ("Track") |
+| Track floor | the whole centre region — everything the strip, bottom bar and rails leave over | a workout exists, no video playing, not over Stride's own launcher; toggleable ("Track") |
 | Goal ring | bottom right, 260 dp | a goal exists **and** a session exists to measure it against |
 | Now-playing card | bottom left | music (not video) has an active `MediaSession` |
 
@@ -589,6 +589,10 @@ Rules this surface has already had to learn the hard way:
   content area. Third-party apps get no inset and are not expected to cooperate.
 - **The goal belongs to the session.** Ending a workout clears it. A ring reading "0%" over an idle
   console is not a stale number, it is a number about a workout that no longer exists.
+- **A missing reading is not a zero reading.** The overlay polls at 1 Hz against a freshness window
+  that outlives a single dropped poll, so the track's lap marker holds its last known position for a
+  few seconds and then disappears entirely. Drawing "we cannot see you" as a marker parked on the
+  start line claims the runner teleported back to the beginning, once a second, forever.
 - **Every bottom sheet in the launcher goes through `showStrideSheet()`.** A stock
   `showModalBottomSheet` sizes against the full window, ignores the ~318 px the HUD occupies, and
   clipped a safety warning mid-sentence.
