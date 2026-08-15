@@ -98,7 +98,15 @@ Schema v1, documented in full in the [catalog repository's README][catalog]:
       "sizeBytes": 31457280,
       "sha256": "…",
       "signerSha256": "…",
-      "releaseNotesUrl": "https://github.com/Clancey/stride/releases/tag/v0.4.2"
+      "releaseNotesUrl": "https://github.com/Clancey/stride/releases/tag/v0.4.2",
+      "releaseNotes": [        // newest first; see §4.1
+        {
+          "versionCode": 42,
+          "versionName": "0.4.2",
+          "date": "2026-08-14",
+          "notes": "Plain text. No markdown, no links."
+        }
+      ]
     }
   ]
 }
@@ -109,6 +117,10 @@ The parser rejects the **whole document**, never one entry, on: an unknown `sche
 package name, a duplicate package, a second `"role": "stride"`, or a malformed `bundles` array
 (§11). Partial acceptance of a document
 that decides what gets installed on a machine with a motor is not a behaviour worth having.
+
+`releaseNotes` is the one exception, and deliberately so: a malformed note is skipped and the rest of
+the document still parses. Notes change what a rider is *told*, never what is installed, so refusing
+the catalog over some prose would take the console's only update path down to protect a paragraph.
 
 Rejecting an unknown `schema` outright is the deliberate one: a future field an old client silently
 ignored could be the one that matters — a revocation flag, say. Refusing is the safe read.
@@ -121,6 +133,26 @@ tools/publish.sh app-release.apk --role stride --name Stride
 
 It reads `versionCode`, `versionName`, `minSdk` and ABIs out of the APK rather than from arguments,
 computes the digests, and rewrites `catalog.json`.
+
+### 4.1 Release notes travel in the catalog, not behind a link
+
+`releaseNotesUrl` was there first and is still emitted, but nothing on the console can follow it:
+this device has no browser. A rider deciding whether to restart the launcher — which takes the
+overlay, Back and Home down with it — was being shown a version number and a size, and nothing else.
+
+So the text itself rides in the entry, and the update dialog renders it in place. Two consequences:
+
+- **Plain text, not markdown.** The dialog is a Flutter `AlertDialog` on a television. `**bold**`
+  and `[text](url)` would render as literal punctuation, and a URL goes nowhere. `tools/changelog.sh`
+  flattens markdown before anything is written to the catalog; bullets arrive as literal `•`.
+- **A window of versions, not just the newest.** Consoles skip releases — the catalog went from
+  versionCode 9 straight to 12, so a console sitting on 9 was never told what 10 or 11 changed.
+  The entry carries the last several releases and `CatalogEntry.notesNewerThan` narrows that to the
+  ones a given console has not run. A console already on the newest version is told nothing, and a
+  first install gets only the newest entry — a backlog it never lived through is noise.
+
+Notes are generated in this repo, by `tools/changelog.sh`, and written into the catalog by the
+release workflow. See §12.
 
 ## 5. Update policy
 
@@ -270,6 +302,7 @@ Stride's *first* copy, which Stride obviously cannot do itself — is the adb wa
 | `lib/model/appstore.dart` | typed snapshot, tolerant of missing keys |
 | `lib/screens/updates_sheet.dart` | the entire UI |
 | `lib/widgets/bundle_row.dart` | the one-tap bundle row, shared by the sheet and the Store tab |
+| `tools/changelog.sh` | release notes from git history, in markdown and plain text — §12 |
 
 ## 10. Deliberately not built
 
@@ -391,3 +424,65 @@ Re-hosting Google's binaries is redistribution of someone else's software, and t
 third-party APKs raise (§4), only more visible. The mechanism here is neutral — a bundle is an
 ordered install, and the catalog is a list of URLs. What a *published* catalog points at is a
 separate decision, and this document does not claim the default one is settled.
+
+## 12. Release notes, and where they come from
+
+Every released version gets notes automatically. Nothing has to be written by hand for a release to
+describe itself, and anything written by hand wins.
+
+### 12.1 The generator
+
+`tools/changelog.sh` derives the notes for a version from git:
+
+```bash
+tools/changelog.sh notes                  # this version, as markdown
+tools/changelog.sh notes --format plain   # ...flattened, the way the console gets it
+tools/changelog.sh json                   # recent releases, for catalog.json
+tools/changelog.sh regenerate             # rewrite CHANGELOG.md from every tag
+tools/changelog.sh check                  # fail if CHANGELOG.md is stale
+```
+
+The source of a version's notes is, in order:
+
+1. `docs/release-notes/<version>.md`, verbatim, if it exists.
+2. Otherwise the commit subjects since the previous `v*` tag, with `(#N)` turned into a PR link.
+
+The fallback is only tolerable because this repo squash-merges with subjects written for a reader —
+*"Call Connect, and don't claim a workout the treadmill hasn't started"* — rather than for a parser.
+Bookkeeping commits (`Bump…`, `Stride 1.0.8`, merges) are dropped. If the convention ever slips, or
+a release deserves the explanation that 1.0.6 and 1.0.7 got, write the file.
+
+### 12.2 What a tag now produces
+
+Pushing a `v*` tag runs `.github/workflows/release.yml`, which builds and signs the APK as before,
+and additionally:
+
+| Output | Where |
+|---|---|
+| `CHANGELOG.md` entry | this repo, committed to the default branch |
+| GitHub release with real notes | `Clancey/stride` — the step v1.0.8 and v1.0.11 never got |
+| `releaseNotes` in the catalog entry | `Clancey/stride-catalog/catalog.json` — what the console reads |
+| Release body on `stride-N` | `Clancey/stride-catalog`, replacing the publisher's placeholder |
+
+Notes are assembled *before* the build, so a release that cannot describe itself fails in seconds
+rather than after ten minutes of Gradle. The changelog commit happens in a fresh clone, never in the
+build workspace — that workspace holds the decrypted release keystore, and no step that runs
+`git commit` should be one `git add -A` away from publishing it.
+
+The changelog push is the one non-fatal step: by then the APK is published and consoles can see it,
+so a rejected push is a paragraph to re-run, not a reason to show a red release. The run summary says
+how.
+
+### 12.3 Writing notes for a release by hand
+
+Before tagging:
+
+```bash
+$EDITOR docs/release-notes/1.0.12.md     # the version, without the leading v
+tools/changelog.sh notes --format plain  # read it the way the console will
+```
+
+Write prose, not a commit list — the generator already covers the commit list. Keep in mind where it
+lands: a dialog on a television, read by someone standing on a treadmill deciding whether to restart
+the launcher mid-session. Markdown is fine in the file (GitHub gets it intact) and is flattened for
+the console, but a link is worth nothing on a device with no browser, so never make one load-bearing.

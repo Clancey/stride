@@ -253,6 +253,31 @@ data class CatalogManifest(
                 }
             }
 
+            // Release notes are decoration in the same sense an icon is: they change what the rider
+            // is told, never what gets installed. So a malformed entry is skipped rather than
+            // thrown - refusing the whole catalog over a bad notes string would take the console's
+            // only update path down to protect some prose.
+            val notesJson = obj.optJSONArray("releaseNotes")
+            val releaseNotes = buildList {
+                if (notesJson != null) {
+                    for (i in 0 until notesJson.length()) {
+                        val n = notesJson.optJSONObject(i) ?: continue
+                        val body = n.optString("notes").trim()
+                        val code = n.optLong("versionCode", -1L)
+                        if (body.isEmpty() || code < 0L) continue
+                        add(
+                            ReleaseNote(
+                                versionCode = code,
+                                versionName = n.optString("versionName")
+                                    .ifEmpty { code.toString() },
+                                date = n.optString("date").takeIf { it.isNotEmpty() },
+                                notes = body,
+                            )
+                        )
+                    }
+                }
+            }.sortedByDescending { it.versionCode }
+
             return CatalogEntry(
                 packageName = packageName,
                 role = role,
@@ -266,6 +291,7 @@ data class CatalogManifest(
                 sha256 = sha256,
                 signerSha256 = signerSha256,
                 releaseNotesUrl = obj.optString("releaseNotesUrl").takeIf { it.isNotEmpty() },
+                releaseNotes = releaseNotes,
                 iconUrl = obj.optString("iconUrl").takeIf { it.isNotEmpty() },
                 requiresGms = obj.optBoolean("requiresGms", false),
                 splits = splits,
@@ -317,6 +343,15 @@ data class CatalogEntry(
     val signerSha256: String,
     val releaseNotesUrl: String?,
     /**
+     * What changed, per version, newest first - so a console can say what it is being offered.
+     *
+     * A window of recent releases rather than only the newest one, because consoles skip versions:
+     * the catalog went from versionCode 9 to 12, and a console sitting on 9 was never told about
+     * 10 or 11. [notesNewerThan] collapses the window down to the part a given console has not
+     * seen. Optional and defaulted, so a catalog published before this field existed still parses.
+     */
+    val releaseNotes: List<ReleaseNote> = emptyList(),
+    /**
      * A small PNG of the app icon, for apps that are not installed yet.
      *
      * Optional, and deliberately not verified against a digest: it is decoration. An icon that
@@ -356,7 +391,35 @@ data class CatalogEntry(
 
     /** What the rider actually waits for, so progress and size reflect the whole install. */
     val totalBytes: Long get() = sizeBytes + splits.sumOf { it.sizeBytes }
+
+    /**
+     * The notes a console on [installed] has not read yet, newest first.
+     *
+     * Everything above the installed versionCode, and nothing at or below it - a rider updating
+     * from 9 to 12 is told what 10, 11 and 12 changed, and never re-shown the release they are
+     * already running. [installed] of null means the app is not installed at all, in which case
+     * the backlog is not history, it is just noise, and only the newest entry is worth showing.
+     */
+    fun notesNewerThan(installed: Long?): List<ReleaseNote> {
+        if (releaseNotes.isEmpty()) return emptyList()
+        if (installed == null) return releaseNotes.take(1)
+        return releaseNotes.filter { it.versionCode > installed && it.versionCode <= versionCode }
+    }
 }
+
+/**
+ * What changed in one released version, as plain text.
+ *
+ * Plain text on purpose. This is rendered in a dialog on a television, by a device with no browser:
+ * markdown would show its own punctuation, and a link would be a dead end. The generator
+ * (`tools/changelog.sh`) flattens markdown before it ever reaches the catalog.
+ */
+data class ReleaseNote(
+    val versionCode: Long,
+    val versionName: String,
+    val date: String?,
+    val notes: String,
+)
 
 /**
  * One part of a split install. [name] is only for logging and progress; Android derives the real

@@ -24,8 +24,44 @@ concurrency:
 jobs:
   release:
     runs-on: ubuntu-latest
+    permissions:
+      # Creating the GitHub Release on this repo, and pushing the regenerated CHANGELOG.md back to
+      # the default branch. The catalog repo needs a separate PAT; see CATALOG_TOKEN below.
+      contents: write
     steps:
       - uses: actions/checkout@v4
+        with:
+          # tools/changelog.sh diffs this tag against the previous one. The default shallow clone
+          # has neither the previous tag nor the commits between them, so every release would
+          # generate empty notes - and empty notes look like "nothing changed" rather than like a
+          # broken checkout, which is the kind of failure that ships.
+          fetch-depth: 0
+
+      - name: Assemble the release notes
+        # Before the build, deliberately: generating notes takes a second and needs nothing but git,
+        # so a mistake here should not cost ten minutes of Gradle first. It also means the notes are
+        # a build input rather than an afterthought - if this step cannot describe the release, the
+        # release does not happen.
+        id: notes
+        run: |
+          set -o pipefail
+          VERSION_NAME="$(grep -m1 '^version:' apps/spikes/pubspec.yaml | sed 's/^version:[[:space:]]*//; s/+.*//')"
+          VERSION_CODE="$(grep -m1 '^version:' apps/spikes/pubspec.yaml | sed 's/.*+//')"
+
+          tools/changelog.sh notes "$VERSION_NAME" > /tmp/release-notes.md
+          tools/changelog.sh json > /tmp/release-notes.json
+
+          echo "version_name=$VERSION_NAME" >> "$GITHUB_OUTPUT"
+          echo "version_code=$VERSION_CODE" >> "$GITHUB_OUTPUT"
+
+          {
+            echo "### Release notes for $VERSION_NAME (versionCode $VERSION_CODE)"
+            echo
+            cat /tmp/release-notes.md
+            echo
+            echo "<sub>Hand-written notes come from <code>docs/release-notes/$VERSION_NAME.md</code>."
+            echo "Without that file these are the commit subjects since the previous tag.</sub>"
+          } >> "$GITHUB_STEP_SUMMARY"
 
       - uses: actions/setup-java@v4
         with:
@@ -108,6 +144,16 @@ jobs:
             exit 1
           fi
 
+      - name: Always re-lock
+        if: always()
+        # The runner is ephemeral, but a workspace that is cached, uploaded, or inspected mid-run
+        # should never contain the decrypted key.
+        #
+        # Immediately after the build, rather than as the final step: the key is needed only by
+        # `flutter build apk`, and publishing, release notes and the changelog all run afterwards.
+        # `always()` still fires it when the build or the signature check fails.
+        run: rm -f keystore/stride-release.jks apps/spikes/android/key.properties
+
       - uses: actions/upload-artifact@v4
         with:
           name: stride-release-apk
@@ -119,6 +165,7 @@ jobs:
           # A PAT with `contents: write` on Clancey/stride-catalog. The default GITHUB_TOKEN is
           # scoped to THIS repo only and cannot create a release on the catalog repo.
           GH_TOKEN: ${{ secrets.CATALOG_TOKEN }}
+          VERSION_NAME: ${{ steps.notes.outputs.version_name }}
         run: |
           set -o pipefail
           APK="$GITHUB_WORKSPACE/apps/spikes/build/app/outputs/flutter-apk/app-release.apk"
@@ -176,16 +223,122 @@ jobs:
             https://x-access-token:"$GH_TOKEN"@github.com/Clancey/stride-catalog.git
 
           ./tools/publish.sh "$APK" --role stride --name Stride
+
+          # Put the notes *in* the catalog, not just behind releaseNotesUrl. A console has no
+          # browser, so a link is a dead end; the update dialog can only tell a rider what they are
+          # getting if the text travels with the entry. A window of recent versions rides along
+          # because consoles skip releases - see tools/changelog.sh.
+          #
+          # Done here rather than inside publish.sh because publish.sh is the catalog's generic
+          # publisher, shared with third-party apps whose notes we do not write.
+          NOTES_JSON=/tmp/release-notes.json python3 - <<'PY'
+          import json, os
+
+          notes = json.load(open(os.environ['NOTES_JSON']))
+          catalog = json.load(open('catalog.json'))
+
+          stride = [a for a in catalog['apps'] if a.get('role') == 'stride']
+          if not stride:
+              raise SystemExit('no role=stride entry in catalog.json after publishing one')
+
+          entry = stride[0]
+          # Never advertise notes for a build the catalog does not serve: a console would be told
+          # about changes it cannot install yet.
+          served = entry['versionCode']
+          entry['releaseNotes'] = [n for n in notes if n['versionCode'] <= served]
+
+          # Same shape publish.sh writes, so the commit diff is the notes and nothing else.
+          with open('catalog.json', 'w') as handle:
+              json.dump(catalog, handle, indent=2)
+              handle.write('\n')
+          print(f"recorded notes for {len(entry['releaseNotes'])} versions up to {served}")
+          PY
+
           ./tools/verify.sh
+
+          # publish.sh gives a new release a placeholder body ("Published by tools/publish.sh"),
+          # because it cannot know what changed. We do, and releaseNotesUrl points here - so make
+          # the page worth the link for anyone who does reach it from a phone or a laptop.
+          # Before the commit, since the commit below may exit early when there is nothing staged.
+          gh release edit "stride-$VC" --repo Clancey/stride-catalog \
+            --title "Stride $VERSION_NAME ($VC)" \
+            --notes-file /tmp/release-notes.md \
+            || echo "note: could not update the body of stride-$VC; the APK and catalog are fine."
+
           git config user.name "stride-release-bot"
           git config user.email "noreply@github.com"
           git add catalog.json
-          git commit -m "Publish Stride from ${GITHUB_SHA:0:7}" || { echo "nothing to commit"; exit 0; }
+          git commit -m "Publish Stride $VERSION_NAME from ${GITHUB_SHA:0:7}" || { echo "nothing to commit"; exit 0; }
           git push
           echo "### Published versionCode $VC to the catalog" >> "$GITHUB_STEP_SUMMARY"
 
-      - name: Always re-lock
-        if: always()
-        # The runner is ephemeral, but a workspace that is cached, uploaded, or inspected mid-run
-        # should never contain the decrypted key.
-        run: rm -f keystore/stride-release.jks apps/spikes/android/key.properties
+      - name: Publish the release notes on this repo
+        # Only for a real tag: a workflow_dispatch build is not a release and must not create one.
+        # This is what v1.0.8 and v1.0.11 never got - both were tagged and published to the catalog,
+        # and neither produced a release page, because writing one was a manual step nobody owned.
+        if: github.event_name == 'push'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          VERSION_NAME: ${{ steps.notes.outputs.version_name }}
+        run: |
+          set -o pipefail
+          TAG="${GITHUB_REF_NAME}"
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            gh release edit "$TAG" --title "Stride $VERSION_NAME" --notes-file /tmp/release-notes.md
+            echo "updated the notes on $TAG"
+          else
+            gh release create "$TAG" --title "Stride $VERSION_NAME" --notes-file /tmp/release-notes.md
+            echo "created $TAG"
+          fi
+
+      - name: Record the release in CHANGELOG.md
+        # The changelog is generated from tags, so it can only be written after the tag exists -
+        # which means committing to the default branch from a build of a commit already on it.
+        #
+        # In a fresh clone, not the build workspace: this workspace currently holds the DECRYPTED
+        # release keystore, and no step that runs `git commit` should ever be one `git add -A` away
+        # from publishing it. The clone also has no build output and no chance of a dirty tree
+        # blocking the checkout.
+        #
+        # Non-fatal on purpose: the release is already published by this point, and a changelog that
+        # missed its push is a paragraph to re-run, not a reason to show a red release. Hence
+        # continue-on-error - even a failed clone must not undo a green release.
+        if: github.event_name == 'push'
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          VERSION_NAME: ${{ steps.notes.outputs.version_name }}
+        run: |
+          BRANCH="${{ github.event.repository.default_branch }}"
+          git clone --quiet --branch "$BRANCH" \
+            "https://x-access-token:$GH_TOKEN@github.com/$GITHUB_REPOSITORY.git" /tmp/changelog
+          cd /tmp/changelog
+
+          git config user.name "stride-release-bot"
+          git config user.email "noreply@github.com"
+
+          tools/changelog.sh regenerate
+          if git diff --quiet -- CHANGELOG.md; then
+            echo "CHANGELOG.md already records $VERSION_NAME."
+            exit 0
+          fi
+
+          git add CHANGELOG.md
+          git commit --quiet -m "Record $VERSION_NAME in the changelog"
+          if git push --quiet origin "$BRANCH"; then
+            echo "### CHANGELOG.md updated for $VERSION_NAME" >> "$GITHUB_STEP_SUMMARY"
+          else
+            {
+              echo "### CHANGELOG.md was not updated"
+              echo
+              echo "The push to \`$BRANCH\` was rejected - most likely something else landed while"
+              echo "this ran. The release itself is published. To fix it:"
+              echo
+              echo '```bash'
+              echo "git pull && tools/changelog.sh regenerate"
+              echo "git commit -am 'Record $VERSION_NAME in the changelog' && git push"
+              echo '```'
+            } >> "$GITHUB_STEP_SUMMARY"
+            echo "::warning::could not push CHANGELOG.md; see the run summary."
+          fi
+

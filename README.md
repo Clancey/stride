@@ -56,6 +56,7 @@ operate.
 | [`docs/RUNBOOK.md`](docs/RUNBOOK.md) | How to recover a console you have broken. Read first. |
 | [`docs/SPIKES.md`](docs/SPIKES.md) | The Phase 0 checklist, filled in on the hardware. |
 | [`docs/APPSTORE.md`](docs/APPSTORE.md) | How Stride and third-party apps get updated on a console with no Play Store. |
+| [`CHANGELOG.md`](CHANGELOG.md) | Every released version. Generated from tags by `tools/changelog.sh` (see APPSTORE §12). |
 
 Updates are served from a separate public repo — **[`Clancey/stride-catalog`](https://github.com/Clancey/stride-catalog)** —
 which holds the APKs and the catalog JSON and is read directly as raw files. Its README is the

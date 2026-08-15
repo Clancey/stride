@@ -64,6 +64,30 @@ enum AppstoreKind {
   };
 }
 
+/// What changed in one released version, as plain text.
+///
+/// Plain text is the contract, not a simplification: this is rendered in a dialog
+/// on a television by a device with no browser, so markdown would show its own
+/// punctuation and a link would go nowhere. `tools/changelog.sh` flattens the
+/// markdown before it is ever written into the catalog.
+class ReleaseNote {
+  const ReleaseNote({
+    required this.versionName,
+    required this.notes,
+    this.date,
+  });
+
+  factory ReleaseNote.fromMap(Map<String, dynamic> map) => ReleaseNote(
+    versionName: map['versionName'] as String? ?? '',
+    notes: map['notes'] as String? ?? '',
+    date: map['date'] as String?,
+  );
+
+  final String versionName;
+  final String notes;
+  final String? date;
+}
+
 /// One row of the updates sheet.
 class AppstoreItem {
   const AppstoreItem({
@@ -79,6 +103,7 @@ class AppstoreItem {
     required this.totalBytes,
     this.message,
     this.releaseNotesUrl,
+    this.releaseNotes = const [],
     this.ineligibleReason,
     this.iconUrl,
     this.bundleId,
@@ -99,6 +124,10 @@ class AppstoreItem {
       totalBytes: asInt(map['totalBytes']),
       message: map['message'] as String?,
       releaseNotesUrl: map['releaseNotesUrl'] as String?,
+      releaseNotes: [
+        for (final note in (map['releaseNotes'] as List<Object?>? ?? const []))
+          if (note is Map) ReleaseNote.fromMap(note.cast<String, dynamic>()),
+      ],
       ineligibleReason: map['ineligibleReason'] as String?,
       iconUrl: map['iconUrl'] as String?,
       bundleId: map['bundleId'] as String?,
@@ -121,6 +150,14 @@ class AppstoreItem {
   final int totalBytes;
   final String? message;
   final String? releaseNotesUrl;
+
+  /// What changed, per version, newest first — and only the versions this console
+  /// has not already run. The native side does that filtering, because it is the
+  /// side that knows what is installed.
+  ///
+  /// Usually one entry. More than one means the console skipped releases, which
+  /// happens whenever it has been off for a while.
+  final List<ReleaseNote> releaseNotes;
   final String? ineligibleReason;
 
   /// Where to fetch an icon for an app that is not on the device yet. Null is ordinary and just
