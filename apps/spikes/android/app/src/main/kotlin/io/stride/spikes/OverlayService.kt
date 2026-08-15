@@ -203,9 +203,20 @@ class OverlayService : Service() {
         private const val MENU_WIDTH_DP = 700f
         private val DESTRUCTIVE_INK = Color.rgb(255, 138, 128)
 
-        /** Footprint of the track floor. Wide and shallow, so the oval reads as ground. */
-        private const val FLOOR_WIDTH_DP = 1020f
-        private const val FLOOR_HEIGHT_DP = 300f
+        /**
+         * Gaps the track floor leaves around the middle of the screen.
+         *
+         * The floor is sized to the whole centre region rather than to a fixed footprint. It is the
+         * one surface on this screen that is *about* the shape it draws, and a 1020 x 300 dp strip
+         * sitting on the bottom bar gave it a quarter of the space and a squashed oval to draw in.
+         * The corners it leaves empty are exactly where the goal ring and the now-playing card sit,
+         * so filling the middle costs nothing that was being used.
+         */
+        private const val FLOOR_SIDE_GAP_DP = 16f
+        private const val FLOOR_EDGE_GAP_DP = 10f
+
+        /** Fallback top inset for the floor when the metric strip is collapsed away. */
+        private const val FLOOR_TOP_FALLBACK_DP = 72f
 
         /** Diameter of the circular corner toggles, and the room the rails must leave them. */
         private const val CORNER_SIZE_DP = 84f
@@ -372,6 +383,12 @@ class OverlayService : Service() {
     private var railsVisible: Boolean = true
     private var trackFloorView: TrackFloorView? = null
     private var trackFloorRoot: View? = null
+
+    /**
+     * Where the rider is around the lap. Outlives the floor's window on purpose: collapsing the
+     * chrome and opening it again should put the marker back where it was, not back at the start.
+     */
+    private val lapTracker = LapTracker(LAP_MILES)
     private var goalRingView: GoalRingView? = null
     private var goalRingRoot: View? = null
     private var cornerLeftView: View? = null
@@ -395,8 +412,11 @@ class OverlayService : Service() {
     private val cyan = Color.rgb(40, 199, 255)
     private val cyanMuted = Color.rgb(190, 234, 255)
 
-    private val workoutListener: (WorkoutSession.State) -> Unit = {
+    private val workoutListener: (WorkoutSession.State) -> Unit = { state ->
         mainHandler.post {
+            // A lap position measured against the previous session says nothing about this one, and
+            // the machine's own distance counter resets underneath us at the same moment.
+            if (state == WorkoutSession.State.IDLE) lapTracker.reset()
             // The track floor and the goal ring only exist while a workout does, so a state change
             // is a structural change to the chrome, not just new text in it. Rebuilding only when
             // the answer actually flipped keeps pause/resume from tearing the overlay down twice.
@@ -475,7 +495,7 @@ class OverlayService : Service() {
                 if (MachineLink.consoleDetached) Color.rgb(255, 138, 128) else Color.rgb(238, 226, 202),
             )
         }
-        trackFloorView?.progress = lapProgress()
+        trackFloorView?.let { applyLapPosition(it) }
         goalRingView?.let { applyGoalRing(it) }
         refreshNowPlaying()
     }
@@ -1016,11 +1036,13 @@ class OverlayService : Service() {
         hudTopPx = value
         hudHeightPx = value
         repositionRails()
+        repositionTrackFloor()
     }
 
     private fun publishBottomInset(value: Int) {
         hudBottomPx = value
         repositionRails()
+        repositionTrackFloor()
     }
 
     private fun publishSideInset(left: Boolean, value: Int) {
@@ -1089,35 +1111,78 @@ class OverlayService : Service() {
         val floor = TrackFloorView(this).apply {
             lapTitle = LAP_TITLE
             lapSubtitle = "track length"
-            progress = lapProgress()
             dim = 0.92f
         }
         val root = FrameLayout(this).apply { addView(floor) }
         // Explicitly untouchable: the floor covers the middle of the screen, and the app running
         // underneath owns every tap that lands there. A decorative surface that eats touches is a
         // broken remote control.
-        //
-        // Sized and anchored low on purpose. Stretched to the full window the oval reads as a
-        // giant ring pasted over the screen; kept short and sitting on the bottom bar it reads as
-        // what it is — a floor receding away from the rider.
-        val params = baseParams(dp(FLOOR_WIDTH_DP), dp(FLOOR_HEIGHT_DP), Gravity.BOTTOM or Gravity.CENTER_HORIZONTAL)
-        params.y = (hudBottomPx.takeIf { it > 0 } ?: dp(HUD_BOTTOM_ESTIMATE_DP)) + dp(8f)
+        val params = baseParams(0, 0, Gravity.BOTTOM or Gravity.CENTER_HORIZONTAL)
         params.flags = params.flags or WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE
+        applyTrackFloorBounds(params)
         try {
             windowManager.addView(root, params)
             trackFloorRoot = root
             trackFloorView = floor
+            applyLapPosition(floor)
         } catch (_: Exception) {
             trackFloorRoot = null
             trackFloorView = null
         }
     }
 
-    /** Fraction of the current lap covered, from the machine's own distance reading. */
-    private fun lapProgress(): Float {
-        val miles = MachineLink.distanceMiles ?: return 0f
-        val laps = miles / LAP_MILES
-        return (laps - kotlin.math.floor(laps)).toFloat()
+    /**
+     * Size the floor to the whole middle of the screen: everything the HUD is not using.
+     *
+     * Measured, not assumed. The bars publish their real heights once they have laid out, and the
+     * first frame runs on the estimates, so the floor has to be re-placed when the real numbers
+     * land — see [repositionTrackFloor]. Placing it once against the estimate left it sitting
+     * roughly 20 px off the bar for the life of the session.
+     */
+    private fun applyTrackFloorBounds(params: WindowManager.LayoutParams) {
+        val screenWidth = resources.displayMetrics.widthPixels
+        val screenHeight = resources.displayMetrics.heightPixels
+        // The rails are windows of their own and the floor must not run under them; with the rails
+        // away the only things out at the edges are the corner buttons, which sit below the oval.
+        val side = if (railsVisible) dp(30f + RAIL_WIDTH_DP + FLOOR_SIDE_GAP_DP) else dp(FLOOR_SIDE_GAP_DP)
+        val top = when {
+            hudTopPx > 0 -> hudTopPx
+            metricsVisible -> dp(HUD_TOP_ESTIMATE_DP)
+            else -> dp(FLOOR_TOP_FALLBACK_DP)
+        }
+        val bottom = if (hudBottomPx > 0) hudBottomPx else dp(HUD_BOTTOM_ESTIMATE_DP)
+        val gap = dp(FLOOR_EDGE_GAP_DP)
+        params.width = (screenWidth - 2 * side).coerceAtLeast(dp(320f))
+        params.height = (screenHeight - top - bottom - 2 * gap).coerceAtLeast(dp(180f))
+        params.y = bottom + gap
+    }
+
+    private fun repositionTrackFloor() {
+        val root = trackFloorRoot ?: return
+        val lp = root.layoutParams as? WindowManager.LayoutParams ?: return
+        val width = lp.width
+        val height = lp.height
+        val y = lp.y
+        applyTrackFloorBounds(lp)
+        if (lp.width == width && lp.height == height && lp.y == y) return
+        try {
+            windowManager.updateViewLayout(root, lp)
+        } catch (_: Exception) {
+            // The floor is already gone; the next rebuild will place it correctly.
+        }
+    }
+
+    /**
+     * Where the rider is on the lap, or nothing at all.
+     *
+     * Null is passed through deliberately: [TrackFloorView] draws an empty track for it rather than
+     * parking the marker on the start line, which is a claim about a workout we cannot see rather
+     * than a report of one.
+     */
+    private fun applyLapPosition(floor: TrackFloorView) {
+        val position = lapTracker.sample(MachineLink.distanceMiles, System.currentTimeMillis())
+        floor.progress = position?.progress
+        floor.lapBadge = position?.let { "LAP ${it.lap}" } ?: ""
     }
 
     private fun addGoalRing() {

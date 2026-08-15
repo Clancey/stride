@@ -4,333 +4,482 @@ import android.content.Context
 import android.graphics.Canvas
 import android.graphics.Color
 import android.graphics.LinearGradient
-import android.graphics.Matrix
 import android.graphics.Paint
-import android.graphics.RadialGradient
 import android.graphics.Path
-import android.graphics.RectF
+import android.graphics.RadialGradient
 import android.graphics.Shader
+import android.os.SystemClock
 import android.view.View
-import kotlin.math.PI
-import kotlin.math.atan2
-import kotlin.math.cos
-import kotlin.math.sin
+import kotlin.math.max
+import kotlin.math.min
 
 /**
  * The centrepiece of the NordicTrack/iFit stock treadmill workout screen: a running track drawn as
- * an oval seen in perspective, lying flat like a floor, with a map-pin marker showing where the
- * runner currently is around the lap.
+ * an oval seen in perspective, lying flat like a floor, with a marker showing where the runner
+ * currently is around the lap.
  *
- * The oval is defined in a normalised "ground plane" space and projected to screen through a single
- * reusable foreshortening so the far side reads as further away than the near side — it is a floor,
- * not a top-down 2D ellipse. Nothing is allocated in [onDraw]; every Paint/Path/Matrix/Shader is a
- * reused instance field because the host redraws this view on a ticker.
+ * ### The geometry
+ *
+ * Where the track *is* lives in [TrackGeometry]: a genuine ground plane seen from a low camera
+ * rather than a squashed 2D ellipse, with a constant-width lane and a solved fit onto whatever box
+ * this view is given. That is the half of this surface that can be checked without a treadmill, so
+ * it is kept separate and unit-tested. This class is the other half: what colour it all is.
+ *
+ * ### Cost
+ *
+ * Everything that only depends on size is computed once in [rebuildGeometry]: the sample tables,
+ * the lane path, the lane markings, the start line, the shaders and the label metrics. [onDraw]
+ * allocates nothing; it walks cached arrays and reuses instance Paints, Paths and Shaders, because
+ * the host redraws this view on a one-second ticker and animates the marker between those ticks.
  */
 class TrackFloorView(context: Context) : View(context) {
 
-    /** Lap progress, 0f..1f. Values outside are wrapped into range. Invalidates on change. */
-    var progress: Float = 0f
+    /**
+     * Lap progress 0f..1f measured from the start line, or null when the machine cannot tell us.
+     *
+     * Null is drawn as an empty track — no marker, no completed band — never as zero. "We cannot
+     * see how far you have run" and "you have run nothing" are different claims and a marker parked
+     * on the start line makes the second one.
+     *
+     * Successive known values are animated rather than jumped, because the feed behind this is a
+     * one-second poll of a distance register and a marker that teleports once a second reads as
+     * broken. A jump of more than [SNAP_FRACTION] of a lap is treated as a seek or a new session
+     * and lands immediately.
+     */
+    var progress: Float? = null
         set(value) {
-            val wrapped = floorMod(value, 1f)
-            if (wrapped != field) {
-                field = wrapped
-                invalidate()
-            }
+            val next = value?.let { floorMod(it, 1f) }
+            if (next == field) return
+            val previous = field
+            field = next
+            applyProgress(next, previous)
+        }
+
+    /** Small line above the title, e.g. "LAP 3". Empty hides it. Invalidates on change. */
+    var lapBadge: String = ""
+        set(value) {
+            if (value == field) return
+            field = value
+            layoutLabels()
+            invalidate()
         }
 
     /** Large label line, e.g. "¼ mile". Invalidates on change. */
     var lapTitle: String = ""
         set(value) {
-            if (value != field) {
-                field = value
-                invalidate()
-            }
+            if (value == field) return
+            field = value
+            layoutLabels()
+            invalidate()
         }
 
     /** Small label line under it, e.g. "track length". Invalidates on change. */
     var lapSubtitle: String = ""
         set(value) {
-            if (value != field) {
-                field = value
-                invalidate()
-            }
+            if (value == field) return
+            field = value
+            layoutLabels()
+            invalidate()
         }
 
-    /** Overall opacity multiplier 0f..1f applied to everything drawn. Default 1f. Invalidates on change. */
+    /** Overall opacity multiplier 0f..1f applied to everything drawn. Default 1f. */
     var dim: Float = 1f
         set(value) {
             val clamped = value.coerceIn(0f, 1f)
-            if (clamped != field) {
-                field = clamped
-                invalidate()
-            }
+            if (clamped == field) return
+            field = clamped
+            invalidate()
         }
+
+    private companion object {
+        /** Samples around the full lap. 288 keeps the outline smooth at console width. */
+        const val SAMPLES = TrackGeometry.DEFAULT_SAMPLES
+
+        /** Fraction of a lap the start/finish chequer covers. */
+        const val CHEQUER_SPAN = 0.014f
+        const val CHEQUER_COLUMNS = 6
+        const val CHEQUER_ROWS = 2
+
+        /** Matches the host's one-second poll, so the marker arrives just as the next sample lands. */
+        const val PROGRESS_ANIM_MS = 1000L
+
+        /** Beyond this much of a lap in one sample it is a seek or a fresh session, not running. */
+        const val SNAP_FRACTION = 0.34f
+    }
 
     private val density: Float = resources.displayMetrics.density
 
-    // A small vanishing-point gain: near (bottom) samples are widened and far (top) samples are
-    // narrowed by (1 + k * gy), which is what sells the oval as receding along the ground rather
-    // than lying flat against the glass. Kept low so the loop never crosses over on itself.
-    private val perspectiveK: Float = 0.30f
-
-    // The oval's inner boundary as a fraction of the outer radius. The gap between the two is the
-    // visible lane; a large hole in the middle is what makes this a stadium loop and not a blob.
-    private val innerScale: Float = 0.74f
-
-    private val outlineSamples: Int = 160
-
-    private val fillPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply { style = Paint.Style.FILL }
-    private val rimPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+    private val lanePaint = Paint(Paint.ANTI_ALIAS_FLAG).apply { style = Paint.Style.FILL }
+    private val bandPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply { style = Paint.Style.FILL }
+    private val outerRimPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
         style = Paint.Style.STROKE
-        color = Color.argb(90, 0xC4, 0x8B, 0xC8)
+        color = Color.rgb(0xD6, 0xD0, 0xFF)
+        strokeWidth = 1.6f * resources.displayMetrics.density
     }
-    private val startLinePaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+    private val bandEdgePaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
         style = Paint.Style.STROKE
-        strokeCap = Paint.Cap.BUTT
+        color = Color.rgb(0xCF, 0xFF, 0xF4)
+        strokeWidth = 1.4f * resources.displayMetrics.density
+    }
+    private val dashPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+        style = Paint.Style.STROKE
+        strokeCap = Paint.Cap.ROUND
         color = Color.WHITE
+        strokeWidth = 1.6f * resources.displayMetrics.density
+    }
+    private val chequerPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+        style = Paint.Style.FILL
+        color = Color.WHITE
+    }
+    private val scrimPaint = Paint(Paint.ANTI_ALIAS_FLAG)
+    private val shadowPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+        style = Paint.Style.FILL
+        color = Color.rgb(0x04, 0x08, 0x0C)
     }
     private val markerBodyPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
         style = Paint.Style.FILL
-        color = Color.rgb(0x3F, 0xE0, 0xC8)
+        color = Color.rgb(0x5C, 0xE8, 0xD2)
     }
     private val markerInnerPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
         style = Paint.Style.FILL
         color = Color.WHITE
     }
-    private val chevronPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
-        style = Paint.Style.STROKE
-        strokeCap = Paint.Cap.ROUND
-        strokeJoin = Paint.Join.ROUND
-        color = Color.rgb(0x1A, 0x2E, 0x2B)
+    private val badgePaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+        style = Paint.Style.FILL
+        textAlign = Paint.Align.CENTER
+        isFakeBoldText = true
+        letterSpacing = 0.16f
+        color = Color.rgb(0x7A, 0xEA, 0xD6)
     }
     private val titlePaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
         style = Paint.Style.FILL
         textAlign = Paint.Align.CENTER
-        color = Color.rgb(0xDA, 0xD6, 0xF2)
+        color = Color.rgb(0xE6, 0xE2, 0xFC)
     }
     private val subtitlePaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
         style = Paint.Style.FILL
         textAlign = Paint.Align.CENTER
-        color = Color.rgb(0x95, 0x91, 0xB4)
+        color = Color.rgb(0x9A, 0x96, 0xBA)
     }
 
-    // Base alphas are cached so that repeated [dim] writes multiply against the design alpha each
-    // frame instead of compounding (0.5 dim twice would otherwise fade everything to nothing).
-    private val fillBaseAlpha = 255
-    private val rimBaseAlpha = 90
-    private val startLineBaseAlpha = 235
-    private val markerBodyBaseAlpha = 255
-    private val markerInnerBaseAlpha = 255
-    private val chevronBaseAlpha = 255
-    private val titleBaseAlpha = 255
-    private val subtitleBaseAlpha = 255
+    // Design alphas are held separately so repeated [dim] writes multiply against the design value
+    // each frame instead of compounding — 0.5 twice would otherwise fade everything to nothing.
+    private val baseAlphas = intArrayOf(255, 255, 120, 90, 60, 235, 255, 90, 255, 255, 255, 255, 255)
+    private val dimmable = arrayOf(
+        lanePaint, bandPaint, outerRimPaint, bandEdgePaint, dashPaint, chequerPaint,
+        scrimPaint, shadowPaint, markerBodyPaint, markerInnerPaint, badgePaint, titlePaint,
+        subtitlePaint,
+    )
 
     private val lanePath = Path()
+    private val bandPath = Path()
+    private val dashPath = Path()
+    private val chequerPath = Path()
     private val markerPath = Path()
-    private val startLinePath = Path()
-    private val markerMatrix = Matrix()
-    private val gradientRect = RectF()
+    private val fontMetrics = Paint.FontMetrics()
 
-    private var fillShader: Shader? = null
-    private var shaderTop = Float.NaN
-    private var shaderBottom = Float.NaN
+    // Screen-space sample tables, indexed by travel fraction from the start line. Built once per
+    // size so a frame is a walk over arrays rather than 1700 trig calls.
+    private val outerX = FloatArray(SAMPLES + 1)
+    private val outerY = FloatArray(SAMPLES + 1)
+    private val innerX = FloatArray(SAMPLES + 1)
+    private val innerY = FloatArray(SAMPLES + 1)
+
+    private val geometry = TrackGeometry()
+    private var geometryReady = false
+
+    private var badgeY = 0f
+    private var titleY = 0f
+    private var subtitleY = 0f
+
+    private var shownProgress = 0f
+    private var animFrom = 0f
+    private var animSpan = 0f
+    private var animStartMs = 0L
+
+    private val animTick = object : Runnable {
+        override fun run() {
+            val elapsed = SystemClock.uptimeMillis() - animStartMs
+            if (elapsed >= PROGRESS_ANIM_MS) {
+                shownProgress = floorMod(animFrom + animSpan, 1f)
+            } else {
+                shownProgress = floorMod(animFrom + animSpan * (elapsed.toFloat() / PROGRESS_ANIM_MS), 1f)
+                postOnAnimation(this)
+            }
+            invalidate()
+        }
+    }
+
+    override fun onSizeChanged(w: Int, h: Int, oldw: Int, oldh: Int) {
+        super.onSizeChanged(w, h, oldw, oldh)
+        rebuildGeometry(w, h)
+    }
+
+    override fun onDetachedFromWindow() {
+        super.onDetachedFromWindow()
+        // The ticker is posted to the view's own animation queue; a detached view that keeps
+        // reposting one keeps the whole overlay window alive for nothing.
+        removeCallbacks(animTick)
+    }
 
     override fun onDraw(canvas: Canvas) {
-        val w = width
-        val h = height
-        if (w == 0 || h == 0) return
-
-        val cx = w * 0.5f
-        // Bias the centre upward: the loop foreshortens downward, so a low centre would clip the
-        // near edge and leave dead space up top where the labels actually live.
-        val cy = h * 0.44f
-        val radiusX = w * 0.34f
-        val radiusY = h * 0.32f
-        val laneTop = cy - radiusY * (1f - perspectiveK)
-        val laneBottom = cy + radiusY * (1f + perspectiveK)
-
+        if (!geometryReady) return
         applyDim()
-        ensureShader(laneTop, laneBottom, radiusY)
 
-        buildLane(cx, cy, radiusX, radiusY)
-        canvas.drawPath(lanePath, fillPaint)
-        canvas.drawPath(lanePath, rimPaint)
-
-        drawStartLine(canvas, cx, cy, radiusX, radiusY)
-        drawMarker(canvas, cx, cy, radiusX, radiusY)
-        drawLabels(canvas, w, h)
-    }
-
-    private fun buildLane(cx: Float, cy: Float, radiusX: Float, radiusY: Float) {
-        lanePath.reset()
-        lanePath.fillType = Path.FillType.EVEN_ODD
-
-        // Outer contour forward, inner contour also forward: two nested closed loops under
-        // EVEN_ODD winding punch a genuine hole rather than filling the interior solid.
-        var t = 0f
-        val step = (2f * PI.toFloat()) / outlineSamples
-        for (i in 0..outlineSamples) {
-            val sx = projX(cx, radiusX, t, 1f)
-            val sy = projY(cy, radiusY, t)
-            if (i == 0) lanePath.moveTo(sx, sy) else lanePath.lineTo(sx, sy)
-            t += step
-        }
-        lanePath.close()
-
-        t = 0f
-        for (i in 0..outlineSamples) {
-            val sx = projX(cx, radiusX, t, innerScale)
-            val sy = innerProjY(cy, radiusY, t)
-            if (i == 0) lanePath.moveTo(sx, sy) else lanePath.lineTo(sx, sy)
-            t += step
-        }
-        lanePath.close()
-    }
-
-    private fun drawStartLine(canvas: Canvas, cx: Float, cy: Float, radiusX: Float, radiusY: Float) {
-        // Left-hand straight sits near t = PI; two short bars perpendicular to travel mimic the
-        // painted start/finish stripe crossing the lane.
-        startLinePaint.strokeWidth = 2f * density
-        val bars = 2
-        val spacing = 0.012f
-        startLinePath.reset()
-        for (b in 0 until bars) {
-            val t = PI.toFloat() + (b - 0.5f) * spacing * 2f
-            val ox = projX(cx, radiusX, t, 1f)
-            val oy = projY(cy, radiusY, t)
-            val ix = projX(cx, radiusX, t, innerScale)
-            val iy = innerProjY(cy, radiusY, t)
-            startLinePath.moveTo(ox, oy)
-            startLinePath.lineTo(ix, iy)
-        }
-        canvas.drawPath(startLinePath, startLinePaint)
-    }
-
-    private fun drawMarker(canvas: Canvas, cx: Float, cy: Float, radiusX: Float, radiusY: Float) {
-        val t = progress * 2f * PI.toFloat()
-        val midScale = (1f + innerScale) * 0.5f
-        val px = projX(cx, radiusX, t, midScale)
-        val py = (projY(cy, radiusY, t) + innerProjY(cy, radiusY, t)) * 0.5f
-
-        val ahead = t + 0.05f
-        val ax = projX(cx, radiusX, ahead, midScale)
-        val ay = (projY(cy, radiusY, ahead) + innerProjY(cy, radiusY, ahead)) * 0.5f
-        val headingDeg = Math.toDegrees(atan2((ay - py).toDouble(), (ax - px).toDouble())).toFloat()
-
-        val pinLen = radiusY * 0.42f
-        val headR = pinLen * 0.42f
-
-        markerPath.reset()
-        markerPath.moveTo(0f, 0f)
-        markerPath.lineTo(-headR * 0.62f, -pinLen + headR)
-        markerPath.lineTo(headR * 0.62f, -pinLen + headR)
-        markerPath.close()
-        markerPath.addCircle(0f, -pinLen + headR, headR, Path.Direction.CW)
-
-        markerMatrix.reset()
-        markerMatrix.postRotate(headingDeg + 90f)
-        markerMatrix.postTranslate(px, py)
-
-        canvas.save()
-        canvas.concat(markerMatrix)
-        canvas.drawPath(markerPath, markerBodyPaint)
-        canvas.drawCircle(0f, -pinLen + headR, headR * 0.62f, markerInnerPaint)
-
-        // Chevron drawn in the marker's local up-axis; the marker rotation already aligns "up" with
-        // the direction of travel, so a fixed up-pointing chevron reads as pointing where you run.
-        chevronPaint.strokeWidth = headR * 0.24f
-        val chy = -pinLen + headR
-        val cw = headR * 0.5f
-        canvas.drawLine(-cw, chy + cw * 0.5f, 0f, chy - cw * 0.6f, chevronPaint)
-        canvas.drawLine(cw, chy + cw * 0.5f, 0f, chy - cw * 0.6f, chevronPaint)
-        canvas.restore()
+        canvas.drawPath(lanePath, lanePaint)
+        val hasProgress = progress != null
+        if (hasProgress) drawCompletedBand(canvas)
+        canvas.drawPath(lanePath, outerRimPaint)
+        canvas.drawPath(dashPath, dashPaint)
+        canvas.drawPath(chequerPath, chequerPaint)
+        drawInfield(canvas)
+        if (hasProgress) drawMarker(canvas)
     }
 
     /**
-     * Lap copy goes in the hole, not the corner.
-     *
-     * Set outside the loop it collides with whatever the oval is drawn over; the middle of the
-     * ring is the one region the figure itself guarantees is empty, and it is where a stadium
-     * infield would put the same information.
+     * Ask the geometry to fit the new size, fill the screen-space sample tables from it, and build
+     * everything else that only depends on size. Called on every size change and nowhere else.
      */
-    private val scrimPaint = Paint(Paint.ANTI_ALIAS_FLAG)
-    private var lastScrimRadius = -1f
+    private fun rebuildGeometry(w: Int, h: Int) {
+        geometryReady = false
+        if (w <= 0 || h <= 0) return
+        if (!geometry.fit(w.toFloat(), h.toFloat(), 8f * density, 6f * density)) return
 
-    private fun drawLabels(canvas: Canvas, w: Int, h: Int) {
-        titlePaint.textSize = h * 0.105f
-        subtitlePaint.textSize = h * 0.052f
-        val x = w * 0.5f
-        val titleY = h * 0.44f + titlePaint.textSize * 0.36f
-        val subtitleY = titleY + subtitlePaint.textSize * 1.55f
-        // Infield text sits directly on the app underneath. Over a poster wall or an album grid
-        // it disappears entirely, so it gets its own soft scrim rather than relying on the
-        // translucent lane, which is nowhere near the middle.
-        val scrimRadius = h * 0.28f
-        if (scrimRadius != lastScrimRadius) {
-            lastScrimRadius = scrimRadius
+        for (i in 0..SAMPLES) {
+            val u = i.toFloat() / SAMPLES
+            geometry.project(u, 1f)
+            outerX[i] = geometry.x
+            outerY[i] = geometry.y
+            geometry.project(u, -1f)
+            innerX[i] = geometry.x
+            innerY[i] = geometry.y
+        }
+
+        buildLanePath()
+        buildDashPath()
+        buildChequerPath()
+        buildShaders(geometry.outerTop, geometry.outerBottom)
+
+        geometryReady = true
+        layoutLabels()
+    }
+
+    /** Outer contour forward, inner contour backward: one closed ring with a genuine hole. */
+    private fun buildLanePath() {
+        lanePath.reset()
+        lanePath.moveTo(outerX[0], outerY[0])
+        for (i in 1..SAMPLES) lanePath.lineTo(outerX[i], outerY[i])
+        for (i in SAMPLES downTo 0) lanePath.lineTo(innerX[i], innerY[i])
+        lanePath.close()
+    }
+
+    /** Broken centre line. Track markings are what stop a coloured ring reading as a progress bar. */
+    private fun buildDashPath() {
+        dashPath.reset()
+        val stride = 8
+        var i = 0
+        while (i < SAMPLES) {
+            geometry.project(i.toFloat() / SAMPLES, 0f)
+            dashPath.moveTo(geometry.x, geometry.y)
+            val end = min(i + stride / 2, SAMPLES)
+            geometry.project(end.toFloat() / SAMPLES, 0f)
+            dashPath.lineTo(geometry.x, geometry.y)
+            i += stride
+        }
+    }
+
+    /** The painted start/finish stripe, as chequered squares laid across the lane. */
+    private fun buildChequerPath() {
+        chequerPath.reset()
+        for (row in 0 until CHEQUER_ROWS) {
+            for (col in 0 until CHEQUER_COLUMNS) {
+                if ((row + col) % 2 != 0) continue
+                val u0 = -CHEQUER_SPAN / 2f + CHEQUER_SPAN * row / CHEQUER_ROWS
+                val u1 = u0 + CHEQUER_SPAN / CHEQUER_ROWS
+                val s0 = -1f + 2f * col / CHEQUER_COLUMNS
+                val s1 = -1f + 2f * (col + 1) / CHEQUER_COLUMNS
+                geometry.project(u0, s0)
+                chequerPath.moveTo(geometry.x, geometry.y)
+                geometry.project(u0, s1)
+                chequerPath.lineTo(geometry.x, geometry.y)
+                geometry.project(u1, s1)
+                chequerPath.lineTo(geometry.x, geometry.y)
+                geometry.project(u1, s0)
+                chequerPath.lineTo(geometry.x, geometry.y)
+                chequerPath.close()
+            }
+        }
+    }
+
+    /**
+     * Translucent and brightest at the near edge.
+     *
+     * A flat opaque band reads as a plastic ring lying on the glass; letting the far side sink into
+     * whatever is playing underneath is what makes it read as ground receding away from the rider.
+     * The infield scrim is the exception — text over an album grid needs something opaque behind it.
+     */
+    private fun buildShaders(top: Float, bottom: Float) {
+        lanePaint.shader = LinearGradient(
+            0f, top, 0f, bottom,
+            intArrayOf(
+                Color.argb(76, 0x6C, 0x65, 0xBE),
+                Color.argb(134, 0x8A, 0x83, 0xDC),
+                Color.argb(205, 0xAD, 0xA6, 0xF6),
+            ),
+            floatArrayOf(0f, 0.55f, 1f),
+            Shader.TileMode.CLAMP,
+        )
+        bandPaint.shader = LinearGradient(
+            0f, top, 0f, bottom,
+            intArrayOf(
+                Color.argb(78, 0x40, 0xC8, 0xB8),
+                Color.argb(128, 0x50, 0xD8, 0xC4),
+                Color.argb(190, 0x68, 0xEE, 0xD6),
+            ),
+            floatArrayOf(0f, 0.55f, 1f),
+            Shader.TileMode.CLAMP,
+        )
+        val scrimRadius = max(geometry.infieldWidth, geometry.infieldHeight) * 0.42f
+        if (scrimRadius > 0f) {
             scrimPaint.shader = RadialGradient(
-                x,
-                h * 0.44f,
+                geometry.infieldCenterX,
+                geometry.infieldCenterY,
                 scrimRadius,
-                intArrayOf(0xCC060B10.toInt(), 0x80060B10.toInt(), 0x00060B10),
-                floatArrayOf(0f, 0.55f, 1f),
+                intArrayOf(0xD8060B10.toInt(), 0x8C060B10.toInt(), 0x00060B10),
+                floatArrayOf(0f, 0.52f, 1f),
                 Shader.TileMode.CLAMP,
             )
         }
-        canvas.drawCircle(x, h * 0.44f, scrimRadius, scrimPaint)
-        if (lapTitle.isNotEmpty()) canvas.drawText(lapTitle, x, titleY, titlePaint)
-        if (lapSubtitle.isNotEmpty()) canvas.drawText(lapSubtitle, x, subtitleY, subtitlePaint)
     }
 
-    private fun projX(cx: Float, radiusX: Float, t: Float, scale: Float): Float {
-        val gx = cos(t) * scale
-        val gy = sin(t)
-        return cx + gx * (1f + perspectiveK * gy) * radiusX
-    }
+    /**
+     * Size the infield copy against the hole it sits in, not against the view.
+     *
+     * The hole is measured, and its centre is above the view's centre because perspective pushes
+     * the near straight down. Text placed on the view's centre line sat on the near lane.
+     */
+    private fun layoutLabels() {
+        if (!geometryReady || geometry.infieldHeight <= 0f) return
+        badgePaint.textSize = geometry.infieldHeight * 0.078f
+        subtitlePaint.textSize = geometry.infieldHeight * 0.088f
+        titlePaint.textSize = geometry.infieldHeight * 0.215f
 
-    private fun projY(cy: Float, radiusY: Float, t: Float): Float {
-        return cy + sin(t) * radiusY
-    }
-
-    private fun innerProjY(cy: Float, radiusY: Float, t: Float): Float {
-        return cy + sin(t) * radiusY * innerScale
-    }
-
-    private fun ensureShader(top: Float, bottom: Float, radiusY: Float) {
-        if (fillShader == null || top != shaderTop || bottom != shaderBottom) {
-            // Translucent, and brightest at the near edge. A flat opaque band reads as a plastic
-            // ring lying on the glass; letting the far side sink into whatever is playing
-            // underneath is what makes it read as ground receding away from the rider.
-            fillShader = LinearGradient(
-                0f, top, 0f, bottom,
-                intArrayOf(
-                    Color.argb(56, 0x6C, 0x64, 0xBE),
-                    Color.argb(132, 0x8A, 0x83, 0xDC),
-                    Color.argb(214, 0xAD, 0xA6, 0xF6),
-                ),
-                floatArrayOf(0f, 0.55f, 1f),
-                Shader.TileMode.CLAMP,
-            )
-            shaderTop = top
-            shaderBottom = bottom
-            fillPaint.shader = fillShader
-            gradientRect.set(0f, top, 0f, bottom)
+        // The title is the only line long enough to reach the lane. Shrink rather than clip: a
+        // truncated "¼ mile" is a different claim about the track.
+        val room = geometry.infieldWidth * 0.78f
+        if (lapTitle.isNotEmpty()) {
+            val measured = titlePaint.measureText(lapTitle)
+            if (measured > room) titlePaint.textSize *= room / measured
         }
+
+        badgeY = geometry.infieldCenterY - geometry.infieldHeight * 0.20f
+        titleY = geometry.infieldCenterY + geometry.infieldHeight * 0.01f
+        subtitleY = geometry.infieldCenterY + geometry.infieldHeight * 0.18f
+    }
+
+    private fun drawCompletedBand(canvas: Canvas) {
+        val p = shownProgress
+        if (p <= 0.0005f) return
+        val last = (p * SAMPLES).toInt().coerceIn(0, SAMPLES)
+
+        bandPath.reset()
+        bandPath.moveTo(outerX[0], outerY[0])
+        for (i in 1..last) bandPath.lineTo(outerX[i], outerY[i])
+        geometry.project(p, 1f)
+        bandPath.lineTo(geometry.x, geometry.y)
+        geometry.project(p, -1f)
+        bandPath.lineTo(geometry.x, geometry.y)
+        for (i in last downTo 0) bandPath.lineTo(innerX[i], innerY[i])
+        bandPath.close()
+
+        canvas.drawPath(bandPath, bandPaint)
+        canvas.drawPath(bandPath, bandEdgePaint)
+    }
+
+    private fun drawInfield(canvas: Canvas) {
+        if (scrimPaint.shader != null) {
+            canvas.drawCircle(
+                geometry.infieldCenterX,
+                geometry.infieldCenterY,
+                max(geometry.infieldWidth, geometry.infieldHeight) * 0.42f,
+                scrimPaint,
+            )
+        }
+        if (lapBadge.isNotEmpty()) drawCentred(canvas, lapBadge, badgePaint, badgeY)
+        if (lapTitle.isNotEmpty()) drawCentred(canvas, lapTitle, titlePaint, titleY)
+        if (lapSubtitle.isNotEmpty()) drawCentred(canvas, lapSubtitle, subtitlePaint, subtitleY)
+    }
+
+    private fun drawCentred(canvas: Canvas, text: String, paint: Paint, centreY: Float) {
+        paint.getFontMetrics(fontMetrics)
+        canvas.drawText(text, geometry.infieldCenterX, centreY - (fontMetrics.ascent + fontMetrics.descent) / 2f, paint)
+    }
+
+    /**
+     * An upright pin standing on the lane, sized by the lane it stands in.
+     *
+     * Sizing off the local lane width rather than a constant is what carries the perspective into
+     * the marker: the same pin is large on the near straight and small across the infield, which is
+     * the cue that says the two sides of the loop are at different distances. It does not rotate —
+     * a pin is stuck in the ground, and the earlier version that turned to face travel spent the
+     * far half of every lap lying on its side.
+     */
+    private fun drawMarker(canvas: Canvas) {
+        val p = shownProgress
+        val pin = geometry.laneWidthAt(p) * TrackGeometry.PIN_SCALE
+        if (pin <= 0f) return
+        geometry.project(p, 0f)
+        val mx = geometry.x
+        val my = geometry.y
+
+        val half = pin * TrackGeometry.PIN_HALF_WIDTH
+        val drop = pin * TrackGeometry.PIN_SHADOW_DROP
+        val headR = pin * TrackGeometry.PIN_HEAD_RADIUS
+        val headY = my - pin * TrackGeometry.PIN_HEAD_OFFSET
+
+        canvas.drawOval(mx - half, my - drop, mx + half, my + drop, shadowPaint)
+        // Body: a triangle from the ground point up to the head, capped by the head circle.
+        markerPath.reset()
+        markerPath.moveTo(mx, my)
+        markerPath.lineTo(mx - half, my - pin * 0.58f)
+        markerPath.lineTo(mx + half, my - pin * 0.58f)
+        markerPath.close()
+        canvas.drawPath(markerPath, markerBodyPaint)
+        canvas.drawCircle(mx, headY, headR, markerBodyPaint)
+        canvas.drawCircle(mx, headY, headR * 0.42f, markerInnerPaint)
+    }
+
+    /**
+     * Take a new lap position, animating toward it unless the jump says it is not running.
+     *
+     * [previous] being null means the track has been dark — there was nothing on screen to animate
+     * from, so the first known position lands rather than sweeping in from the start line.
+     */
+    private fun applyProgress(next: Float?, previous: Float?) {
+        removeCallbacks(animTick)
+        if (next == null) {
+            invalidate()
+            return
+        }
+        // Distance only ever grows, so the marker only ever runs forward; the wrap past the start
+        // line is a small forward step, not a lap-long sprint backwards.
+        val delta = floorMod(next - shownProgress, 1f)
+        if (previous == null || delta > SNAP_FRACTION || windowToken == null) {
+            shownProgress = next
+            invalidate()
+            return
+        }
+        animFrom = shownProgress
+        animSpan = delta
+        animStartMs = SystemClock.uptimeMillis()
+        postOnAnimation(animTick)
     }
 
     private fun applyDim() {
-        fillPaint.alpha = scaledAlpha(fillBaseAlpha)
-        rimPaint.alpha = scaledAlpha(rimBaseAlpha)
-        rimPaint.strokeWidth = 1.5f * density
-        startLinePaint.alpha = scaledAlpha(startLineBaseAlpha)
-        markerBodyPaint.alpha = scaledAlpha(markerBodyBaseAlpha)
-        markerInnerPaint.alpha = scaledAlpha(markerInnerBaseAlpha)
-        chevronPaint.alpha = scaledAlpha(chevronBaseAlpha)
-        titlePaint.alpha = scaledAlpha(titleBaseAlpha)
-        subtitlePaint.alpha = scaledAlpha(subtitleBaseAlpha)
+        for (i in dimmable.indices) {
+            dimmable[i].alpha = (baseAlphas[i] * dim).toInt().coerceIn(0, 255)
+        }
     }
-
-    private fun scaledAlpha(base: Int): Int = (base * dim).toInt().coerceIn(0, 255)
 
     private fun floorMod(value: Float, mod: Float): Float {
         val r = value % mod
