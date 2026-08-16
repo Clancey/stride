@@ -751,8 +751,94 @@ class DirectMachineCommands(private val session: DirectMachineSession) : Machine
      * belt to zero via `KPH`; a console that implements the workout register but not the speed
      * register would therefore accept a start it has no way to undo. Refusing to arm a control whose
      * counterpart is missing is the difference between a treadmill and a trap.
+     *
+     * ## Why this also writes a speed and an incline
+     *
+     * GlassOS's `StartNewWorkout` takes no arguments, and measured on the real machine it drove the
+     * console `IDLE -> WARM_UP -> WORKOUT` and started the belt at **1.0 mph** with no speed command
+     * sent by us — the belt moves and the incline sits at 0. DIRECT is supposed to be a swap for
+     * that, so pressing Start has to produce the same machine, not merely the same register.
+     *
+     * Whether GlassOS writes those values itself or the firmware picks them on entering a workout is
+     * not visible from outside, and it does not matter: writing them explicitly is idempotent if the
+     * machine was going to choose them anyway, and it is the difference between a defined starting
+     * state and a firmware default we have never seen on hardware we do not own.
+     *
+     * The mode goes first, in its own frame. A speed written while the console is still `IDLE` may
+     * be rejected as out of context, and the register block orders values by field id — `KPH` (0)
+     * would land *before* `WORKOUT_MODE` (12) inside a single frame, which is precisely the order
+     * that risks being dropped. Two frames cost one exchange and remove the question.
+     *
+     * A refused opening speed is deliberately **not** fatal. The workout has started by then, and
+     * the failure it leaves behind is a stationary belt under a started workout — which is what
+     * DIRECT did before this existed, and is the safe direction to fail in.
      */
-    override fun startWorkout(): MachineAck = setMode(FitProCodec.WorkoutMode.RUNNING, "start")
+    override fun startWorkout(): MachineAck {
+        val started = setMode(FitProCodec.WorkoutMode.RUNNING, "start")
+        if (started !is MachineAck.Ok) return started
+        val opening = openingSpeedKph()
+        val ack = writeOpeningState(opening)
+        if (ack !is MachineAck.Ok) {
+            Log.w(
+                TAG,
+                "workout started but the opening state was not accepted " +
+                    "(${FitProValues.kphToMph(opening)} mph): $ack",
+            )
+        }
+        return started
+    }
+
+    /**
+     * The speed a new workout opens at, in kph.
+     *
+     * [START_SPEED_MPH] is what the machine GlassOS was measured on does, and it is also that
+     * machine's own minimum — one observation fits both "always 1 mph" and "always the slowest it
+     * will run", and there is no second machine to separate them. Coercing 1 mph into the reported
+     * range satisfies both readings wherever they agree, and on a machine whose floor is above
+     * 1 mph it sends a speed that can actually be accepted rather than one that is refused.
+     *
+     * Bounded by Stride's own policy ceiling as well, so a machine reporting a nonsense minimum
+     * cannot talk us into opening a workout above the fastest speed this app will ever command.
+     */
+    private fun openingSpeedKph(): Double {
+        val limits = session.probe.limits ?: return FitProValues.mphToKph(START_SPEED_MPH)
+        val ceiling = minOf(limits.maxSpeedKph, FitProValues.mphToKph(MachineCoordinator.MAX_SPEED_MPH))
+        val target = FitProValues.mphToKph(START_SPEED_MPH)
+        // A machine reporting an inverted range must not invert the coercion.
+        if (limits.minSpeedKph > ceiling) return target
+        return target.coerceIn(limits.minSpeedKph, ceiling)
+    }
+
+    /**
+     * The opening speed and a flat belt, in one frame.
+     *
+     * Incline is included only when the machine has a grade register — a treadmill without one is a
+     * machine for which "incline 0" is not a state that exists, and naming an unsupported register
+     * in a write is how a frame gets refused wholesale, taking the speed down with it.
+     */
+    private fun writeOpeningState(kph: Double): MachineAck =
+        write("opening state", FitProCodec.Register.KPH) { session ->
+            buildList {
+                add(FitProCodec.writeOf(FitProCodec.Register.KPH, FitProCodec.encodeSpeed(kph)))
+                if (session.supports(FitProCodec.Register.GRADE) != false) {
+                    add(
+                        FitProCodec.writeOf(
+                            FitProCodec.Register.GRADE,
+                            FitProCodec.encodeIncline(openingInclinePercent()),
+                        ),
+                    )
+                }
+            }
+        }
+
+    /** Flat, unless the machine cannot be flat, in which case as close to it as it goes. */
+    private fun openingInclinePercent(): Double {
+        val limits = session.probe.limits ?: return START_INCLINE_PERCENT
+        val floor = maxOf(limits.minInclinePercent, MachineCoordinator.MIN_INCLINE)
+        val ceiling = minOf(limits.maxInclinePercent, MachineCoordinator.MAX_INCLINE)
+        if (floor > ceiling) return START_INCLINE_PERCENT
+        return START_INCLINE_PERCENT.coerceIn(floor, ceiling)
+    }
 
     override fun pause(): MachineAck = setMode(FitProCodec.WorkoutMode.PAUSE, "pause")
 
@@ -971,6 +1057,14 @@ class DirectMachineCommands(private val session: DirectMachineSession) : Machine
 
     private companion object {
         const val TAG = "DirectMachine"
+
+        /**
+         * What a new workout opens at, matching GlassOS measured on the real machine: the belt runs
+         * at 1.0 mph and the deck sits flat. See [startWorkout] for why DIRECT writes these rather
+         * than trusting the firmware to pick them.
+         */
+        const val START_SPEED_MPH = 1.0
+        const val START_INCLINE_PERCENT = 0.0
 
         /**
          * Whole-[step] values within a range, highest first, with both ends always present.

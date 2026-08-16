@@ -31,6 +31,9 @@ class DirectWriteSequenceTest {
         /** Status returned for frames that carry writes. Reads always succeed. */
         var writeStatus: FitProCodec.Status = FitProCodec.Status.DONE
 
+        /** Registers this console rejects. A frame naming any of them is refused whole. */
+        val refuses = mutableSetOf<FitProCodec.Register>()
+
         /** When set, the console stops answering — a live link that has gone quiet. */
         var silent = false
 
@@ -79,7 +82,13 @@ class DirectWriteSequenceTest {
                 val v = readValues[register] ?: 0
                 for (b in 0 until register.width) values += ((v shr (8 * b)) and 0xFF).toByte()
             }
-            val status = if (written.isEmpty()) FitProCodec.Status.DONE else writeStatus
+            val status = if (written.isEmpty()) {
+                FitProCodec.Status.DONE
+            } else if (written.any { it in refuses }) {
+                FitProCodec.Status.FAILED
+            } else {
+                writeStatus
+            }
             return reply(values.toByteArray(), status)
         }
 
@@ -173,6 +182,105 @@ class DirectWriteSequenceTest {
             modesWritten(wire),
         )
     }
+
+    /**
+     * Starting a workout opens the belt at 1 mph on a flat deck, because that is what GlassOS does.
+     *
+     * `StartNewWorkout` takes no arguments, and measured on the real machine it started the belt at
+     * 1.0 mph with no speed command sent by us. A rider pressing Start must get the same treadmill
+     * whichever transport is selected, so DIRECT writes the state rather than hoping the firmware
+     * picks it.
+     */
+    @Test
+    fun `starting a workout opens the belt at 1 mph and flat`() {
+        val (commands, _, wire) = ready()
+        commands.startWorkout()
+        assertEquals(
+            "the opening speed must be 1 mph, expressed in kph",
+            1.0,
+            FitProValues.kphToMph(speedWritten(wire).last()),
+            0.01,
+        )
+        assertEquals("a new workout starts flat", 0.0, inclineWritten(wire).last(), 0.001)
+    }
+
+    /**
+     * The mode is written before the speed, in a separate frame.
+     *
+     * Values inside one register block are ordered by field id, so `KPH` (0) would reach the console
+     * ahead of `WORKOUT_MODE` (12) — a speed arriving while the machine is still idle, which is the
+     * case most likely to be discarded. Ordering the frames removes the question.
+     */
+    @Test
+    fun `the opening speed is sent after the mode, not before it`() {
+        val (commands, _, wire) = ready()
+        commands.startWorkout()
+        val mode = wire.writes.indexOfFirst { it.first == FitProCodec.Register.WORKOUT_MODE }
+        val speed = wire.writes.indexOfFirst { it.first == FitProCodec.Register.KPH }
+        assertTrue("both must be written", mode >= 0 && speed >= 0)
+        assertTrue("mode at $mode must precede speed at $speed", mode < speed)
+    }
+
+    /**
+     * A machine that will not run as slowly as 1 mph opens at the slowest speed it will run.
+     *
+     * The single hardware observation fits both "always 1 mph" and "always the machine's floor",
+     * because the machine it was taken on has a 1.0 mph floor. Coercing satisfies both readings
+     * where they agree and sends an acceptable speed where they do not.
+     */
+    @Test
+    fun `the opening speed is raised to a floor the machine can actually run`() {
+        val wire = FakeConsole()
+        // A machine that will not run below 3 kph (about 1.9 mph).
+        wire.readValues[FitProCodec.Register.MIN_KPH] = 300
+        wire.readValues[FitProCodec.Register.MAX_KPH] = 1930
+        wire.readValues[FitProCodec.Register.MIN_GRADE] = 0
+        wire.readValues[FitProCodec.Register.MAX_GRADE] = 1500
+        val session = DirectMachineSession(wire)
+        session.probe.confirm(wire)
+        DirectMachineCommands(session).startWorkout()
+        assertEquals(
+            "1 mph is below this machine's floor, so it must open at the floor",
+            3.0,
+            speedWritten(wire).last(),
+            0.01,
+        )
+    }
+
+    /**
+     * A refused opening speed leaves the workout started.
+     *
+     * By the time the speed is written the console has already accepted the start, and the failure
+     * this leaves is a stationary belt under a started workout — which is what DIRECT did before the
+     * opening state existed. Reporting the start as failed would be worse: the coordinator would
+     * show the rider an error for a workout the machine is actually running.
+     */
+    @Test
+    fun `a refused opening speed does not fail the start`() {
+        val (commands, _, wire) = ready()
+        wire.refuses += FitProCodec.Register.KPH
+        assertEquals(
+            "the start itself was accepted",
+            MachineAck.Ok,
+            commands.startWorkout(),
+        )
+        assertEquals(
+            "the console was still asked to start",
+            listOf(FitProCodec.WorkoutMode.RUNNING.value),
+            modesWritten(wire),
+        )
+    }
+
+    /** Every speed the console was asked to run at, in kph, in order. */
+    private fun speedWritten(wire: FakeConsole): List<Double> = wire.writes
+        .filter { it.first == FitProCodec.Register.KPH }
+        .map { FitProCodec.decodeSpeed(it.second.map(Int::toByte).toByteArray()) }
+
+    /** Every incline the console was asked for, in percent, in order. */
+    private fun inclineWritten(wire: FakeConsole): List<Double> = wire.writes
+        .filter { it.first == FitProCodec.Register.GRADE }
+        .map { FitProCodec.decodeIncline(it.second.map(Int::toByte).toByteArray()) }
+
 
     /**
      * Auto fan is unknown until asked, because nothing on the wire answers it.

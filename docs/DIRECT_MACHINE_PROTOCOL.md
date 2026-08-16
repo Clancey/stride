@@ -380,12 +380,19 @@ that look alike" above rather than here, because the trap is that it looks wrong
 - Distance and elapsed-time units are inferred (above).
 - `SUPPORTED_DEVICES` is requested during the handshake but the reply is not checked, so there is no
   model or device-type allowlist before commands are bound.
-- **Whether GlassOS's `StartNewWorkout` moves the belt by itself.** The gRPC handler is behind
-  obfuscated coroutine plumbing and was not traced. It matters only as a parity nicety: Stride's
-  `MachineCoordinator.startWorkout` is shared by both transports and sets no speed of its own, so if
-  GlassOS does start the belt internally, the direct path is the quieter of the two. That asymmetry
-  is in the safe direction, and closing it by guessing would mean writing a speed — moving a
-  treadmill — on an assumption, which is the one class of change this document exists to prevent.
+- **Whether GlassOS's `StartNewWorkout` moves the belt by itself.** It does — measured on the real
+  machine, it drove the console `IDLE → WARM_UP → WORKOUT` and started the belt at **1.0 mph** with
+  no speed command sent by Stride, on a flat deck. `DirectMachineCommands.startWorkout` now
+  reproduces that: mode first, then the opening speed and a zero grade in a second frame.
+
+  The mode goes in its own frame deliberately. Values inside one register block are ordered by field
+  id, so `KPH` (0) would reach the console *ahead* of `WORKOUT_MODE` (12) in a combined frame — a
+  speed arriving while the machine is still idle, which is the case most likely to be discarded.
+
+  What is *not* settled is whether the 1.0 mph is a constant or the machine's own floor. The machine
+  it was measured on (17125) reports a 1.0 mph minimum, so one observation fits both readings. The
+  implementation coerces 1 mph into the reported range, which agrees with both wherever they agree
+  and sends an acceptable speed on a machine whose floor is higher.
 - The preset **ladder step** (1.0) is invented. No preset register exists in FitPro, so the direct
   path must synthesise the quick picks; the endpoints come from the machine's own MIN/MAX registers,
   but nothing corroborates the spacing between them.
