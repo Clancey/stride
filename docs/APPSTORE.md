@@ -418,7 +418,44 @@ console. So `restartRequired` exists purely so the UI can *say so*: when the las
 row stops offering an install and asks for a power cycle, with a dismiss. Silently finishing would
 leave a rider with a Play Store that looks installed and behaves broken.
 
-### 11.6 Licensing
+### 11.6 "This device isn't Play Protect certified"
+
+Installing the bundle is not the last step. The first sign-in reports:
+
+> This device isn't Play Protect certified.
+
+Nothing is broken, and no ordering mistake causes it. Google certifies a **build**, by fingerprint,
+when a manufacturer submits it for testing. NordicTrack never submitted this one — the console was
+never meant to run Play at all — so no install can satisfy the check.
+
+Google's own escape hatch is per-device rather than per-build: register the console's **GSF device
+id** against a Google account at <https://www.google.com/android/uncertified> and that account may
+use Play on that device. This is a supported route for exactly this situation, not a bypass; nothing
+is patched, and Play Protect keeps working normally afterwards.
+
+**Getting the id.** Stride reports it in **Diagnostics → ENV Environment**, under
+`-- Google Play certification --`. The two usual ways to read it are both dead ends here: a device-id
+app comes from the Play Store, which is the thing that does not work yet, and the `sqlite3` route
+into GSF's database needs root. `PlayCertification` reads it with one query against GSF's `gservices`
+provider, which costs the read-only `READ_GSERVICES` permission and nothing else.
+
+**Paste the decimal form.** The page wants decimal. Nearly every device-id app displays hex, and
+pasting hex is the most common reason this step appears not to work — the page rejects it without
+explaining why. The ENV screen prints the decimal first and labels the hex as a cross-check only.
+Two related traps the code already handles:
+
+- GSF stores the id in a signed 64-bit column, so roughly half of all ids come back **negative**.
+  `-1` is not an error and is not `-1` to Google; it is `18446744073709551615`.
+- GSF writes **0** before it has first reached Google. Registering a zero id looks like it worked
+  and does nothing, so it is reported as "no id yet — give it a network and a reboot" instead.
+
+**After registering.** Force stop and clear data on Play Services and the Play Store, then reboot.
+Propagation is not instant; a few minutes is normal.
+
+This is per **account and device**, so every tester repeats it on their own console. That is the
+reason the id is surfaced in the app at all rather than left as an `adb` recipe in this file: a
+tester with a treadmill and no laptop cannot run `adb`.
+### 11.7 Licensing
 
 Re-hosting Google's binaries is redistribution of someone else's software, and the same question the
 third-party APKs raise (§4), only more visible. The mechanism here is neutral — a bundle is an

@@ -40,6 +40,12 @@
          so this grants the right to *ask*, not the right to install silently. Grant with:
          adb shell appops set io.stride.spikes REQUEST_INSTALL_PACKAGES allow -->
     <uses-permission android:name="android.permission.REQUEST_INSTALL_PACKAGES"/>
+    <!-- Read the console's GSF device id, which is the value a rider must register at
+         google.com/android/uncertified to use a sideloaded Play Store (docs/APPSTORE.md §11.5).
+         Read-only access to one key/value provider; it grants nothing else. Without it the
+         diagnostics screen can only tell a tester their id is unavailable, and the alternative
+         ways to read it are a Play Store app (which is the broken thing) or root. -->
+    <uses-permission android:name="com.google.android.providers.gsf.permission.READ_GSERVICES"/>
 
     <!-- S4 app enumeration under targetSdk 30+ package-visibility filtering.
          This <queries> block restores visibility of exactly the things the launcher legitimately
@@ -72,6 +78,10 @@
             <data android:scheme="package"/>
         </intent>
         <package android:name="com.ifit.rivendell"/>
+        <!-- GSF owns the gservices provider holding the device id above. Package-visibility
+             filtering hides content providers too, so without this the query returns null on a
+             targetSdk 30+ build and the id looks absent on a console where Play is installed. -->
+        <package android:name="com.google.android.gsf"/>
     </queries>
 
     <application

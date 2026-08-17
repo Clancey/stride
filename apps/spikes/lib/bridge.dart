@@ -38,6 +38,14 @@ class SpikeBridge {
 
   static Future<Map<String, dynamic>> environment() => _map('environment');
 
+  /// The console's GSF device id plus whether Play Services is present.
+  ///
+  /// A sideloaded Play Store reports "device isn't Play Protect certified" until this id is
+  /// registered at the returned `registrationUrl`. Paste `gsfAndroidId` (decimal) there, never
+  /// `gsfAndroidIdHex`. See docs/APPSTORE.md §11.5.
+  static Future<Map<String, dynamic>> playCertification() =>
+      _map('playCertification');
+
   // S1 - launcher
   static Future<bool> isDefaultHome() => _bool('isDefaultHome');
   static Future<List<Map<String, dynamic>>> homeCandidates() =>
