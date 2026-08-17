@@ -448,9 +448,19 @@ onto a phone, from a screen a metre away, by someone standing on a treadmill. An
 twenty digits has no checksum and no visual anchors; groups of four are the shape everybody has
 already practised on a card number. The separators are thin spaces, so a copy lifts the bare digits.
 
-The two usual ways to read it are both dead ends here: a device-id
-app comes from the Play Store, which is the thing that does not work yet, and the `sqlite3` route
-into GSF's database needs root. `PlayCertification` reads it with one query against GSF's `gservices`
+The three usual ways to read it are all dead ends here: a device-id
+app comes from the Play Store, which is the thing that does not work yet; the `sqlite3` route into
+GSF's database needs root; and `adb shell content query` is refused outright, because the shell user
+does not hold the permission either:
+
+```
+$ adb shell "content query --uri content://com.google.android.gsf.gservices --where \"name='android_id'\""
+java.lang.SecurityException: Permission Denial: ... requires
+  com.google.android.providers.gsf.permission.READ_GSERVICES
+```
+
+An app that declares `READ_GSERVICES` is granted it at install time, so Stride can do what the shell
+cannot. `PlayCertification` reads it with one query against GSF's `gservices`
 provider, which costs the read-only `READ_GSERVICES` permission and nothing else.
 
 **Paste the decimal form.** The page wants decimal. Nearly every device-id app displays hex, and

@@ -8,13 +8,64 @@
 # The grant that matters most is WRITE_SECURE_SETTINGS: it cannot be granted by any dialog, only
 # from here, and once held Stride puts the other two back by itself (StridePermissions.repair).
 #
-#   tools/deploy.sh [device]        # default: 192.168.10.51:45557
+#   tools/deploy.sh [device]        # default: whatever is already connected, else mDNS discovery
 #
-# The wireless-debugging port changes on reboot. `adb devices` will tell you the new one.
+# The wireless-debugging port changes on every reboot, so there is no address worth hardcoding.
+# With no argument this uses the console already connected to adb, and failing that asks the
+# network for one -- wireless debugging advertises itself over mDNS as _adb-tls-connect._tcp.
 
 set -euo pipefail
 
-DEVICE="${1:-192.168.10.51:45557}"
+find_device() {
+  # Something already connected wins: it is the one the operator most likely meant.
+  local connected
+  connected="$(command adb devices | awk '$2 == "device" { print $1; exit }')"
+  if [ -n "$connected" ]; then echo "$connected"; return 0; fi
+
+  # Otherwise ask the network. adb's own resolver knows about paired consoles.
+  local found
+  found="$(command adb mdns services 2>/dev/null |
+    awk '$2 ~ /_adb-tls-connect/ { print $3; exit }')"
+  if [ -n "$found" ]; then echo "$found"; return 0; fi
+
+  if command -v dns-sd >/dev/null 2>&1; then
+    local name host port
+    # Only the "Add" rows are results; the banner mentions the service type too.
+    name="$(timeout 5 dns-sd -B _adb-tls-connect._tcp 2>/dev/null |
+      awk '$2 == "Add" { print $NF; exit }')"
+    if [ -n "$name" ]; then
+      local line
+      # "... can be reached at Android.local.:41517 (interface 14)" - the last
+      # field is the interface, so take the host:port field by its shape.
+      line="$(timeout 5 dns-sd -L "$name" _adb-tls-connect._tcp 2>/dev/null |
+        awk '/can be reached at/ {
+               for (i = 1; i <= NF; i++) if ($i ~ /:[0-9]+$/) { print $i; exit }
+             }')"
+      host="${line%%:*}"; port="${line##*:}"
+      if [ -n "$port" ]; then
+        # dns-sd reports the .local name; resolve it, because adb connect wants an address.
+        local ip
+        ip="$(dscacheutil -q host -a name "${host%.}" 2>/dev/null |
+          awk '/^ip_address/ { print $2; exit }')"
+        [ -n "$ip" ] && echo "$ip:$port" && return 0
+        echo "${host%.}:$port" && return 0
+      fi
+    fi
+  fi
+  return 1
+}
+
+DEVICE="${1:-}"
+if [ -z "$DEVICE" ]; then
+  echo "==> looking for a console"
+  if ! DEVICE="$(find_device)"; then
+    echo "no console found. Enable wireless debugging on it, then either pass the" >&2
+    echo "address explicitly or run: adb connect <ip>:<port>" >&2
+    exit 1
+  fi
+  echo "    found $DEVICE"
+fi
+command adb connect "$DEVICE" >/dev/null 2>&1 || true
 PKG="io.stride.spikes"
 SERVICE="$PKG/$PKG.StrideAccessibilityService"
 LISTENER="$PKG/$PKG.StrideNotificationListener"
