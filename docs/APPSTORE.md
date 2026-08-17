@@ -302,6 +302,11 @@ Stride's *first* copy, which Stride obviously cannot do itself — is the adb wa
 | `lib/model/appstore.dart` | typed snapshot, tolerant of missing keys |
 | `lib/screens/updates_sheet.dart` | the entire UI |
 | `lib/widgets/bundle_row.dart` | the one-tap bundle row, shared by the sheet and the Store tab |
+| `PlayCertification.kt` | reads the GSF device id, decimal-first (pure rules) — §11.6 |
+| `CertificationDumpReceiver.kt` | hands that id to `adb`, gated on `DUMP` — §11.6 |
+| `lib/widgets/play_certification.dart` | the Store-tab row and the registration sheet — §11.6 |
+| `tools/certify.sh` | drives the registration from a computer — §11.6 |
+| `tools/console.sh` | finds the console; no port is worth hardcoding |
 | `tools/changelog.sh` | release notes from git history, in markdown and plain text — §12 |
 
 ## 10. Deliberately not built
@@ -462,6 +467,26 @@ java.lang.SecurityException: Permission Denial: ... requires
 An app that declares `READ_GSERVICES` is granted it at install time, so Stride can do what the shell
 cannot. `PlayCertification` reads it with one query against GSF's `gservices`
 provider, which costs the read-only `READ_GSERVICES` permission and nothing else.
+
+**Or drive it from a computer.** `tools/certify.sh` does every part of this that is mechanical:
+
+```bash
+tools/certify.sh          # finds the console itself
+```
+
+It reads the id, puts it on your clipboard, opens the registration page, and then — once you say
+you have registered — clears both apps' data and reboots. Registering is the one step it cannot do,
+because the page needs you signed in as the account the console will use.
+
+The shell still cannot read the id itself, so the script asks Stride:
+`CertificationDumpReceiver` answers a broadcast with the id as result data, which `am broadcast`
+prints as one parseable line. The receiver is exported, because a broadcast from the shell has to
+reach it, but gated on `android.permission.DUMP` — the shell user holds that and an ordinary app
+does not. Without the gate this would hand a stable device identifier to every app on a console
+whose entire job is running other people's software.
+
+Clearing the two apps' data is the step people skip, and the usual reason registering "did not
+work": both cache the failed certification check, and nothing re-reads it until their data is gone.
 
 **Paste the decimal form.** The page wants decimal. Nearly every device-id app displays hex, and
 pasting hex is the most common reason this step appears not to work — the page rejects it without

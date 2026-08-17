@@ -171,6 +171,23 @@
             </intent-filter>
         </receiver>
 
+        <!-- Lets `adb` read the GSF device id for Google's uncertified-device registration. The
+             shell cannot read it itself (no READ_GSERVICES) and the database behind it needs root,
+             so asking the app is the only way to drive that registration from a computer.
+
+             Exported, because a broadcast from the shell has to reach it - but gated on DUMP, which
+             the shell user holds and an ordinary app does not. Without that gate this would publish
+             a stable device identifier to every app on a console whose whole job is running other
+             people's software. -->
+        <receiver
+            android:name="io.stride.spikes.CertificationDumpReceiver"
+            android:exported="true"
+            android:permission="android.permission.DUMP">
+            <intent-filter>
+                <action android:name="io.stride.spikes.DUMP_CERTIFICATION"/>
+            </intent-filter>
+        </receiver>
+
         <!-- App store: PackageInstaller session results, including the STATUS_PENDING_USER_ACTION
              confirmation intent, land at InstallResultReceiver - which is registered at RUNTIME by
              StrideAppstoreService, deliberately not here.

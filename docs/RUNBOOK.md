@@ -335,6 +335,11 @@ wireless debugging advertises itself over mDNS. There is deliberately no default
 If discovery comes up empty, wireless debugging is off on the console. It does not survive a reboot;
 turn it back on in Developer options.
 
+**Play refusing to sign in** — "This device isn't Play Protect certified" — is expected on a console
+whose build Google never certified, and `tools/certify.sh` walks through the fix: it reads the
+device id, opens Google's registration page, and afterwards clears the two Play apps' cached failure
+and reboots. Registering is the only manual step. Background in `docs/APPSTORE.md` section 11.6.
+
 **Before you deploy to anyone but yourself, unlock the release key.** Without
 `tools/keystore.sh unlock`, `deploy.sh` builds with the *debug* key. That APK installs and runs
 normally, so nothing looks wrong — but Android refuses an update signed by a different key, so
