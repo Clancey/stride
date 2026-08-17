@@ -23,6 +23,7 @@ import android.view.KeyEvent
 import io.flutter.plugin.common.MethodCall
 import io.flutter.plugin.common.MethodChannel
 import io.stride.spikes.appstore.AppstoreBridge
+import io.stride.spikes.appstore.StrideAppstoreService
 import java.io.ByteArrayOutputStream
 import java.util.Locale
 import java.util.concurrent.Executors
@@ -107,6 +108,10 @@ class SpikeBridge(private val context: Context) : MethodChannel.MethodCallHandle
         try {
             when (call.method) {
                 "environment" -> result.success(environment())
+                "playCertification" -> result.success(
+                    PlayCertification.snapshot(context.contentResolver) +
+                        ("hasGms" to StrideAppstoreService.hasUsableGms(context)),
+                )
 
                 // --- S1: launcher ---
                 "isDefaultHome" -> result.success(isDefaultHome())

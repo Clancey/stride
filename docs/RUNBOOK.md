@@ -323,9 +323,22 @@ sees the card.
 **`tools/deploy.sh` does all of this for you** — build, install, grant, verify, launch:
 
 ```bash
-tools/deploy.sh              # defaults to 192.168.10.51:45557
-tools/deploy.sh <ip>:<port>  # the wireless-debugging port changes on reboot
+tools/deploy.sh              # finds the console itself
+tools/deploy.sh <ip>:<port>  # or say exactly which one
 ```
+
+With no argument it uses the console already attached to `adb`, and failing that asks the network:
+wireless debugging advertises itself over mDNS. There is deliberately no default address, because
+**the wireless-debugging port changes on every reboot** and a stale hardcoded one fails with
+`device not found` after a two-minute build — which is exactly how this was found.
+
+If discovery comes up empty, wireless debugging is off on the console. It does not survive a reboot;
+turn it back on in Developer options.
+
+**Play refusing to sign in** — "This device isn't Play Protect certified" — is expected on a console
+whose build Google never certified, and `tools/certify.sh` walks through the fix: it reads the
+device id, opens Google's registration page, and afterwards clears the two Play apps' cached failure
+and reboots. Registering is the only manual step. Background in `docs/APPSTORE.md` section 11.6.
 
 **Before you deploy to anyone but yourself, unlock the release key.** Without
 `tools/keystore.sh unlock`, `deploy.sh` builds with the *debug* key. That APK installs and runs

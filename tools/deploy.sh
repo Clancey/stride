@@ -8,13 +8,18 @@
 # The grant that matters most is WRITE_SECURE_SETTINGS: it cannot be granted by any dialog, only
 # from here, and once held Stride puts the other two back by itself (StridePermissions.repair).
 #
-#   tools/deploy.sh [device]        # default: 192.168.10.51:45557
+#   tools/deploy.sh [device]        # default: whatever is already connected, else mDNS discovery
 #
-# The wireless-debugging port changes on reboot. `adb devices` will tell you the new one.
+# The wireless-debugging port changes on every reboot, so there is no address worth hardcoding.
+# With no argument this uses the console already connected to adb, and failing that asks the
+# network for one -- wireless debugging advertises itself over mDNS as _adb-tls-connect._tcp.
 
 set -euo pipefail
 
-DEVICE="${1:-192.168.10.51:45557}"
+# shellcheck source=tools/console.sh
+. "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/console.sh"
+
+DEVICE="$(require_console "${1:-}")"
 PKG="io.stride.spikes"
 SERVICE="$PKG/$PKG.StrideAccessibilityService"
 LISTENER="$PKG/$PKG.StrideNotificationListener"

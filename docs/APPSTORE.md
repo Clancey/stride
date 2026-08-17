@@ -302,6 +302,11 @@ Stride's *first* copy, which Stride obviously cannot do itself — is the adb wa
 | `lib/model/appstore.dart` | typed snapshot, tolerant of missing keys |
 | `lib/screens/updates_sheet.dart` | the entire UI |
 | `lib/widgets/bundle_row.dart` | the one-tap bundle row, shared by the sheet and the Store tab |
+| `PlayCertification.kt` | reads the GSF device id, decimal-first (pure rules) — §11.6 |
+| `CertificationDumpReceiver.kt` | hands that id to `adb`, gated on `DUMP` — §11.6 |
+| `lib/widgets/play_certification.dart` | the Store-tab row and the registration sheet — §11.6 |
+| `tools/certify.sh` | drives the registration from a computer — §11.6 |
+| `tools/console.sh` | finds the console; no port is worth hardcoding |
 | `tools/changelog.sh` | release notes from git history, in markdown and plain text — §12 |
 
 ## 10. Deliberately not built
@@ -418,7 +423,89 @@ console. So `restartRequired` exists purely so the UI can *say so*: when the las
 row stops offering an install and asks for a power cycle, with a dismiss. Silently finishing would
 leave a rider with a Play Store that looks installed and behaves broken.
 
-### 11.6 Licensing
+### 11.6 "This device isn't Play Protect certified"
+
+Installing the bundle is not the last step. The first sign-in reports:
+
+> This device isn't Play Protect certified.
+
+Nothing is broken, and no ordering mistake causes it. Google certifies a **build**, by fingerprint,
+when a manufacturer submits it for testing. NordicTrack never submitted this one — the console was
+never meant to run Play at all — so no install can satisfy the check.
+
+Google's own escape hatch is per-device rather than per-build: register the console's **GSF device
+id** against a Google account at <https://www.google.com/android/uncertified> and that account may
+use Play on that device. This is a supported route for exactly this situation, not a bypass; nothing
+is patched, and Play Protect keeps working normally afterwards.
+
+**Getting the id.** Once Play Services is installed, a row appears at the bottom of the **Store**
+tab — *"Play says this console is not certified?"* — and opens the whole procedure as a sheet: the id
+in large grouped digits, the address to type, and the four steps in the order they happen. It is
+also printed in **Diagnostics → ENV Environment** under `-- Google Play certification --`, for
+copying out of a log.
+
+The row is deliberately calm and cannot be dismissed. Stride has no way to ask Google whether a
+console is already registered, so a warning would cry wolf at everyone who has already done it,
+while a dismiss button would hide the answer from the tester who meets the error next month.
+
+The id is shown in groups of four, because it is up to twenty digits long and gets copied by hand
+onto a phone, from a screen a metre away, by someone standing on a treadmill. An unbroken run of
+twenty digits has no checksum and no visual anchors; groups of four are the shape everybody has
+already practised on a card number. The separators are thin spaces, so a copy lifts the bare digits.
+
+The three usual ways to read it are all dead ends here: a device-id
+app comes from the Play Store, which is the thing that does not work yet; the `sqlite3` route into
+GSF's database needs root; and `adb shell content query` is refused outright, because the shell user
+does not hold the permission either:
+
+```
+$ adb shell "content query --uri content://com.google.android.gsf.gservices --where \"name='android_id'\""
+java.lang.SecurityException: Permission Denial: ... requires
+  com.google.android.providers.gsf.permission.READ_GSERVICES
+```
+
+An app that declares `READ_GSERVICES` is granted it at install time, so Stride can do what the shell
+cannot. `PlayCertification` reads it with one query against GSF's `gservices`
+provider, which costs the read-only `READ_GSERVICES` permission and nothing else.
+
+**Or drive it from a computer.** `tools/certify.sh` does every part of this that is mechanical:
+
+```bash
+tools/certify.sh          # finds the console itself
+```
+
+It reads the id, puts it on your clipboard, opens the registration page, and then — once you say
+you have registered — clears both apps' data and reboots. Registering is the one step it cannot do,
+because the page needs you signed in as the account the console will use.
+
+The shell still cannot read the id itself, so the script asks Stride:
+`CertificationDumpReceiver` answers a broadcast with the id as result data, which `am broadcast`
+prints as one parseable line. The receiver is exported, because a broadcast from the shell has to
+reach it, but gated on `android.permission.DUMP` — the shell user holds that and an ordinary app
+does not. Without the gate this would hand a stable device identifier to every app on a console
+whose entire job is running other people's software.
+
+Clearing the two apps' data is the step people skip, and the usual reason registering "did not
+work": both cache the failed certification check, and nothing re-reads it until their data is gone.
+
+**Paste the decimal form.** The page wants decimal. Nearly every device-id app displays hex, and
+pasting hex is the most common reason this step appears not to work — the page rejects it without
+explaining why. The ENV screen prints the decimal first and labels the hex as a cross-check only.
+Two related traps the code already handles:
+
+- GSF stores the id in a signed 64-bit column, so roughly half of all ids come back **negative**.
+  `-1` is not an error and is not `-1` to Google; it is `18446744073709551615`.
+- GSF writes **0** before it has first reached Google. Registering a zero id looks like it worked
+  and does nothing, so it is reported as "no id yet — give it a network and a reboot" instead.
+
+**After registering.** Force stop and clear data on Play Services and the Play Store, then reboot.
+Propagation is not instant; a few minutes is normal.
+
+This is per **account and device**, so every tester repeats it on their own console. That is the
+reason the id is surfaced in the app at all rather than left as an `adb` recipe in this file: a
+tester with a treadmill and no laptop cannot run `adb`, and will not think to open a diagnostics
+screen either — which is why the pointer lives in the Store tab, next to where they installed Play.
+### 11.7 Licensing
 
 Re-hosting Google's binaries is redistribution of someone else's software, and the same question the
 third-party APKs raise (§4), only more visible. The mechanism here is neutral — a bundle is an
