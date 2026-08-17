@@ -7,6 +7,7 @@ import '../theme/stride_tokens.dart';
 import '../widgets/stride_sheet.dart';
 import '../widgets/app_models.dart';
 import '../widgets/bundle_row.dart';
+import '../widgets/play_certification.dart';
 import '../widgets/store_icon.dart';
 import '../widgets/app_tile.dart';
 import '../model/appstore.dart';
@@ -47,6 +48,11 @@ class _AllAppsScreenState extends State<AllAppsScreen>
   AppstoreStatus _store = AppstoreStatus.empty;
   Timer? _poll;
 
+  /// Read once per visit rather than polled: it only changes when Play Services
+  /// is installed or first checks in with Google, and both of those need a
+  /// restart to take effect anyway.
+  PlayCertificationInfo _certification = PlayCertificationInfo.absent;
+
   /// Packages already reconciled into [_apps]. An install that completes while
   /// this screen is open reports `installed` on every poll thereafter, so
   /// without this the inventory would reload every two seconds forever.
@@ -59,6 +65,7 @@ class _AllAppsScreenState extends State<AllAppsScreen>
     _tabs = TabController(length: 2, vsync: this)
       ..addListener(() => setState(() {}));
     _refreshStore();
+    _refreshCertification();
     // Same cadence as the updates sheet: the install pipeline lives in a service
     // that outlives the Flutter engine, so polling is the only way to see it.
     _poll = Timer.periodic(const Duration(seconds: 2), (_) => _refreshStore());
@@ -74,6 +81,12 @@ class _AllAppsScreenState extends State<AllAppsScreen>
 
   /// Never throws: a catalog that cannot be reached must not take the app list
   /// down with it, since browsing and pinning installed apps still works offline.
+  Future<void> _refreshCertification() async {
+    final info = await readPlayCertification();
+    if (!mounted) return;
+    setState(() => _certification = info);
+  }
+
   Future<void> _refreshStore() async {
     final raw = await SpikeBridge.appstoreStatus();
     if (!mounted) return;
@@ -246,13 +259,21 @@ class _AllAppsScreenState extends State<AllAppsScreen>
     final bundles = _store.offerableBundles;
 
     if (offered.isEmpty && blocked.isEmpty && bundles.isEmpty) {
-      return _StoreEmpty(
+      final empty = _StoreEmpty(
         status: _store,
         searching: query.isNotEmpty,
         onCheckNow: () async {
           await SpikeBridge.appstoreCheckNow();
           await _refreshStore();
         },
+      );
+      if (!_certification.hasGms) return empty;
+      return Column(
+        children: [
+          Expanded(child: empty),
+          const SizedBox(height: StrideSpace.md),
+          PlayCertificationRow(info: _certification),
+        ],
       );
     }
 
@@ -299,6 +320,10 @@ class _AllAppsScreenState extends State<AllAppsScreen>
               enabled: false,
               onInstall: () {},
             ),
+        ],
+        if (_certification.hasGms) ...[
+          const SizedBox(height: StrideSpace.md),
+          PlayCertificationRow(info: _certification),
         ],
       ],
     );

@@ -433,8 +433,22 @@ id** against a Google account at <https://www.google.com/android/uncertified> an
 use Play on that device. This is a supported route for exactly this situation, not a bypass; nothing
 is patched, and Play Protect keeps working normally afterwards.
 
-**Getting the id.** Stride reports it in **Diagnostics → ENV Environment**, under
-`-- Google Play certification --`. The two usual ways to read it are both dead ends here: a device-id
+**Getting the id.** Once Play Services is installed, a row appears at the bottom of the **Store**
+tab — *"Play says this console is not certified?"* — and opens the whole procedure as a sheet: the id
+in large grouped digits, the address to type, and the four steps in the order they happen. It is
+also printed in **Diagnostics → ENV Environment** under `-- Google Play certification --`, for
+copying out of a log.
+
+The row is deliberately calm and cannot be dismissed. Stride has no way to ask Google whether a
+console is already registered, so a warning would cry wolf at everyone who has already done it,
+while a dismiss button would hide the answer from the tester who meets the error next month.
+
+The id is shown in groups of four, because it is up to twenty digits long and gets copied by hand
+onto a phone, from a screen a metre away, by someone standing on a treadmill. An unbroken run of
+twenty digits has no checksum and no visual anchors; groups of four are the shape everybody has
+already practised on a card number. The separators are thin spaces, so a copy lifts the bare digits.
+
+The two usual ways to read it are both dead ends here: a device-id
 app comes from the Play Store, which is the thing that does not work yet, and the `sqlite3` route
 into GSF's database needs root. `PlayCertification` reads it with one query against GSF's `gservices`
 provider, which costs the read-only `READ_GSERVICES` permission and nothing else.
@@ -454,7 +468,8 @@ Propagation is not instant; a few minutes is normal.
 
 This is per **account and device**, so every tester repeats it on their own console. That is the
 reason the id is surfaced in the app at all rather than left as an `adb` recipe in this file: a
-tester with a treadmill and no laptop cannot run `adb`.
+tester with a treadmill and no laptop cannot run `adb`, and will not think to open a diagnostics
+screen either — which is why the pointer lives in the Store tab, next to where they installed Play.
 ### 11.7 Licensing
 
 Re-hosting Google's binaries is redistribution of someone else's software, and the same question the
