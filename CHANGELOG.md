@@ -7,6 +7,26 @@ what shipped rather than what was intended. Notes for a version come from
 `docs/release-notes/<version>.md` when that file exists, and from the commit subjects since the previous
 tag when it does not.
 
+## 1.2.0 — versionCode 14 — 2026-08-24
+
+**Stride now works on pre-GlassOS consoles.** A NordicTrack X22i and its siblings run an older iFit stack with no GlassOS service on the console at all. Stride assumed GlassOS was always there, so on those machines it connected to nothing, showed **Not measured** for every metric, and gave no hint that the fix was a setting three screens down. That was a real report from an X22i owner and this release is the answer to it.
+
+**Stride now works out what your console is.** On first run it checks what is actually present — iFit's GlassOS service, or an iFit console on the USB port — and picks the connection to match. The settings screen tells you what it found and whether the choice was automatic, and picking one yourself always overrides it and sticks.
+
+If your machine works today, it keeps working exactly as it does now. The check is deliberately cautious: a console running GlassOS stays on GlassOS, and Stride will not move a working treadmill onto the experimental direct path on its own. Only a console where GlassOS is genuinely absent is sent anywhere else.
+
+**Machines were being given too little time to answer.** Direct hardware access waited 400 milliseconds for a reply. Measured against iFit's own software that is not a deadline at all — it is the *pause before reading starts*, and the real deadline is one to three and a half seconds depending on what was asked. A console replying exactly as designed was being treated as absent. Every command now waits as long as the machine is actually allowed to take.
+
+**Two consoles, told apart properly.** Stride now reads the console's USB product id and speaks the generation it reports, rather than assuming. A console being reflashed is recognised and left alone rather than written to.
+
+**The safety key is still the only emergency stop**, on every connection. Stride's stop is best-effort and always has been. Everything that protects you — the speed and incline limits, the ramp limiting, stop preemption — sits above all the connections in one place, so the connection Stride picks never changes the safety rules.
+
+**What has not been tested on hardware.** The direct path was rebuilt from iFit's own console software rather than from captures of a running machine, and has still not been run against a real treadmill. It stays marked experimental and still warns before you switch to it. If it stops answering, switch back to iFit and speed, incline and fan return.
+
+Installs as an update over 1.1.0.
+
+Tested on a NordicTrack Commercial 1750.
+
 ## 1.1.0 — versionCode 13 — 2026-08-23
 
 **Stride can now drive equipment that isn't iFit's.** Until now it reached the treadmill one way: through iFit's own GlassOS service on the console. This release adds two more paths, and you choose between them under **Settings → Advanced → Machine connection**.
