@@ -195,6 +195,14 @@ class _SettingsScreenState extends State<SettingsScreen>
       );
       return;
     }
+    // Ask for USB access as part of the tap, not from the background retry.
+    // Stride keeps an overlay above everything it launches, so a dialog raised
+    // from a poll can appear behind it and never be seen -- the rider taps the
+    // setting, nothing visibly happens, and it gets reported as not working.
+    if (transport == 'direct') {
+      await SpikeBridge.usbPermissionRequest();
+      if (!mounted) return;
+    }
     setState(() => _switching = true);
     try {
       await _awaitRetarget(before);

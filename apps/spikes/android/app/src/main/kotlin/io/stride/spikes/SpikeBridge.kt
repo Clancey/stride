@@ -18,6 +18,7 @@ import android.os.Build
 import android.os.Handler
 import android.os.Looper
 import android.provider.Settings
+import android.util.Log
 import android.util.LruCache
 import android.view.KeyEvent
 import io.flutter.plugin.common.MethodCall
@@ -166,6 +167,7 @@ class SpikeBridge(private val context: Context) : MethodChannel.MethodCallHandle
                 "settingsGet" -> result.success(settingsGet())
                 "transportSet" -> result.success(transportSet(call))
                 "heartRateStrapSet" -> result.success(heartRateStrapSet(call))
+                "usbPermissionRequest" -> result.success(usbPermissionRequest())
                 "grantsGet" -> result.success(grantsGet())
                 "grantsRepair" -> result.success(StridePermissions.repair(context))
                 "grantOpenSettings" -> result.success(
@@ -636,7 +638,7 @@ class SpikeBridge(private val context: Context) : MethodChannel.MethodCallHandle
             // found. Shown rather than only acted on: a rider whose console was detected as one
             // thing and behaves like another learns more from this line than from any retry.
             "transportAutomatic" to StrideSettings.transportIsAutomatic,
-            "transportDetail" to TransportDetector.describe(),
+            "transportDetail" to TransportDetector.describeWithBus(context),
         )
     }
 
@@ -671,6 +673,22 @@ class SpikeBridge(private val context: Context) : MethodChannel.MethodCallHandle
         OverlayService.refreshChrome()
         return true
     }
+
+    /**
+     * Raise the USB permission dialog from the settings screen.
+     *
+     * Deliberately driven from here rather than only from the link's retry. Stride is the launcher
+     * and keeps an overlay above everything, so a dialog raised from a background poll can end up
+     * behind it and be missed entirely — the rider sees nothing happen and reports that the setting
+     * does not work. Asking as part of an explicit tap puts it in front of the screen they are
+     * already looking at.
+     *
+     * Returns true when permission is already held, which the screen reads as "nothing to do".
+     */
+    private fun usbPermissionRequest(): Boolean =
+        runCatching { UsbSerialTransport.requestPermission(context) }
+            .onFailure { Log.w("SpikeBridge", "USB permission request failed", it) }
+            .getOrDefault(false)
 
     private fun grantsGet(): List<Map<String, Any?>> =
         StridePermissions.all(context).map {

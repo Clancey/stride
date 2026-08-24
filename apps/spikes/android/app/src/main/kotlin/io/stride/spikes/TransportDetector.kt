@@ -153,6 +153,23 @@ object TransportDetector {
         }
     }
 
+    /**
+     * The same, plus what the USB bus actually shows.
+     *
+     * Detection falling back to iFit has several causes and the summary above cannot separate them.
+     * A rider whose console reports "USB has vendor 1234/product 5, none of which is a console
+     * Stride recognises" has handed us the two numbers needed to support their machine; one who
+     * reports "it defaulted to iFit" has not.
+     */
+    /** Record that GlassOS answered for real, so [describe] stops saying it is absent. */
+    fun noteGlassOsWorking() {
+        glassOsSeen = true
+        lastDescription = summarise(glassOs = true, usb = usbSeen)
+    }
+
+    fun describeWithBus(context: Context): String =
+        describe() + " " + UsbSerialTransport.describeBus(context)
+
     private fun label(variant: FitProCodec.Variant): String = when (variant) {
         FitProCodec.Variant.FITPRO1 -> "FitPro1"
         FitProCodec.Variant.FITPRO2 -> "FitPro2"
