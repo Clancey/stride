@@ -82,6 +82,19 @@ class FtmsMachineCommands(private val transport: FtmsLink) : MachineCommands {
      *
      * Idempotent and cheap to repeat, because `MachineLink` calls it on a schedule rather than once.
      * A machine that has already granted control answers `SUCCESS` again.
+     *
+     * ## A deliberate divergence from qdomyos-zwift
+     *
+     * qz sends `StartOrResume` immediately after `RequestControl` inside its own speed command —
+     * "start simulation" — so that a target speed always lands on a running machine. Stride does
+     * **not**, and must not: `PLAN.md` §3.5 says the belt never begins moving without explicit
+     * on-console confirmation, and a setpoint that silently starts a treadmill is exactly that rule
+     * being broken.
+     *
+     * The cost is real and is handled elsewhere. Some machines ignore a target speed unless a
+     * workout is running, which surfaces as a refusal rather than movement — the same situation
+     * [MachineLink.CONTROL_NEEDS_WORKOUT_NOTICE] already explains to the rider on the GlassOS path.
+     * A refusal a rider can act on is a better failure than a belt that starts on its own.
      */
     override fun connect(): Int? {
         if (!transport.connected) return GlassOsClient.ConsoleState.DISCONNECTED

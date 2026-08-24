@@ -35,6 +35,23 @@ package io.stride.spikes
  * - **Bit 3 carries two fields.** Inclination *and* Ramp Angle Setting, four bytes, not two.
  * - **Bit 7 carries three fields.** Total Energy, Energy Per Hour, Energy Per Minute — five bytes.
  *
+ * And one that bites only if this file ever grows an elliptical: **Cross Trainer Data (`0x2ACE`)
+ * has a 24-bit flags field**, not 16. Reusing [parseTreadmillData]'s two-byte read on it would put
+ * every field one byte out. It is a different characteristic with a different header, not a variant.
+ *
+ * ## Cross-checked against qdomyos-zwift
+ *
+ * The layout above was written from the SIG specification, then verified field-for-field against
+ * `qdomyos-zwift` — the reference implementation in this space. Its `0x2ACD` bitfield
+ * (`horizontreadmill.cpp`) declares the same thirteen flags in the same order, reads the same
+ * two-byte header, gates speed on `!moreData`, advances four bytes for inclination, four for
+ * elevation and five for expended energy, and decodes inclination as `int16_t`. Its Control Point
+ * op codes and result codes (`ftmsbike.h`) are numerically identical to the ones here.
+ *
+ * `FtmsCodecTest` additionally decodes the exact frame its `CharacteristicNotifier2ACD` publishes to
+ * Zwift, in both of that function's flag layouts. That is the closest thing to a reference vector
+ * available without hardware.
+ *
  * ## Units are the spec's, not the app's
  *
  * Everything here stays in the units FTMS defines — km/h, metres, percent. Conversion to the mph and

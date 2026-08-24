@@ -346,4 +346,81 @@ class FtmsCodecTest {
         assertNull(FtmsCodec.workoutStateFromStatus(bytes(0x7F)))
         assertNull(FtmsCodec.workoutStateFromStatus(bytes()))
     }
+
+    // ---- interoperability with qdomyos-zwift ------------------------------------------------
+
+    /**
+     * The exact frame `qdomyos-zwift` emits to Zwift, decoded.
+     *
+     * Taken from its `CharacteristicNotifier2ACD::notify`, which is the FTMS treadmill payload it
+     * publishes as a virtual machine and which is known to work against production Zwift. That makes
+     * it the closest thing to a reference vector available without hardware: if this decodes wrong,
+     * Stride disagrees with the most widely deployed FTMS implementation in this space.
+     *
+     * Layout it writes, flags `0x0E 0x05` (= `0x050E`): speed, average speed, total distance,
+     * inclination + ramp, heart rate, elapsed time.
+     *
+     * ```
+     * 0E 05                      flags
+     * 25 03                      speed        805 -> 8.05 km/h
+     * BC 02                      avg speed    700 -> 7.00 km/h
+     * 49 06 00                   distance     1609 m
+     * 1E 00                      incline      30 -> 3.0 %
+     * 11 00                      ramp         17 -> 1.7 deg
+     * 8A                         heart rate   138 bpm
+     * 58 02                      elapsed      600 s
+     * ```
+     */
+    @Test
+    fun `the frame qdomyos-zwift publishes to Zwift decodes field for field`() {
+        val data = FtmsCodec.parseTreadmillData(
+            bytes(
+                0x0E, 0x05,
+                0x25, 0x03,
+                0xBC, 0x02,
+                0x49, 0x06, 0x00,
+                0x1E, 0x00,
+                0x11, 0x00,
+                0x8A,
+                0x58, 0x02,
+            ),
+        )!!
+
+        assertEquals(8.05, data.speedKph!!, 1e-9)
+        assertEquals(7.00, data.averageSpeedKph!!, 1e-9)
+        assertEquals(1609, data.totalDistanceMetres)
+        assertEquals(3.0, data.inclinePercent!!, 1e-9)
+        assertEquals(1.7, data.rampAngleDegrees!!, 1e-9)
+        assertEquals(138, data.heartRateBpm)
+        assertEquals(600, data.elapsedSeconds)
+    }
+
+    /**
+     * The same source's other layout, flags `0x0C 0x05`, which omits average speed.
+     *
+     * Worth pinning separately because dropping a two-byte field shifts everything after it. A
+     * parser that ignored the average-speed bit would still decode speed correctly here and get
+     * distance, incline, heart rate and elapsed time all wrong.
+     */
+    @Test
+    fun `the same publisher's no-average-speed layout also decodes`() {
+        val data = FtmsCodec.parseTreadmillData(
+            bytes(
+                0x0C, 0x05,
+                0x25, 0x03,
+                0x49, 0x06, 0x00,
+                0x1E, 0x00,
+                0x11, 0x00,
+                0x8A,
+                0x58, 0x02,
+            ),
+        )!!
+
+        assertEquals(8.05, data.speedKph!!, 1e-9)
+        assertNull(data.averageSpeedKph)
+        assertEquals(1609, data.totalDistanceMetres)
+        assertEquals(3.0, data.inclinePercent!!, 1e-9)
+        assertEquals(138, data.heartRateBpm)
+        assertEquals(600, data.elapsedSeconds)
+    }
 }
