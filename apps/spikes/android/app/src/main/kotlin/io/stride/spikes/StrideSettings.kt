@@ -114,10 +114,53 @@ object StrideSettings {
      * unreadable value: the safe answer to "what did the rider mean" is the one that is implemented.
      */
     var transport: Transport
-        get() = Transport.parse(requirePrefs().getString(KEY_TRANSPORT, null))
+        get() = transportChoice ?: detectedTransport ?: Transport.GLASSOS
         set(value) {
             requirePrefs().edit().putString(KEY_TRANSPORT, value.name).apply()
         }
+
+    /**
+     * What the rider explicitly picked, or null if they never have.
+     *
+     * The distinction is the whole point and it used to be lost: [Transport.parse] answered
+     * `GLASSOS` both for "the rider chose iFit" and for "nobody has ever chosen", so there was no
+     * way to detect a sensible default without overriding a real decision. A rider who deliberately
+     * selects iFit on a console where it does not work is entitled to have that stick.
+     */
+    val transportChoice: Transport?
+        get() = requirePrefs().getString(KEY_TRANSPORT, null)
+            ?.let { raw -> Transport.entries.firstOrNull { it.name.equals(raw, ignoreCase = true) } }
+
+    /**
+     * What the hardware says it should be, cached for the life of the process.
+     *
+     * Cached because it is read on every settings load and every transport open, and the probe
+     * behind it opens a socket and enumerates USB. It cannot change without the console being
+     * re-cabled or rebooted, both of which restart this process.
+     */
+    @Volatile private var detectedTransport: Transport? = null
+
+    /**
+     * Run detection and remember it, but **only once it has actually found something**.
+     *
+     * An inconclusive answer — no GlassOS on the port and no FitPro1 console enumerated — is not
+     * cached, so the next attempt asks again. Caching it would mean a console whose USB device
+     * appeared a moment after Stride started, or whose daemon was still binding, stayed on the
+     * wrong transport until somebody power-cycled the machine.
+     *
+     * Blocking — it opens a socket — so callers must be off the main thread.
+     */
+    fun detectTransport(context: Context) {
+        if (detectedTransport != null) return
+        val result = TransportDetector.detect(context)
+        if (result.confident) detectedTransport = result.transport
+    }
+
+    /** True when the transport in use was detected rather than chosen. For the settings screen. */
+    val transportIsAutomatic: Boolean get() = transportChoice == null
+
+    /** True once detection has actually established what this console is. */
+    val transportResolved: Boolean get() = detectedTransport != null
 
     /**
      * Whether Stride should connect to a paired Bluetooth heart rate strap.

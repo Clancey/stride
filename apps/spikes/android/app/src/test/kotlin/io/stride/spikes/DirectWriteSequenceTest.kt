@@ -27,6 +27,10 @@ class DirectWriteSequenceTest {
     private class FakeConsole : FitProTransport {
         override val name = "fake"
         override val connected = true
+        // The generation a fake console claims. FitPro1 because that is the framing verified
+        // against iFit's own code; nothing in these tests reaches the transport layer where
+        // the two differ.
+        override val variant = FitProCodec.Variant.FITPRO1
 
         /** Status returned for frames that carry writes. Reads always succeed. */
         var writeStatus: FitProCodec.Status = FitProCodec.Status.DONE
@@ -43,7 +47,7 @@ class DirectWriteSequenceTest {
         /** Values handed back for reads, by register. Anything absent reads as zero. */
         val readValues = mutableMapOf<FitProCodec.Register, Int>()
 
-        override fun exchange(frame: ByteArray, timeoutMs: Long): ByteArray? {
+        override fun exchange(frame: ByteArray, command: FitProCodec.Command): ByteArray? {
             if (silent) return null
             // A real console validates before it acts, and so must this one. Without these checks
             // the fake answers a frame addressed to the wrong device, carrying the wrong command,

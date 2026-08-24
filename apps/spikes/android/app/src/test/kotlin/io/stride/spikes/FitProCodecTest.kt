@@ -367,7 +367,7 @@ class FitProCodecTest {
     @Test
     fun bleChunkingEmitsALeadThenTwentyBytePackets() {
         val payload = ByteArray(9) { (it + 1).toByte() }
-        val packets = FitProCodec.chunkForBle(payload)
+        val packets = FitProCodec.chunkMessages(payload)
         assertEquals(2, packets.size)
         assertEquals("FE 02 09 02", hex(packets[0]))
         assertEquals(20, packets[1].size)
@@ -375,10 +375,131 @@ class FitProCodecTest {
         assertEquals(9, packets[1][1].toInt())
     }
 
+    /**
+     * The chunking matches iFit's `CreateMessages` / `CreateInitMessage` exactly, transcribed by
+     * hand from `Sindarin.FitPro1.Communication.FitProCommunicationGroup`:
+     *
+     * ```
+     * CreateInitMessage → [254, 2, orig.Length, TotalMessageCount(orig) + 1]
+     * TotalMessageCount → orig.Length > 18 ? ceil(orig.Length / 18) : 1
+     * each message      → byte[20]; [0] = index (255 on the last), [1] = min(18, remaining)
+     * ```
+     *
+     * Pinned because it is the framing every BLE console is addressed in, and because the shared
+     * `CommAdapter.SendBytes` makes it look like the USB path too — it is not, the USB adapter
+     * overrides that method to send the unchunked frame. Both facts are one method apart in iFit's
+     * source and getting them the wrong way round produces a console that answers nothing.
+     */
+    @Test
+    fun chunkingMatchesTheVendorsOwnMessageBuilder() {
+        // 40 bytes → ceil(40/18) = 3 messages, so the lead count is 4.
+        val payload = ByteArray(40) { it.toByte() }
+        val packets = FitProCodec.chunkMessages(payload)
+
+        assertEquals(4, packets.size)
+        assertEquals("FE 02 28 04", hex(packets[0]))
+        assertEquals(0x00.toByte(), packets[1][0])
+        assertEquals(18, packets[1][1].toInt())
+        assertEquals(0x01.toByte(), packets[2][0])
+        assertEquals(18, packets[2][1].toInt())
+        // The final message is indexed 0xFF and carries the 4-byte remainder.
+        assertEquals(0xFF.toByte(), packets[3][0])
+        assertEquals(4, packets[3][1].toInt())
+        // Every data message is padded to a full 20 bytes.
+        packets.drop(1).forEach { assertEquals(20, it.size) }
+    }
+
+    /** An exact multiple of 18 must not emit a trailing empty message. */
+    @Test
+    fun chunkingOfAnExactMultipleEndsOnTheLastFullMessage() {
+        val packets = FitProCodec.chunkMessages(ByteArray(36))
+        assertEquals(3, packets.size)
+        assertEquals("FE 02 24 03", hex(packets[0]))
+        assertEquals(0xFF.toByte(), packets[2][0])
+        assertEquals(18, packets[2][1].toInt())
+    }
+
+    // ---- deadlines ---------------------------------------------------------------------------
+
+    /**
+     * The deadline is a transport base **plus** a per-command allowance, which is how iFit composes
+     * it: `FitProCommunication.Timeout` contributes 1 s on USB and 2 s on BLE, and the command's own
+     * `ResponseTimeoutMs` is added as `AdditionalDelay`.
+     *
+     * Stride used a flat 400 ms for every command on every transport. That is shorter than the
+     * vendor's *read delay* for most of these — the pause before reading even begins — so a console
+     * answering exactly as designed was being timed out and reported as absent. On a machine with
+     * no GlassOS to fall back to, that is the difference between working and appearing dead.
+     */
+    @Test
+    fun deadlinesAreATransportBasePlusACommandAllowance() {
+        // Telemetry: 1s + 1s wired, 2s + 1s on the radio.
+        assertEquals(2_000L, FitProCodec.Command.READ_WRITE_DATA.timeoutMs(onBle = false))
+        assertEquals(3_000L, FitProCodec.Command.READ_WRITE_DATA.timeoutMs(onBle = true))
+
+        // The handshake commands get the same allowance as telemetry.
+        assertEquals(2_000L, FitProCodec.Command.DEVICE_INFO.timeoutMs(onBle = false))
+
+        // The slow informational reads get the vendor's larger one.
+        assertEquals(3_500L, FitProCodec.Command.SERIAL_NUMBER.timeoutMs(onBle = false))
+        assertEquals(4_500L, FitProCodec.Command.SERIAL_NUMBER.timeoutMs(onBle = true))
+
+        // Every deadline must exceed the old flat 400 ms, which is the bug being fixed.
+        FitProCodec.Command.entries.forEach {
+            assertTrue("${'$'}it is still shorter than the old 400ms", it.timeoutMs(false) > 400L)
+        }
+    }
+
+    /**
+     * Read delays are the vendor's, per command, and differ by a factor of five.
+     *
+     * Telemetry is polled constantly and gets 80 ms; the console interrogation commands get 300 ms
+     * and the slow reads 400 ms. Using one figure for all of them either stalls the poll or races
+     * the console.
+     */
+    @Test
+    fun readDelaysAreSetPerCommand() {
+        assertEquals(80L, FitProCodec.Command.READ_WRITE_DATA.readDelayMs)
+        assertEquals(300L, FitProCodec.Command.DEVICE_INFO.readDelayMs)
+        assertEquals(300L, FitProCodec.Command.SUPPORTED_COMMANDS.readDelayMs)
+        assertEquals(400L, FitProCodec.Command.SERIAL_NUMBER.readDelayMs)
+        // The delay must always leave room inside the deadline, or the read never happens.
+        FitProCodec.Command.entries.forEach {
+            assertTrue("${'$'}it delays past its own deadline", it.readDelayMs < it.timeoutMs(false))
+        }
+    }
+
+    // ---- protocol generations ---------------------------------------------------------------
+
+    /**
+     * A console names its generation in its USB product id, and the two are framed differently
+     * enough that guessing is silence rather than a wrong reading.
+     *
+     * From `Sindarin.Usb.Android.UsbProduct`: `{ Unknown = 0, FitPro1 = 2, FitPro2 = 3 }`.
+     */
+    @Test
+    fun theUsbProductIdNamesTheProtocolGeneration() {
+        assertEquals(FitProCodec.Variant.FITPRO1, FitProCodec.Variant.fromUsbProductId(2))
+        assertEquals(FitProCodec.Variant.FITPRO2, FitProCodec.Variant.fromUsbProductId(3))
+    }
+
+    /**
+     * An unrecognised product id is **not** defaulted to a generation.
+     *
+     * Product 153 is the console's own firmware bootloader. Writing register frames at a device in
+     * DFU mode is precisely what the vendor lock exists to prevent, and "assume the newer one" would
+     * do it.
+     */
+    @Test
+    fun anUnknownProductIdSelectsNoGeneration() {
+        assertNull(FitProCodec.Variant.fromUsbProductId(153))
+        assertNull(FitProCodec.Variant.fromUsbProductId(0))
+    }
+
     @Test
     fun bleChunkingSplitsPastEighteenBytes() {
         val payload = ByteArray(20) { it.toByte() }
-        val packets = FitProCodec.chunkForBle(payload)
+        val packets = FitProCodec.chunkMessages(payload)
         assertEquals(3, packets.size)
         assertEquals("FE 02 14 03", hex(packets[0]))
         assertEquals(0x00.toByte(), packets[1][0])
@@ -453,18 +574,18 @@ class FitProCodecTest {
     /**
      * The exact inverse of the verified chunker, checked against a frame that needs two packets.
      *
-     * Round-tripping through [FitProCodec.chunkForBle] is the point: if either side drifts, the two
+     * Round-tripping through [FitProCodec.chunkMessages] is the point: if either side drifts, the two
      * stop agreeing, and this catches it without needing a console.
      */
     @Test
     fun `reassembles a chunked reply`() {
         val frame = ByteArray(22) { (it + 1).toByte() }
         val payload = FitProCodec.fitPro2Envelope(frame)
-        val packets = FitProCodec.chunkForBle(payload)
+        val packets = FitProCodec.chunkMessages(payload)
         assertEquals("22-byte frame + 4-byte envelope needs a lead and two packets", 3, packets.size)
 
         var got: ByteArray? = null
-        val assembler = FitProCodec.BleReassembler { got = it }
+        val assembler = FitProCodec.MessageReassembler { got = it }
         packets.forEach { assembler.accept(it) }
 
         assertArrayEquals("envelope should be stripped and the frame restored", frame, got)
@@ -474,9 +595,9 @@ class FitProCodecTest {
     @Test
     fun `reassembles a single packet reply`() {
         val frame = byteArrayOf(0x02, 0x07, 0x02, 0x00, 0x10, 0x27, 0x42)
-        val packets = FitProCodec.chunkForBle(FitProCodec.fitPro2Envelope(frame))
+        val packets = FitProCodec.chunkMessages(FitProCodec.fitPro2Envelope(frame))
         var got: ByteArray? = null
-        val assembler = FitProCodec.BleReassembler { got = it }
+        val assembler = FitProCodec.MessageReassembler { got = it }
         packets.forEach { assembler.accept(it) }
         assertArrayEquals(frame, got)
     }
@@ -491,13 +612,13 @@ class FitProCodecTest {
     @Test
     fun `ignores packet padding`() {
         val frame = byteArrayOf(0x02, 0x05, 0x02, 0x00, 0x09)
-        val packets = FitProCodec.chunkForBle(FitProCodec.fitPro2Envelope(frame))
+        val packets = FitProCodec.chunkMessages(FitProCodec.fitPro2Envelope(frame))
         val data = packets[1]
         assertEquals("data packets are padded out to a full ATT payload", 20, data.size)
         assertEquals("only the envelope plus frame is real", 9, data[1].toInt())
 
         var got: ByteArray? = null
-        FitProCodec.BleReassembler { got = it }.also { packets.forEach(it::accept) }
+        FitProCodec.MessageReassembler { got = it }.also { packets.forEach(it::accept) }
         assertArrayEquals(frame, got)
     }
 
@@ -505,7 +626,7 @@ class FitProCodecTest {
     @Test
     fun `drops fragments arriving without a lead`() {
         var calls = 0
-        val assembler = FitProCodec.BleReassembler { calls++ }
+        val assembler = FitProCodec.MessageReassembler { calls++ }
         assembler.accept(byteArrayOf(0xFF.toByte(), 0x03, 1, 2, 3))
         assertEquals("a tail with no head is not a frame", 0, calls)
     }
@@ -514,11 +635,11 @@ class FitProCodecTest {
     @Test
     fun `a new lead discards a partial frame`() {
         val frame = byteArrayOf(0x02, 0x05, 0x02, 0x00, 0x09)
-        val packets = FitProCodec.chunkForBle(FitProCodec.fitPro2Envelope(frame))
+        val packets = FitProCodec.chunkMessages(FitProCodec.fitPro2Envelope(frame))
 
         var got: ByteArray? = null
         var calls = 0
-        val assembler = FitProCodec.BleReassembler { got = it; calls++ }
+        val assembler = FitProCodec.MessageReassembler { got = it; calls++ }
         assembler.accept(byteArrayOf(0xFE.toByte(), 0x02, 40, 3))
         assembler.accept(ByteArray(20).also { it[0] = 0; it[1] = 18 })
         packets.forEach { assembler.accept(it) }
@@ -531,9 +652,9 @@ class FitProCodecTest {
     @Test
     fun `withholds an incomplete frame`() {
         val frame = ByteArray(22) { (it + 1).toByte() }
-        val packets = FitProCodec.chunkForBle(FitProCodec.fitPro2Envelope(frame))
+        val packets = FitProCodec.chunkMessages(FitProCodec.fitPro2Envelope(frame))
         var calls = 0
-        val assembler = FitProCodec.BleReassembler { calls++ }
+        val assembler = FitProCodec.MessageReassembler { calls++ }
         assembler.accept(packets[0])
         assembler.accept(packets[1])
         assertEquals("one of two data packets is not a frame", 0, calls)
@@ -566,8 +687,8 @@ class FitProCodecTest {
         reply[6] = checksum.toByte()
 
         var got: ByteArray? = null
-        val packets = FitProCodec.chunkForBle(FitProCodec.fitPro2Envelope(reply))
-        FitProCodec.BleReassembler { got = it }.also { packets.forEach(it::accept) }
+        val packets = FitProCodec.chunkMessages(FitProCodec.fitPro2Envelope(reply))
+        FitProCodec.MessageReassembler { got = it }.also { packets.forEach(it::accept) }
 
         val parsed = FitProCodec.parseResponse(got!!, listOf(FitProCodec.Register.ACTUAL_KPH))!!
         assertTrue("the round trip must not disturb the checksum", parsed.checksumValid)

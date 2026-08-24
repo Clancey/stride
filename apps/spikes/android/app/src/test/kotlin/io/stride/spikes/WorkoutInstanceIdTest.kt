@@ -24,12 +24,16 @@ class WorkoutInstanceIdTest {
     private class FakeWire(var mode: FitProCodec.WorkoutMode) : FitProTransport {
         override val name = "fake"
         override val connected = true
+        // The generation a fake console claims. FitPro1 because that is the framing verified
+        // against iFit's own code; nothing in these tests reaches the transport layer where
+        // the two differ.
+        override val variant = FitProCodec.Variant.FITPRO1
         var replies = 0
 
         /** Set to drop `WORKOUT_MODE` from the reply, which is how a lossy link looks to [read]. */
         var silent = false
 
-        override fun exchange(frame: ByteArray, timeoutMs: Long): ByteArray? {
+        override fun exchange(frame: ByteArray, command: FitProCodec.Command): ByteArray? {
             replies++
             if (silent) return null
             // Values are packed in ascending field id: CURRENT_DISTANCE(4), RUNNING_TIME(4),

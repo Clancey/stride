@@ -111,6 +111,15 @@ object MachineLink {
     private const val HEART_RATE_REOPEN_INTERVAL_MS = 30_000L
 
     /**
+     * How often to re-ask the hardware what it is while detection is unresolved.
+     *
+     * Short, because the two cases it exists for — a daemon still binding at boot, a USB device not
+     * yet enumerated — resolve within seconds and every one of those seconds is a rider looking at
+     * "Not measured".
+     */
+    private const val REDETECT_INTERVAL_MS = 5_000L
+
+    /**
      * What a control says when GlassOS is answering but has no machine attached to it.
      *
      * Its own state, not a guess: the console reports [GlassOsClient.ConsoleState.DISCONNECTED]
@@ -623,6 +632,9 @@ object MachineLink {
      */
     private fun openTransport(app: Context) {
         StrideSettings.attach(app)
+        // Before reading the setting, because on a console the rider has never configured the
+        // setting *is* the detection. Runs once per process and is a no-op afterwards.
+        StrideSettings.detectTransport(app)
         when (StrideSettings.transport) {
             StrideSettings.Transport.GLASSOS -> {
                 val c = GlassOsClient(app)
@@ -938,7 +950,14 @@ object MachineLink {
         // Which transports even have a link that can drop. GlassOS talks to a local socket and opens
         // one per call, so there is nothing to re-establish; the other two hold a physical link.
         val dropped = when (StrideSettings.transport) {
-            StrideSettings.Transport.GLASSOS -> return
+            // Nothing to reopen, but this is the state a console sits in when detection could not
+            // decide -- GlassOS is where an inconclusive answer falls back to. Ask again from here,
+            // because "the daemon had not bound yet" and "the USB device had not enumerated yet"
+            // both look exactly like this and both fix themselves within seconds.
+            StrideSettings.Transport.GLASSOS -> {
+                redetectIfUnresolved(app)
+                return
+            }
             StrideSettings.Transport.DIRECT -> directSession?.connected != true
             // Added with FTMS. Without this branch an FTMS machine that went out of range, was
             // switched off, or dropped its BLE link stayed dead until the rider restarted Stride or
@@ -958,6 +977,37 @@ object MachineLink {
         // way past, and the "every few seconds" retry ran on every poll instead.
         nextReopenAt = SystemClock.elapsedRealtime() + REOPEN_INTERVAL_MS
     }
+
+    /**
+     * Ask the hardware again when nothing has been established yet.
+     *
+     * Only runs while the transport is **automatic** and the link is not producing readings, so a
+     * rider who chose GlassOS deliberately is never second-guessed, and a console that is working is
+     * never re-probed. Detection caches itself as soon as it finds something, so this stops on its
+     * own the moment it succeeds.
+     *
+     * Posted to the connect thread: the probe opens a socket, and the poll thread is what every
+     * metric on screen depends on.
+     */
+    private fun redetectIfUnresolved(app: Context) {
+        if (!StrideSettings.transportIsAutomatic) return
+        if (StrideSettings.transportResolved) return
+        val now = SystemClock.elapsedRealtime()
+        if (now < nextDetectAt) return
+        nextDetectAt = now + REDETECT_INTERVAL_MS
+        connectHandler?.post {
+            val before = StrideSettings.transport
+            StrideSettings.detectTransport(app)
+            val after = StrideSettings.transport
+            if (after != before) {
+                Log.i(TAG, "detection resolved to $after; retargeting")
+                retarget()
+            }
+        }
+    }
+
+    /** Throttles [redetectIfUnresolved]. */
+    @Volatile private var nextDetectAt = 0L
 
     /**
      * Reconnect a heart rate strap that has dropped.

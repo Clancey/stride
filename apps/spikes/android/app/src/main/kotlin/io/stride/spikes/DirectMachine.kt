@@ -235,12 +235,15 @@ class DirectMachineSession(
             FitProCodec.Command.VERSION_INFO,
             FitProCodec.Command.SERIAL_NUMBER,
         )) {
-            runCatching { transport.exchange(FitProCodec.commandFrame(command, address)) }
+            runCatching { transport.exchange(FitProCodec.commandFrame(command, address), command) }
                 .onFailure { Log.w(TAG, "${command.name} failed", it) }
         }
 
         supportedCommands = runCatching {
-            transport.exchange(FitProCodec.commandFrame(FitProCodec.Command.SUPPORTED_COMMANDS, address))
+            transport.exchange(
+                FitProCodec.commandFrame(FitProCodec.Command.SUPPORTED_COMMANDS, address),
+                FitProCodec.Command.SUPPORTED_COMMANDS,
+            )
                 ?.let(FitProCodec::parseSupportedCommands)
                 .orEmpty()
         }.getOrDefault(emptySet())
@@ -279,7 +282,10 @@ class DirectMachineSession(
     private fun handshake(): FitProCodec.DeviceInfo? {
         for (candidate in listOf(FitProCodec.ADDRESS_MAIN, FitProCodec.ADDRESS_TREADMILL)) {
             val reply = runCatching {
-                transport.exchange(FitProCodec.commandFrame(FitProCodec.Command.DEVICE_INFO, candidate))
+                transport.exchange(
+                    FitProCodec.commandFrame(FitProCodec.Command.DEVICE_INFO, candidate),
+                    FitProCodec.Command.DEVICE_INFO,
+                )
             }.getOrNull() ?: continue
 
             if (FitProCodec.statusOf(reply) != FitProCodec.Status.DONE) {

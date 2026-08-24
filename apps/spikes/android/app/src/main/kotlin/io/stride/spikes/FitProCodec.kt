@@ -107,6 +107,45 @@ object FitProCodec {
         SERIAL_NUMBER(-107),
         ;
 
+        /**
+         * How long to wait after writing this command before reading its reply, in milliseconds.
+         *
+         * iFit does not read straight away: every command carries its own `ReadDelayMs` and the
+         * connection is driven through `SendBytesWithReadDelay`, which waits before the bulk read
+         * (`RetryingConnection`). The figures are the vendor's, per command, and they differ by a
+         * factor of five — telemetry is polled far more often than the console is interrogated, and
+         * is given correspondingly less slack.
+         */
+        val readDelayMs: Long
+            get() = when (this) {
+                READ_WRITE_DATA -> 80L
+                DEVICE_INFO, SYSTEM_INFO, SUPPORTED_COMMANDS, SUPPORTED_DEVICES -> 300L
+                else -> 400L
+            }
+
+        /**
+         * How long the console may take to answer this command, in milliseconds, before it counts
+         * as absent.
+         *
+         * A **base plus a per-command allowance**, which is how iFit composes it: the transport
+         * contributes 1 s on USB and 2 s on BLE (`FitProCommunication.Timeout`), and the command's
+         * own `ResponseTimeoutMs` is added on top as `AdditionalDelay`. So a `ReadWriteData` on USB
+         * gets 2 s, not 1 s, and a `SerialNumber` gets 3.5 s.
+         *
+         * This matters more than it looks. Stride used a flat 400 ms for everything, which is
+         * shorter than the vendor's *read delay* for most of these commands, never mind its
+         * deadline — a console answering exactly as designed was being written off as not there.
+         */
+        fun timeoutMs(onBle: Boolean): Long {
+            val base = if (onBle) 2_000L else 1_000L
+            val allowance = when (this) {
+                READ_WRITE_DATA -> 1_000L
+                DEVICE_INFO, SYSTEM_INFO, SUPPORTED_COMMANDS, SUPPORTED_DEVICES -> 1_000L
+                else -> 2_500L
+            }
+            return base + allowance
+        }
+
         companion object {
             /**
              * Resolves a command byte, accepting it either sign-extended (`-127`) or masked
@@ -500,9 +539,71 @@ object FitProCodec {
     }
 
     /**
-     * Wraps a frame in the FitPro2 envelope `[0x02, 0x04, 0x02, frameLength]`. VERIFIED (`th/q.java`).
+     * Which generation of the FitPro protocol a console speaks.
      *
-     * The associated 400 ms reply timeout is a transport concern and lives in [FitProTransport].
+     * The two share this codec's frame (`[device][length][command][body][checksum]`), the bitfield
+     * register model and the value converters — verified line for line against iFit's own
+     * `Sindarin.FitPro1.Core` and `Sindarin.FitPro2.Core`. What they do **not** share is how that
+     * frame reaches the wire, and the difference is total rather than cosmetic: a console spoken to
+     * in the wrong generation's framing answers nothing at all.
+     *
+     * The console declares which it is in its USB product id, so this is read from the hardware
+     * rather than guessed.
+     */
+    enum class Variant(val usbProductId: Int) {
+        /**
+         * The pre-GlassOS consoles — a NordicTrack X22i and its siblings, running
+         * `com.ifit.launcher` into `com.ifit.standalone`.
+         *
+         * Verified line for line against `Sindarin.FitPro1.Core`: this codec's frame, its register
+         * ids and its converters are that assembly's.
+         */
+        FITPRO1(2),
+
+        /**
+         * The GlassOS-era consoles, such as the Commercial 1750.
+         *
+         * ## A naming caution, because two different things are called "FitPro2"
+         *
+         * This codec was recovered from **GlassOS 6.14.6**, the console software on a 1750, and it
+         * is a register protocol: `[device][length][command][bitfield masks][values][checksum]`.
+         * iFit's own `Sindarin.FitPro2.Core` assembly is a *different* protocol entirely —
+         * `[communicationType][device|command][payloadLength][payload]`, no checksum, `FeatureId`
+         * lookups and four-byte floats rather than bitfield masks and hundredths.
+         *
+         * They are not the same wire and must not be conflated. What reconciles them is that they
+         * describe different links: this codec is the console talking **down to its motor board**,
+         * which is the same register protocol on both generations — which is precisely why the
+         * register ids recovered from GlassOS match `Sindarin.FitPro1.Core`'s `BitField` enum
+         * exactly. Sindarin's FitPro2 is an app-to-console link, one layer up.
+         *
+         * Practically: this value selects the same register codec, and that is deliberate, but it
+         * has never been confirmed against a product-3 board on real hardware. A 1750 is defaulted
+         * to GlassOS for exactly that reason and only reaches here if a rider opts in.
+         */
+        FITPRO2(3),
+        ;
+
+        companion object {
+            /**
+             * The variant a USB product id names, or null for a device this codec does not describe.
+             *
+             * Null rather than a default: writing register frames at an unrecognised peripheral is
+             * exactly what the vendor lock exists to prevent, and "assume the newer one" would do it.
+             */
+            fun fromUsbProductId(productId: Int): Variant? =
+                entries.firstOrNull { it.usbProductId == productId }
+        }
+    }
+
+    /**
+     * Wraps a frame in the envelope `[0x02, 0x04, 0x02, frameLength]`. VERIFIED (`th/q.java`, and
+     * `Sindarin.FitPro1.Communication.FitProCommunication`'s raw-bytes constructor).
+     *
+     * **BLE only.** FitPro1 builds every request with this prefix and then strips it again the
+     * moment the link turns out not to be BLE — `Format`'s setter calls `RemoveBleBytes`, which
+     * drops exactly these four bytes. So a serial console is written the bare frame and a BLE
+     * console is written the enveloped one, which is the rule [FitProTransport] follows.
      */
     fun fitPro2Envelope(frame: ByteArray): ByteArray {
         require(frame.size <= 0xFF) { "FitPro2 length byte cannot exceed 255, got ${frame.size}" }
@@ -510,14 +611,22 @@ object FitProCodec {
     }
 
     /**
-     * Splits [payload] into BLE packets: a lead `[0xFE, 0x02, len, chunkCount]` then 20-byte data
+     * Splits [payload] into packets: a lead `[0xFE, 0x02, len, chunkCount]` then 20-byte data
      * packets `[index, dataLength, …up to 18 bytes]`, the last of which is indexed `0xFF`.
-     * VERIFIED (`th/o.java`).
+     * VERIFIED (`th/o.java`, and byte-for-byte against
+     * `FitProCommunicationGroup.CreateMessages` / `CreateInitMessage`).
      *
      * `chunkCount` counts the lead packet as well as the data packets, which is why the source adds
      * one. Data packets are padded to a full 20 bytes.
+     *
+     * Named for the framing rather than for BLE, which is what it used to be called, because the
+     * framing itself is not BLE-specific — it is what `FitProCommunicationGroup.CreateMessages`
+     * produces for any caller. In practice only the BLE adapter uses it: FitPro1's USB adapter
+     * overrides `SendBytes` to write `OriginalBytes`, the unchunked frame, and FitPro2 never chunks
+     * at all. Worth stating because reading only the shared `CommAdapter.SendBytes` gives the
+     * opposite impression.
      */
-    fun chunkForBle(payload: ByteArray): List<ByteArray> {
+    fun chunkMessages(payload: ByteArray): List<ByteArray> {
         require(payload.size <= 0xFF) { "BLE length byte cannot exceed 255, got ${payload.size}" }
         val maxData = 18
         val segments = if (payload.isEmpty()) {
@@ -546,7 +655,7 @@ object FitProCodec {
     }
 
     /**
-     * Rebuilds a frame from the console's notification fragments — the inverse of [chunkForBle].
+     * Rebuilds a frame from the console's notification fragments — the inverse of [chunkMessages].
      *
      * The console answers in the shape it is addressed in. GlassOS's own receive path (`th/q.g`)
      * concatenates the raw notifications and then drops **26** bytes from the front, removes two
@@ -562,7 +671,7 @@ object FitProCodec {
      *
      * Not thread-safe. Callers drive it from a single callback thread and [reset] between exchanges.
      */
-    class BleReassembler(private val onFrame: (ByteArray) -> Unit) {
+    class MessageReassembler(private val onFrame: (ByteArray) -> Unit) {
 
         private var buffer = ByteArray(0)
         private var expected = -1
