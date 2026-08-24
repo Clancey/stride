@@ -41,6 +41,10 @@ userspace has **no direct access**. Three known paths:
 | B | **Legacy WebSocket** `ws://<ip>/control`, JSON `{"type":"set","values":{"KPH":"8.5"}}` | Pre-≈2019 iFit firmware | What qz's `proformwifitreadmill` uses. Likely absent on this console. |
 | C | **ADB logcat + `input swipe` touch simulation** | Any iFit console | What qz's `nordictrackifitadbtreadmill` uses. **Rejected**: it requires the iFit UI to be foregrounded, which contradicts the entire premise of this product. |
 
+A fourth path exists but is not in this table, because it is not a way to reach *this* machine:
+**BLE FTMS (`0x1826`)** reaches equipment that is not iFit's at all. It is now implemented
+(`FtmsCodec`, `FtmsTransport`, `FtmsMachineCommands`) — see §2.5.
+
 ### 2.2 The mTLS certificate problem — how everyone else handles it
 
 **CORRECTED 2026-08-13, by direct measurement on the user's console. The original claim below was
@@ -254,6 +258,26 @@ ADB, USB serial, RFCOMM, ANT+, CSAFE, DIRCON.
 
 Stride will **not** port 120 drivers. It builds GlassOS first, then generic FTMS, and only extracts
 a shared abstraction once those two reveal the real commonality (§4).
+
+### 2.5 Why a standards driver came before any more proprietary ones
+
+Measured against `qdomyos-zwift`'s catalog at the time of writing: **132 device drivers**, of which
+114 are BLE GATT. Its discovery chain matches **282 distinct device-name patterns**, and **128 of
+those route to a single driver** — its generic FTMS implementation. One driver covers roughly 45% of
+the hardware it recognises; the remaining ~60 proprietary drivers split the rest.
+
+That ratio is the whole argument. A generic FTMS driver is the highest breadth-per-line change
+available anywhere in this project, and it is the second concrete implementation §3.4 was waiting on
+before extracting an abstraction.
+
+Two caveats worth keeping honest:
+
+- **Treadmills did not standardise the way bikes did.** Of qz's 30 real treadmill drivers, only 8
+  touch FTMS; 22 are fully proprietary. FTMS buys a great many bikes and trainers, and comparatively
+  few treadmills.
+- **qz is GPL-3.** Protocol facts — UUIDs, byte layouts, flag semantics — are not copyrightable and
+  are taken here from the Bluetooth SIG specification. qz's *expression* is, and none of it is
+  copied. §2.3's split already anticipates this.
 
 ## 3. Architecture
 

@@ -620,9 +620,9 @@ class SpikeBridge(private val context: Context) : MethodChannel.MethodCallHandle
             // What the direct path actually found, rather than what the UI assumes it would find.
             // Null until an attempt has been made, which is a third state the screen needs: "not
             // tried" is not "did not work".
-            "directDetail" to MachineLink.directDetail,
-            "directLinked" to MachineLink.directLinked,
-            "directCapabilities" to MachineLink.directCapabilities(),
+            "machineDetail" to MachineLink.machineDetail,
+            "machineLinked" to MachineLink.machineLinked,
+            "machineCapabilities" to MachineLink.machineCapabilities(),
             // Lets the screen tell "the switch has not run yet" from "it ran and found nothing".
             // Without it, a re-read immediately after transportSet reports the *old* transport's
             // findings, and the rider sees the previous link's capabilities under the new setting.
@@ -675,7 +675,7 @@ class SpikeBridge(private val context: Context) : MethodChannel.MethodCallHandle
         "speedNotice" to MachineLink.unavailableReason(MachineLink.Control.SPEED),
         "inclineNotice" to MachineLink.unavailableReason(MachineLink.Control.INCLINE),
         "fanNotice" to MachineLink.unavailableReason(MachineLink.Control.FAN),
-        "directDetail" to MachineLink.directDetail,
+        "machineDetail" to MachineLink.machineDetail,
         // Resolved here, not in Dart. MachineLink owns every safety sentence and the rule for
         // choosing between them; a second copy of that rule in Dart is a second thing to get wrong.
         "metricsNotice" to MachineLink.metricsNotice,

@@ -37,6 +37,16 @@ object StrideSettings {
          * than being retrofitted onto working code later.
          */
         DIRECT,
+
+        /**
+         * The Bluetooth SIG **Fitness Machine Service**, to equipment that is not iFit's.
+         *
+         * The only transport here that reaches a machine Stride is *not running on*. Selecting it
+         * does not make it work: the machine must be paired in Android's Bluetooth settings first,
+         * because Stride deliberately does not hold the location permission that BLE scanning
+         * requires below Android 12. See `FtmsTransport`.
+         */
+        FTMS,
         ;
 
         companion object {
@@ -112,8 +122,8 @@ object StrideSettings {
      * True when the direct register path is selected.
      *
      * Read this as "the rider has opted in", never as "the direct path is working". Whether it is
-     * working is a question only the handshake can answer — `MachineLink.directLinked` and
-     * `MachineLink.directCapabilities()` hold that answer, and it varies by machine. Any caller
+     * working is a question only the handshake can answer — `MachineLink.machineLinked` and
+     * `MachineLink.machineCapabilities()` hold that answer, and it varies by machine. Any caller
      * that treats this as a capability check will be wrong.
      */
     val directHardwareAccess: Boolean

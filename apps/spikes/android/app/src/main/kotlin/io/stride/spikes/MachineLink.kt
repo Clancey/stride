@@ -80,6 +80,18 @@ object MachineLink {
             "using the console."
 
     /**
+     * What the FTMS path says when no standards-compliant machine could be found.
+     *
+     * Names pairing specifically because that is the fix on the consoles this targets. Stride does
+     * not scan below Android 12 — scanning there needs a location permission a launcher has no
+     * business holding — so a machine that has never been paired is invisible however long the rider
+     * waits. See [FtmsTransport].
+     */
+    const val FTMS_NO_MACHINE: String =
+        "No Bluetooth fitness machine found. Pair the machine in Android's Bluetooth settings first, " +
+            "then try again."
+
+    /**
      * How often the poll retries direct discovery when nothing is attached.
      *
      * Long enough that a console with no treadmill wired to it is not enumerating USB forever, short
@@ -217,18 +229,30 @@ object MachineLink {
     @Volatile private var direct: DirectMachineClient? = null
 
     /**
-     * What the direct handshake concluded, in a sentence fit to show a rider. Null on the GlassOS
-     * path or before the attempt has finished.
+     * The FTMS path, when [StrideSettings.transport] selects it. Null on every other transport.
      *
-     * Read through from the session rather than cached here. The handshake runs from two places —
-     * [openDirect] when the link is first opened, and [DirectMachineCommands.connect] when it has
-     * dropped and come back — and a copy taken at the first would keep describing a failure the
-     * second had already fixed.
-     *
-     * [openFailure] covers the case the session cannot describe: there is no session, because no
-     * transport could be opened at all.
+     * Held separately for the same reason [direct] is: what the three transports can be asked
+     * differs. Only GlassOS publishes quick picks outright, only the direct session has a handshake
+     * whose result a rider needs to read, and only this one is a link to a machine Stride is *not*
+     * running on — which is why its failure copy talks about pairing rather than about the console.
      */
-    val directDetail: String?
+    @Volatile private var ftmsTransport: FtmsTransport? = null
+    @Volatile private var ftms: FtmsClient? = null
+
+    /**
+     * What the last handshake concluded, in a sentence fit to show a rider. Null on the GlassOS path
+     * or before the attempt has finished.
+     *
+     * Read through from the session rather than cached here. The direct handshake runs from two
+     * places — [openDirect] when the link is first opened, and [DirectMachineCommands.connect] when
+     * it has dropped and come back — and a copy taken at the first would keep describing a failure
+     * the second had already fixed.
+     *
+     * [openFailure] covers the case no session can describe: there is no session, because no
+     * transport could be opened at all. That is also the whole of the FTMS story, which either finds
+     * a machine or reports [FTMS_NO_MACHINE].
+     */
+    val machineDetail: String?
         get() = directSession?.lastConnect?.detail ?: openFailure
 
     @Volatile private var openFailure: String? = null
@@ -474,7 +498,43 @@ object MachineLink {
                 MachineCoordinator.rebind(GlassOsCommands(c))
             }
             StrideSettings.Transport.DIRECT -> openDirect(app)
+            StrideSettings.Transport.FTMS -> openFtms(app)
         }
+    }
+
+    /**
+     * Bring up the FTMS path: find a machine, and only then hand the coordinator something that can
+     * move a belt.
+     *
+     * Shorter than [openDirect] because FTMS needs no framing probe. The register path has to
+     * confirm it understands the wire before a write means anything; FTMS is a published profile
+     * whose `RequestControl` is itself the handshake, and the machine either grants control or does
+     * not. Failure leaves the coordinator unbound rather than bound to a half-open session, because
+     * an unbound coordinator refuses commands — the correct answer when we could not establish that
+     * the machine is listening.
+     */
+    private fun openFtms(app: Context) {
+        val transport = try {
+            FtmsTransport.open(app)
+        } catch (t: Throwable) {
+            Log.w(TAG, "ftms transport failed to open", t)
+            null
+        }
+        if (transport == null) {
+            openFailure = FTMS_NO_MACHINE
+            MachineCoordinator.rebind(null)
+            return
+        }
+
+        openFailure = null
+        ftmsTransport = transport
+        ftms = FtmsClient(transport)
+        val commands = FtmsMachineCommands(transport)
+        // The machine's own ceiling, so the clamp becomes the intersection of ours and theirs.
+        // Null when it did not publish both ranges, which leaves Stride's fixed ceiling standing
+        // alone rather than inventing a limit the machine never agreed to.
+        MachineCoordinator.applyMachineLimits(commands.limits())
+        MachineCoordinator.rebind(commands)
     }
 
     /**
@@ -550,6 +610,12 @@ object MachineLink {
         direct = null
         directSession?.let { runCatching { it.close() } }
         directSession = null
+        ftms = null
+        // Closed rather than merely dropped, for the same reason the GlassOS client is: clearing the
+        // field stops future work from finding it, but only the close stops a GATT link from staying
+        // subscribed and delivering notifications into a transport nobody reads.
+        ftmsTransport?.let { runCatching { it.close() } }
+        ftmsTransport = null
         openFailure = null
         // Closed, not merely dropped. Clearing the field stops *future* work from finding it; the
         // close is what stops work that is already in flight on another thread from finishing a
@@ -578,7 +644,7 @@ object MachineLink {
     private val poll = object : Runnable {
         override fun run() {
             val read = try {
-                client?.read() ?: direct?.read()
+                client?.read() ?: direct?.read() ?: ftms?.read()
             } catch (t: Throwable) {
                 // A failed read means "we do not know". Never a crash, and never a stale number.
                 null
@@ -851,14 +917,14 @@ object MachineLink {
      * Ordered most specific first. The direct path knows a great deal about *why* it is not working
      * — no cable, nothing answering, a machine that listed the registers it implements and did not
      * include this one — and a rider who taps a dead incline pill deserves that sentence rather
-     * than a generic "can't reach the console". [directDetail] is set by the handshake and is
+     * than a generic "can't reach the console". [machineDetail] is set by the handshake and is
      * already written for a rider to read.
      */
     fun unavailableReason(): String {
         // The direct path's own conclusion outranks the generic sentences, but only on the direct
         // path: CONSOLE_DETACHED_NOTICE talks about GlassOS having no treadmill attached, which is
         // not a thing that can be true when we are not talking to GlassOS at all.
-        val detail = directDetail
+        val detail = machineDetail
         if (!canCommand() && detail != null) return detail
         return when {
             consoleDetached -> CONSOLE_DETACHED_NOTICE
@@ -901,41 +967,69 @@ object MachineLink {
     enum class Control { SPEED, INCLINE, FAN }
 
     /**
-     * Whether a machine actually answered the direct handshake.
+     * Whether a machine actually answered on whichever non-GlassOS transport is selected.
      *
-     * Not "is a session bound". A session is deliberately bound even when nothing answered, because
-     * that is what gives [DirectMachineCommands.connect] somewhere to retry from when the treadmill
-     * is powered on a minute later. Reporting that as linked would put "the treadmill answered" on
-     * the settings screen next to a treadmill that never did.
+     * Not "is a session bound". A direct session is deliberately bound even when nothing answered,
+     * because that is what gives [DirectMachineCommands.connect] somewhere to retry from when the
+     * treadmill is powered on a minute later. Reporting that as linked would put "the treadmill
+     * answered" on the settings screen next to a treadmill that never did.
+     *
+     * FTMS has no equivalent half-open state: [openFtms] hands back a transport only once the GATT
+     * link is up and its characteristics are subscribed, so a live link is the whole answer there.
      */
-    val directLinked: Boolean get() = directSession?.lastConnect?.connected == true
+    val machineLinked: Boolean
+        get() = directSession?.lastConnect?.connected == true ||
+            ftmsTransport?.connected == true
 
     /**
      * What the machine itself said it supports, for the settings screen to display.
      *
-     * Null when the direct path has not been opened — which the screen must show as "not tried"
-     * rather than "unsupported". The values are the machine's own answer, decoded from the
-     * supported-register bitmask in its `DEVICE_INFO` reply, so this is reporting rather than
-     * predicting. That distinction is the whole point: the screen used to state flatly that incline
-     * and fan would not work, which was a guess, and on any machine that implements them it was
-     * simply false.
+     * Null when no non-GlassOS transport has been opened — which the screen must show as "not tried"
+     * rather than "unsupported". The values are the machine's own answer, so this is reporting rather
+     * than predicting. That distinction is the whole point: the screen used to state flatly that
+     * incline and fan would not work, which was a guess, and on any machine that implements them it
+     * was simply false.
+     *
+     * Both transports can answer it, from different evidence: the direct path decodes a
+     * supported-register bitmask out of `DEVICE_INFO`, and FTMS reads the `Fitness Machine Feature`
+     * bits and its two supported-range characteristics. Same question, same shape of answer.
      */
-    fun directCapabilities(): Map<String, Any?>? {
-        val session = directSession ?: return null
-        val limits = session.probe.limits
+    fun machineCapabilities(): Map<String, Any?>? {
+        directSession?.let { session ->
+            val limits = session.probe.limits
+            return mapOf(
+                "speed" to session.supports(Control.SPEED),
+                "incline" to session.supports(Control.INCLINE),
+                "fan" to session.supports(Control.FAN),
+                "transport" to session.transportName,
+                // The machine's own range, read from MIN_KPH/MAX_KPH and MIN_GRADE/MAX_GRADE. This
+                // is the rider's answer to "what can this thing actually do", and it is worth
+                // showing because it is the strongest evidence the link is real: a plausible range
+                // means the frames are being decoded correctly, and a nonsense one means they are
+                // not.
+                "minSpeedMph" to limits?.minSpeedMph,
+                "maxSpeedMph" to limits?.maxSpeedMph,
+                "minIncline" to limits?.minInclinePercent,
+                "maxIncline" to limits?.maxInclinePercent,
+            )
+        }
+        val transport = ftmsTransport ?: return null
+        val features = transport.features
+        val speed = transport.speedRange
+        val incline = transport.inclinationRange
         return mapOf(
-            "speed" to session.supports(Control.SPEED),
-            "incline" to session.supports(Control.INCLINE),
-            "fan" to session.supports(Control.FAN),
-            "transport" to session.transportName,
-            // The machine's own range, read from MIN_KPH/MAX_KPH and MIN_GRADE/MAX_GRADE. This is
-            // the rider's answer to "what can this thing actually do", and it is worth showing
-            // because it is the strongest evidence the link is real: a plausible range means the
-            // frames are being decoded correctly, and a nonsense one means they are not.
-            "minSpeedMph" to limits?.minSpeedMph,
-            "maxSpeedMph" to limits?.maxSpeedMph,
-            "minIncline" to limits?.minInclinePercent,
-            "maxIncline" to limits?.maxInclinePercent,
+            // Whether a *target* is accepted, not whether the value is reported. A machine can
+            // stream its speed while refusing to be told one, and showing the reporting bit here
+            // would promise a control that always refuses.
+            "speed" to features?.supportsSpeedTarget,
+            "incline" to features?.supportsInclineTarget,
+            // Not unknown: the fitness machine profile has no fan concept at all.
+            "fan" to false,
+            "transport" to transport.name,
+            "minSpeedMph" to speed?.let { FtmsValues.kphToMph(it.minKph) },
+            "maxSpeedMph" to speed?.let { FtmsValues.kphToMph(it.maxKph) },
+            "minIncline" to incline?.minPercent,
+            "maxIncline" to incline?.maxPercent,
         )
     }
 

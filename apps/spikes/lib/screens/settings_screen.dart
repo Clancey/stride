@@ -129,10 +129,10 @@ class _SettingsScreenState extends State<SettingsScreen>
                         setState(() => _advancedOpen = !_advancedOpen),
                     transport: _settings['transport'] as String? ?? 'glassos',
                     onTransport: _setTransport,
-                    directDetail: _settings['directDetail'] as String?,
-                    directLinked: _settings['directLinked'] as bool? ?? false,
-                    directCapabilities:
-                        (_settings['directCapabilities'] as Map?)
+                    machineDetail: _settings['machineDetail'] as String?,
+                    machineLinked: _settings['machineLinked'] as bool? ?? false,
+                    machineCapabilities:
+                        (_settings['machineCapabilities'] as Map?)
                             ?.cast<String, dynamic>(),
                     switching: _switching,
                   ),
@@ -152,16 +152,21 @@ class _SettingsScreenState extends State<SettingsScreen>
     );
   }
 
-  Future<void> _setTransport(bool direct) async {
-    if (direct) {
-      final confirmed = await _confirmDirect();
+  Future<void> _setTransport(String transport) async {
+    final current = _settings['transport'] as String? ?? 'glassos';
+    if (transport == current) return;
+    // Only leaving iFit needs a warning. Coming back to it is the recovery
+    // path, and putting a confirmation in front of the way out of a broken
+    // link is how a rider ends up stuck on a transport that does not answer.
+    if (transport != 'glassos') {
+      final confirmed = await _confirmLeavingIfit(transport);
       if (confirmed != true) return;
     }
     // Remembered before the switch, because what we are waiting for is this
     // number changing. Reading it afterwards would race the very work we are
     // trying to wait for.
     final before = _settings['retargetCount'] as int?;
-    final ok = await SpikeBridge.transportSet(direct ? 'direct' : 'glassos');
+    final ok = await SpikeBridge.transportSet(transport);
     if (!mounted) return;
     if (!ok) {
       ScaffoldMessenger.of(context).showSnackBar(
@@ -201,36 +206,52 @@ class _SettingsScreenState extends State<SettingsScreen>
     }
   }
 
-  Future<bool?> _confirmDirect() => showDialog<bool>(
-    context: context,
-    builder: (context) => AlertDialog(
-      backgroundColor: StrideColors.panelRaised,
-      title: const Text('Turn on direct hardware access?'),
-      content: const Text(
-        'This bypasses iFit and talks to the treadmill controller directly '
-        'over USB or Bluetooth.\n\n'
-        'It is experimental. Stride will ask the treadmill which controls it '
-        'has and only offer those, so what works depends on your machine — and '
-        'if nothing answers, speed, incline and fan stop responding until you '
-        'switch back.\n\n'
-        'The safety key remains the only emergency stop either way.',
-      ),
-      actions: [
-        TextButton(
-          onPressed: () => Navigator.of(context).pop(false),
-          child: const Text('Keep using iFit'),
+  Future<bool?> _confirmLeavingIfit(String transport) {
+    final ftms = transport == 'ftms';
+    return showDialog<bool>(
+      context: context,
+      builder: (context) => AlertDialog(
+        backgroundColor: StrideColors.panelRaised,
+        title: Text(
+          ftms
+              ? 'Use a Bluetooth fitness machine?'
+              : 'Turn on direct hardware access?',
         ),
-        FilledButton(
-          style: FilledButton.styleFrom(
-            backgroundColor: StrideColors.warning,
-            foregroundColor: StrideColors.ink,
+        content: Text(
+          ftms
+              ? 'This leaves iFit and talks to a Bluetooth machine that '
+                    'supports the standard fitness machine profile.\n\n'
+                    'It is experimental, and it is for equipment other than '
+                    'this console. Pair the machine in Android settings first '
+                    "— Stride can't discover an unpaired one. If nothing "
+                    'answers, speed and incline stop responding until you '
+                    'switch back.\n\n'
+                    'The safety key remains the only emergency stop either way.'
+              : 'This bypasses iFit and talks to the treadmill controller '
+                    'directly over USB or Bluetooth.\n\n'
+                    'It is experimental. Stride will ask the treadmill which '
+                    'controls it has and only offer those, so what works '
+                    'depends on your machine — and if nothing answers, speed, '
+                    'incline and fan stop responding until you switch back.\n\n'
+                    'The safety key remains the only emergency stop either way.',
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.of(context).pop(false),
+            child: const Text('Keep using iFit'),
           ),
-          onPressed: () => Navigator.of(context).pop(true),
-          child: const Text('Turn it on anyway'),
-        ),
-      ],
-    ),
-  );
+          FilledButton(
+            style: FilledButton.styleFrom(
+              backgroundColor: StrideColors.warning,
+              foregroundColor: StrideColors.ink,
+            ),
+            onPressed: () => Navigator.of(context).pop(true),
+            child: const Text('Turn it on anyway'),
+          ),
+        ],
+      ),
+    );
+  }
 }
 
 class _Section extends StatelessWidget {
@@ -444,31 +465,63 @@ class _AdvancedSection extends StatelessWidget {
     required this.onToggle,
     required this.transport,
     required this.onTransport,
-    this.directDetail,
-    this.directLinked = false,
-    this.directCapabilities,
+    this.machineDetail,
+    this.machineLinked = false,
+    this.machineCapabilities,
     this.switching = false,
   });
 
   final bool open;
   final VoidCallback onToggle;
   final String transport;
-  final ValueChanged<bool> onTransport;
+  final ValueChanged<String> onTransport;
 
   /// What the handshake concluded, written for a rider. Null before it has run.
-  final String? directDetail;
+  final String? machineDetail;
 
-  /// Whether a direct session is actually bound right now.
-  final bool directLinked;
+  /// Whether a machine is actually answering on the selected transport.
+  final bool machineLinked;
 
   /// True while the switch is still opening the new link and handshaking.
   final bool switching;
 
   /// The machine's own answer about which controls it implements, or null if
   /// it was never asked. Each value may itself be null, meaning "unknown".
-  final Map<String, dynamic>? directCapabilities;
+  final Map<String, dynamic>? machineCapabilities;
 
-  /// What to say about the direct path.
+  /// The transports a rider can pick, in the order they are offered.
+  ///
+  /// iFit first because it is the default and the recovery path. The other two
+  /// are both experimental and both leave iFit, but they are not variants of
+  /// one setting: one talks to the controller *underneath* this console, the
+  /// other talks to a different machine entirely. A single switch could not say
+  /// that, which is why this is a list rather than a toggle.
+  static const List<_TransportOption> _options = [
+    _TransportOption(
+      id: 'glassos',
+      title: 'iFit (GlassOS)',
+      experimental: false,
+      blurb: 'Talk to the treadmill through the console\'s own iFit service.',
+    ),
+    _TransportOption(
+      id: 'direct',
+      title: 'Direct hardware access',
+      experimental: true,
+      blurb:
+          'Bypass iFit and drive this console\'s controller over USB or '
+          'Bluetooth. Stride asks the treadmill what it supports.',
+    ),
+    _TransportOption(
+      id: 'ftms',
+      title: 'Bluetooth fitness machine',
+      experimental: true,
+      blurb:
+          'Drive separate equipment that supports the standard fitness '
+          'machine profile. Pair it in Android settings first.',
+    ),
+  ];
+
+  /// What to say about one option.
   ///
   /// Every branch reports something that has actually been established rather
   /// than asserting in advance what will not work. The old copy said flatly
@@ -476,28 +529,34 @@ class _AdvancedSection extends StatelessWidget {
   /// nothing was wired behind the switch; on a machine that implements them it
   /// was simply untrue, and telling a rider their controls are dead when they
   /// are live is the wrong direction to be wrong in.
-  String _summary() {
+  String _summary(_TransportOption option) {
+    // An option the rider is not on describes itself. Only the selected one has
+    // findings, and attributing them to the others would report a failed BLE
+    // scan underneath the iFit row.
+    if (option.id != transport) return option.blurb;
+
     // While the switch is running, neither the old findings nor the absence of
     // new ones is the truth, so say what is actually happening instead.
     if (switching) {
-      return direct
-          ? 'Connecting to the treadmill…'
-          : 'Handing control back to iFit…';
+      return option.id == 'glassos'
+          ? 'Handing control back to iFit…'
+          : 'Connecting to the machine…';
     }
-    if (!direct) {
-      return 'Bypass iFit and drive the controller directly over USB or '
-          'Bluetooth. Stride asks the treadmill what it supports.';
+
+    if (option.id == 'glassos') {
+      return 'On. Stride is talking to the treadmill through iFit.';
     }
-    final detail = directDetail;
-    if (detail != null && !directLinked) return detail;
-    if (directLinked) {
-      return 'On, and the treadmill answered. Stride is using the controls it '
+
+    final detail = machineDetail;
+    if (detail != null && !machineLinked) return detail;
+    if (machineLinked) {
+      return 'On, and the machine answered. Stride is using the controls it '
           'said it has.';
     }
-    return 'On. Stride is looking for the treadmill over USB and Bluetooth.';
+    return option.id == 'ftms'
+        ? 'On. Stride is looking for a paired fitness machine.'
+        : 'On. Stride is looking for the treadmill over USB and Bluetooth.';
   }
-
-  bool get direct => transport == 'direct';
 
   @override
   Widget build(BuildContext context) {
@@ -514,66 +573,147 @@ class _AdvancedSection extends StatelessWidget {
           _Section(
             title: 'Machine connection',
             subtitle:
-                'Stride talks to the treadmill through iFit by default. Direct '
-                'access skips iFit and speaks to the controller itself.',
-            child: Container(
-              padding: const EdgeInsets.all(StrideSpace.md),
-              decoration: BoxDecoration(
-                color: StrideColors.panelHigh,
-                borderRadius: BorderRadius.circular(StrideRadius.md),
-                border: Border.all(
-                  color: direct ? StrideColors.warning : StrideColors.line,
-                  width: direct ? 1.6 : 1,
-                ),
-              ),
-              child: Row(
-                children: [
-                  Expanded(
-                    child: Column(
-                      crossAxisAlignment: CrossAxisAlignment.start,
-                      children: [
-                        Row(
-                          children: [
-                            Text(
-                              'Direct hardware access',
-                              style: Theme.of(context).textTheme.titleMedium,
-                            ),
-                            const SizedBox(width: StrideSpace.xs),
-                            const _ExperimentalBadge(),
-                          ],
-                        ),
-                        const SizedBox(height: StrideSpace.xxs),
-                        Text(
-                          _summary(),
-                          style: Theme.of(context).textTheme.bodyMedium,
-                        ),
-                        if (direct && directLinked) ...[
-                          const SizedBox(height: StrideSpace.xs),
-                          _CapabilityList(capabilities: directCapabilities),
-                        ],
-                      ],
-                    ),
+                'Stride talks to the treadmill through iFit by default. The '
+                'other two leave iFit: one drives this console\'s controller '
+                'directly, the other drives separate Bluetooth equipment.',
+            child: Column(
+              children: [
+                for (final option in _options) ...[
+                  if (option != _options.first)
+                    const SizedBox(height: StrideSpace.xs),
+                  _TransportRow(
+                    option: option,
+                    selected: option.id == transport,
+                    summary: _summary(option),
+                    // Disabled mid-switch. Choosing again while a handshake is
+                    // running would queue a second one behind it, and the rider
+                    // would be told about a link that had already been replaced.
+                    onTap: switching ? null : () => onTransport(option.id),
+                    busy: switching && option.id == transport,
+                    capabilities:
+                        option.id == transport &&
+                            option.id != 'glassos' &&
+                            machineLinked
+                        ? machineCapabilities
+                        : null,
                   ),
-                  // Disabled mid-switch. Flipping again while a handshake is
-                  // running would queue a second one behind it, and the rider
-                  // would be told about a link that had already been replaced.
-                  if (switching)
-                    const Padding(
-                      padding: EdgeInsets.symmetric(horizontal: StrideSpace.sm),
-                      child: SizedBox(
-                        width: 20,
-                        height: 20,
-                        child: CircularProgressIndicator(strokeWidth: 2),
-                      ),
-                    )
-                  else
-                    Switch(value: direct, onChanged: onTransport),
                 ],
-              ),
+              ],
             ),
           ),
         ],
       ],
+    );
+  }
+}
+
+/// One selectable transport.
+class _TransportOption {
+  const _TransportOption({
+    required this.id,
+    required this.title,
+    required this.experimental,
+    required this.blurb,
+  });
+
+  /// Matches `StrideSettings.Transport`, lowercased. Sent to the bridge as-is.
+  final String id;
+  final String title;
+  final bool experimental;
+
+  /// What this transport does, shown when it is not the selected one.
+  final String blurb;
+}
+
+/// One row of the transport chooser.
+class _TransportRow extends StatelessWidget {
+  const _TransportRow({
+    required this.option,
+    required this.selected,
+    required this.summary,
+    required this.onTap,
+    required this.busy,
+    this.capabilities,
+  });
+
+  final _TransportOption option;
+  final bool selected;
+  final String summary;
+  final VoidCallback? onTap;
+  final bool busy;
+  final Map<String, dynamic>? capabilities;
+
+  @override
+  Widget build(BuildContext context) {
+    // Warning-coloured only when a non-default transport is actually in use.
+    // Colouring the unselected rows would make merely reading this screen look
+    // like something was wrong.
+    final border = selected
+        ? (option.experimental ? StrideColors.warning : StrideColors.accent)
+        : StrideColors.line;
+    return InkWell(
+      onTap: onTap,
+      borderRadius: BorderRadius.circular(StrideRadius.md),
+      child: Container(
+        width: double.infinity,
+        padding: const EdgeInsets.all(StrideSpace.md),
+        decoration: BoxDecoration(
+          color: StrideColors.panelHigh,
+          borderRadius: BorderRadius.circular(StrideRadius.md),
+          border: Border.all(color: border, width: selected ? 1.6 : 1),
+        ),
+        child: Row(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Padding(
+              padding: const EdgeInsets.only(top: 2, right: StrideSpace.sm),
+              child: Icon(
+                selected
+                    ? Icons.radio_button_checked
+                    : Icons.radio_button_unchecked,
+                color: selected ? border : StrideColors.textMuted,
+                size: 22,
+              ),
+            ),
+            Expanded(
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Row(
+                    children: [
+                      Flexible(
+                        child: Text(
+                          option.title,
+                          style: Theme.of(context).textTheme.titleMedium,
+                        ),
+                      ),
+                      if (option.experimental) ...[
+                        const SizedBox(width: StrideSpace.xs),
+                        const _ExperimentalBadge(),
+                      ],
+                    ],
+                  ),
+                  const SizedBox(height: StrideSpace.xxs),
+                  Text(summary, style: Theme.of(context).textTheme.bodyMedium),
+                  if (capabilities != null) ...[
+                    const SizedBox(height: StrideSpace.xs),
+                    _CapabilityList(capabilities: capabilities),
+                  ],
+                ],
+              ),
+            ),
+            if (busy)
+              const Padding(
+                padding: EdgeInsets.only(left: StrideSpace.sm),
+                child: SizedBox(
+                  width: 20,
+                  height: 20,
+                  child: CircularProgressIndicator(strokeWidth: 2),
+                ),
+              ),
+          ],
+        ),
+      ),
     );
   }
 }
