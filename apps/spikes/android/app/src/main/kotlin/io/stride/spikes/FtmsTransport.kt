@@ -60,6 +60,14 @@ interface FtmsLink {
     fun announcedWorkoutState(): Int?
 
     /**
+     * Consume the "the machine revoked our control" flag, returning whether it was set.
+     *
+     * Consuming rather than peeking, so the notification is acted on exactly once and a stale flag
+     * cannot make every later command re-request control forever.
+     */
+    fun takeControlLost(): Boolean
+
+    /**
      * Write one Control Point command and wait for the machine's indication.
      *
      * Returns null on timeout or transport failure, which callers **must** read as "we do not know",
@@ -125,6 +133,24 @@ class FtmsTransport private constructor(
     @Volatile private var closed = false
 
     /**
+     * Set when a command's reply never arrived.
+     *
+     * Once that has happened the link cannot be trusted for another command, and the reason is
+     * specific rather than general: FTMS carries no transaction id, so a *late* reply to the command
+     * that timed out is indistinguishable from an on-time reply to the next one. When both are
+     * speed commands even the op-code check matches. A stale success would tell
+     * [MachineCoordinator] a setpoint landed when it did not, and it ramps from there.
+     *
+     * Reported as a drop so the link is torn down and rebuilt, which is the only way to be sure no
+     * unmatched reply is still in flight. A reconnect costs seconds; a false acknowledgement next to
+     * a belt has no bounded cost.
+     */
+    @Volatile private var desynchronised = false
+
+    /** Set by the Status characteristic when the machine takes its control grant back. */
+    private val controlLost = java.util.concurrent.atomic.AtomicBoolean(false)
+
+    /**
      * Set by the GATT callback when the link actually drops, as distinct from us closing it.
      *
      * Without this, [connected] would mean "we have not called close()", which stays true forever
@@ -132,7 +158,9 @@ class FtmsTransport private constructor(
      */
     @Volatile private var dropped = false
 
-    override val connected: Boolean get() = !closed && !dropped
+    override val connected: Boolean get() = !closed && !dropped && !desynchronised
+
+    override fun takeControlLost(): Boolean = controlLost.getAndSet(false)
 
     /** What the machine says it can do. Read once at connect; null when it did not answer. */
     @Volatile override var features: FtmsCodec.Features? = null
@@ -185,15 +213,24 @@ class FtmsTransport private constructor(
         if (!connected) return null
         responses.clear()
         return try {
-            if (!writeAndWait(frame, timeoutMs)) return null
-            val reply = responses.poll(timeoutMs, TimeUnit.MILLISECONDS) ?: return null
+            if (!writeAndWait(frame, timeoutMs)) {
+                desynchronise("write for op ${frame.firstOrNull()} was not acknowledged")
+                return null
+            }
+            val reply = responses.poll(timeoutMs, TimeUnit.MILLISECONDS)
+            if (reply == null) {
+                desynchronise("no reply to op ${frame.firstOrNull()}")
+                return null
+            }
             val parsed = FtmsCodec.parseControlResponse(reply)
             // A reply to some *other* op code means the machine is answering a command we are no
             // longer waiting on. Treating it as this command's answer would let a stale "success"
             // confirm a setpoint that was never acknowledged.
             val sent = (frame.firstOrNull()?.toInt() ?: -1) and 0xFF
             if (parsed != null && parsed.requestOpCode != sent) {
-                Log.w(TAG, "control reply for op ${parsed.requestOpCode}, expected $sent")
+                // A reply for a different op code proves a previous exchange is still unwinding, so
+                // the stream is already out of step even though this one did not time out.
+                desynchronise("control reply for op ${parsed.requestOpCode}, expected $sent")
                 return null
             }
             parsed
@@ -201,6 +238,17 @@ class FtmsTransport private constructor(
             Log.w(TAG, "ftms command failed", t)
             null
         }
+    }
+
+    /**
+     * Give up on this link. See [desynchronised].
+     *
+     * Deliberately not recoverable in place: `MachineLink`'s poll sees [connected] go false and
+     * rebuilds the transport, which is what discards any reply still in flight.
+     */
+    private fun desynchronise(why: String) {
+        if (!desynchronised) Log.w(TAG, "ftms link desynchronised: $why")
+        desynchronised = true
     }
 
     private fun writeAndWait(frame: ByteArray, timeoutMs: Long): Boolean {
@@ -335,12 +383,16 @@ class FtmsTransport private constructor(
 
         private fun scanForService(adapter: BluetoothAdapter): List<BluetoothDevice> {
             val scanner = adapter.bluetoothLeScanner ?: return emptyList()
+            // Guarded because scan callbacks keep arriving on a Binder thread after the latch
+            // releases, and the waiting thread copies this out. In a gym with several FTMS
+            // advertisers that concurrent modification throws, and the scan returns nothing.
             val found = LinkedHashMap<String, BluetoothDevice>()
+            val lock = Any()
             val done = CountDownLatch(1)
             val callback = object : ScanCallback() {
                 override fun onScanResult(callbackType: Int, result: ScanResult) {
                     val device = result.device ?: return
-                    found[device.address] = device
+                    synchronized(lock) { found[device.address] = device }
                     // One match is enough to stop early: an FTMS machine advertising the service is
                     // what we came for, and continuing to scan only spends the rider's time.
                     done.countDown()
@@ -360,7 +412,9 @@ class FtmsTransport private constructor(
             return try {
                 scanner.startScan(listOf(filter), settings, callback)
                 done.await(SCAN_TIMEOUT_MS, TimeUnit.MILLISECONDS)
-                found.values.toList()
+                // Stopped before the snapshot so no further callback can race the copy.
+                runCatching { scanner.stopScan(callback) }
+                synchronized(lock) { found.values.toList() }
             } catch (t: Throwable) {
                 Log.w(TAG, "ftms scan could not start", t)
                 emptyList()
@@ -377,7 +431,12 @@ class FtmsTransport private constructor(
             val descriptorWrites = ArrayBlockingQueue<Boolean>(1)
             val reads = ArrayBlockingQueue<Pair<UUID, ByteArray?>>(1)
             var service: android.bluetooth.BluetoothGattService? = null
-            var pending: FtmsTransport? = null
+            // AtomicReference rather than a captured local: this is written on the connect
+            // thread and read on Binder callback threads, and a plain local carries no
+            // happens-before edge between them. A callback that observed null would drop a
+            // write acknowledgement, a notification, or -- worst -- the single disconnect
+            // event, leaving `connected` true forever on a dead link that is never reopened.
+            val pending = java.util.concurrent.atomic.AtomicReference<FtmsTransport?>(null)
 
             val callback = object : BluetoothGattCallback() {
                 override fun onConnectionStateChange(g: BluetoothGatt, status: Int, newState: Int) {
@@ -389,7 +448,7 @@ class FtmsTransport private constructor(
                             discovered.countDown()
                         }
                     } else if (newState == BluetoothProfile.STATE_DISCONNECTED) {
-                        pending?.dropped = true
+                        pending.get()?.dropped = true
                         discovered.countDown()
                     }
                 }
@@ -438,7 +497,7 @@ class FtmsTransport private constructor(
                     status: Int,
                 ) {
                     if (characteristic.uuid != CONTROL_POINT) return
-                    pending?.writeAcks?.offer(status == BluetoothGatt.GATT_SUCCESS)
+                    pending.get()?.writeAcks?.offer(status == BluetoothGatt.GATT_SUCCESS)
                 }
 
                 @Suppress("DEPRECATION")
@@ -447,7 +506,7 @@ class FtmsTransport private constructor(
                     characteristic: BluetoothGattCharacteristic,
                 ) {
                     if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) return
-                    pending?.onNotification(characteristic.uuid, characteristic.value)
+                    pending.get()?.onNotification(characteristic.uuid, characteristic.value)
                 }
 
                 override fun onCharacteristicChanged(
@@ -455,7 +514,7 @@ class FtmsTransport private constructor(
                     characteristic: BluetoothGattCharacteristic,
                     value: ByteArray,
                 ) {
-                    pending?.onNotification(characteristic.uuid, value)
+                    pending.get()?.onNotification(characteristic.uuid, value)
                 }
             }
 
@@ -488,7 +547,7 @@ class FtmsTransport private constructor(
             val (data, machineType) = found
 
             val transport = FtmsTransport(gatt, control, machineType)
-            pending = transport
+            pending.set(transport)
 
             // Notifications before reads: a machine that starts pushing telemetry the moment it is
             // subscribed should not have those first samples land before there is anywhere to put
@@ -592,6 +651,11 @@ class FtmsTransport private constructor(
             }
             STATUS -> {
                 FtmsCodec.workoutStateFromStatus(value)?.let { announcedWorkoutState = it }
+                // Recorded rather than acted on here: the transport does not know what a control
+                // grant is. FtmsMachineCommands consumes this before its next command so that the
+                // command re-requests control instead of being refused -- and the command most
+                // likely to be refused after a grant lapses is the rider's stop.
+                if (FtmsCodec.controlPermissionLost(value)) controlLost.set(true)
             }
         }
     }

@@ -36,17 +36,42 @@ class FtmsMachineTest {
         private val results: Map<Int, Int> = emptyMap(),
         /** Op codes the machine simply does not answer. */
         private val silent: Set<Int> = emptySet(),
+        /**
+         * Op codes to refuse with `control not permitted` exactly **once**, then accept.
+         *
+         * Models the real thing: a grant lapses, the machine refuses, and once control has been
+         * taken again the same command works. A permanently refusing machine is a different case
+         * and is covered by [results].
+         */
+        private val refuseOnceForControl: Set<Int> = emptySet(),
     ) : FtmsLink {
         override val name: String get() = "fake"
         val sent = mutableListOf<ByteArray>()
 
+        /** Set by a test to model the machine announcing it took its control grant back. */
+        var announceControlLost: Boolean = false
+
+        private val refused = mutableSetOf<Int>()
+
         override fun latest() = sample
         override fun announcedWorkoutState() = announced
+
+        override fun takeControlLost(): Boolean {
+            val was = announceControlLost
+            announceControlLost = false
+            return was
+        }
 
         override fun command(frame: ByteArray, timeoutMs: Long): FtmsCodec.ControlResponse? {
             sent += frame
             val op = frame[0].toInt() and 0xFF
             if (op in silent) return null
+            if (op == FtmsCodec.OpCode.REQUEST_CONTROL) {
+                return FtmsCodec.ControlResponse(op, FtmsCodec.Result.SUCCESS)
+            }
+            if (op in refuseOnceForControl && refused.add(op)) {
+                return FtmsCodec.ControlResponse(op, FtmsCodec.Result.CONTROL_NOT_PERMITTED)
+            }
             return FtmsCodec.ControlResponse(op, results[op] ?: FtmsCodec.Result.SUCCESS)
         }
 
@@ -111,6 +136,81 @@ class FtmsMachineTest {
         link.sent.clear()
         commands.setSpeedKph(9.0)
 
+        // Two passes: the refusal drops the belief, and the retry re-requests before trying again.
+        // A machine that refuses permanently gets exactly one retry, never a loop.
+        assertEquals(
+            listOf(
+                FtmsCodec.OpCode.REQUEST_CONTROL,
+                FtmsCodec.OpCode.SET_TARGET_SPEED,
+                FtmsCodec.OpCode.REQUEST_CONTROL,
+                FtmsCodec.OpCode.SET_TARGET_SPEED,
+            ),
+            opsSent(link),
+        )
+    }
+
+    /**
+     * **A stop refused for a lapsed grant is retried, not reported as a refusal.**
+     *
+     * This is the sharpest edge in the driver. A machine revokes control when something else claims
+     * it or when it times the grant out. Without a retry the *first* command after that is always
+     * refused and only the second re-requests control — survivable for a speed nudge, and not
+     * survivable for a stop: the rider presses stop, the machine says "not permitted", and the belt
+     * keeps running until they press it again.
+     */
+    @Test
+    fun `a stop refused for lost control is retried after re-requesting it`() {
+        val link = FakeLink(refuseOnceForControl = setOf(FtmsCodec.OpCode.STOP_OR_PAUSE))
+
+        val ack = FtmsMachineCommands(link).stop()
+
+        assertEquals("the stop must succeed, not surface a refusal", MachineAck.Ok, ack)
+        assertEquals(
+            listOf(
+                FtmsCodec.OpCode.REQUEST_CONTROL,
+                FtmsCodec.OpCode.STOP_OR_PAUSE,
+                FtmsCodec.OpCode.REQUEST_CONTROL,
+                FtmsCodec.OpCode.STOP_OR_PAUSE,
+            ),
+            opsSent(link),
+        )
+    }
+
+    /**
+     * An announced revocation is acted on *before* the command, not discovered by being refused.
+     *
+     * The machine publishes `Control Permission Lost` on its Status characteristic. Consuming it
+     * means the command carries a fresh grant rather than spending a round trip finding out.
+     */
+    @Test
+    fun `an announced control loss re-requests control before the next command`() {
+        val link = FakeLink()
+        val commands = FtmsMachineCommands(link)
+
+        // Take control the ordinary way first, so the belief is established.
+        commands.setSpeedKph(8.0)
+        link.sent.clear()
+        // The machine now announces it has taken control back.
+        link.announceControlLost = true
+        commands.setSpeedKph(9.0)
+
+        assertEquals(
+            listOf(FtmsCodec.OpCode.REQUEST_CONTROL, FtmsCodec.OpCode.SET_TARGET_SPEED),
+            opsSent(link),
+        )
+    }
+
+    /** A refusal the machine meant is still a refusal — the retry must not mask a real "no". */
+    @Test
+    fun `a refusal that is not about control is not retried`() {
+        val link = FakeLink(
+            results = mapOf(
+                FtmsCodec.OpCode.SET_TARGET_SPEED to FtmsCodec.Result.INVALID_PARAMETER,
+            ),
+        )
+        val ack = FtmsMachineCommands(link).setSpeedKph(8.0)
+
+        assertTrue("expected Refused, got $ack", ack is MachineAck.Refused)
         assertEquals(
             listOf(FtmsCodec.OpCode.REQUEST_CONTROL, FtmsCodec.OpCode.SET_TARGET_SPEED),
             opsSent(link),
@@ -438,6 +538,34 @@ class FtmsMachineTest {
         )
         assertEquals(false, snapshot.fanWritable)
         assertEquals(true, snapshot.speedWritable)
+    }
+
+    /**
+     * A machine that reports heart rate carries it into the snapshot.
+     *
+     * This is the only transport that can: GlassOS and the register path leave it null. It is the
+     * fallback behind a chest strap, not a replacement for one — on a treadmill it comes from grips
+     * a running rider is not holding.
+     */
+    @Test
+    fun `machine-reported heart rate reaches the snapshot`() {
+        val snapshot = FtmsValues.toSnapshot(
+            FtmsCodec.MachineData(speedKph = 8.05, heartRateBpm = 142),
+            features = null,
+            workoutState = GlassOsCommands.WORKOUT_RUNNING,
+        )
+        assertEquals(142, snapshot.heartRateBpm)
+    }
+
+    /** A machine that reports no heart rate leaves it unknown, never zero. */
+    @Test
+    fun `a machine with no heart rate sensor reports none`() {
+        val snapshot = FtmsValues.toSnapshot(
+            FtmsCodec.MachineData(speedKph = 8.05),
+            features = null,
+            workoutState = GlassOsCommands.WORKOUT_RUNNING,
+        )
+        assertNull(snapshot.heartRateBpm)
     }
 
     /** Below a walking pace, pace is unknown rather than a huge number dressed up as information. */

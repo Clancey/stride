@@ -311,6 +311,14 @@ class GlassOsClient(private val context: Context) {
          * rather than inventing a zero. The direct path fills it in from `FAN_STATE`.
          */
         val fanLevel: Int? = null,
+        /**
+         * Heart rate as reported by the *machine*, or null when it does not report one.
+         *
+         * Only FTMS fills this in; GlassOS and the register path leave it null. Null is not zero and
+         * is not "the rider has no pulse" — on a treadmill it usually means nobody is holding the
+         * grip sensors, which is the normal case for anyone actually running.
+         */
+        val heartRateBpm: Int? = null,
     )
 
     /**

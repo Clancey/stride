@@ -184,13 +184,35 @@ class FtmsMachineCommands(private val transport: FtmsLink) : MachineCommands {
      */
     private fun command(label: String, build: () -> ByteArray): MachineAck {
         if (!transport.connected) return MachineAck.NoAnswer("$label: not connected")
-        if (!requireControl()) {
-            return MachineAck.Refused("$label: the machine did not grant control")
-        }
         val frame = try {
             build()
         } catch (t: IllegalArgumentException) {
             return MachineAck.Refused("$label: ${t.message}")
+        }
+
+        val first = attempt(label, frame)
+        // One retry, and only for the one refusal that a retry can actually fix.
+        //
+        // A machine revokes control when something else claims it or when it times the grant out,
+        // and it announces that on the Status characteristic -- but the announcement can be missed,
+        // arrive late, or never be sent at all. Without this retry the first command after a lapse
+        // is always refused and only the *second* re-requests control. That is survivable for a
+        // speed nudge and not survivable for a stop: the rider presses stop, the machine says "not
+        // permitted", and the belt keeps running until they press it again.
+        if (first is MachineAck.Refused && !hasControl) {
+            Log.i(TAG, "$label refused for lost control; re-requesting and retrying once")
+            return attempt(label, frame)
+        }
+        return first
+    }
+
+    /** One pass: take control if we do not hold it, write, and read the machine's answer. */
+    private fun attempt(label: String, frame: ByteArray): MachineAck {
+        // Consumed before deciding, so a revocation the machine announced is acted on rather than
+        // discovered by having a command refused.
+        if (transport.takeControlLost()) hasControl = false
+        if (!requireControl()) {
+            return MachineAck.Refused("$label: the machine did not grant control")
         }
         val reply = transport.command(frame)
             ?: return MachineAck.NoAnswer("$label: no reply from the machine")
@@ -198,8 +220,7 @@ class FtmsMachineCommands(private val transport: FtmsLink) : MachineCommands {
             MachineAck.Ok
         } else {
             // A refusal of `control not permitted` means the grant lapsed underneath us. Dropping
-            // the belief here is what makes the *next* command re-request it rather than repeating a
-            // command the machine will keep rejecting.
+            // the belief here is what lets the caller above retry with control re-requested.
             if (reply.result == FtmsCodec.Result.CONTROL_NOT_PERMITTED) hasControl = false
             MachineAck.Refused("$label: ${FtmsCodec.Result.describe(reply.result)}")
         }
@@ -351,6 +372,8 @@ object FtmsValues {
             // Not "unknown": the profile has no fan, so this control can never work here.
             fanWritable = false,
             fanLevel = null,
+            // The machine's own sensor, when it has one. MachineLink prefers a strap over this.
+            heartRateBpm = sample.heartRateBpm,
         )
     }
 

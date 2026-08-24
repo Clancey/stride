@@ -279,12 +279,17 @@ class FtmsCodecTest {
      *
      * A machine can stream speed while refusing to be told one. Conflating the two puts a control on
      * screen that always refuses.
+     *
+     * The machine word's inclination bit is **3**, not 1 — bit 1 is Cadence Supported. Reading bit 1
+     * reported "measures incline" for every bike that reports cadence. The target word is numbered
+     * separately, and its bits 0 and 1 are speed and inclination, which is why that mistake never
+     * enabled a control the machine would refuse.
      */
     @Test
     fun `features separate what is reported from what can be set`() {
-        // machine word bit 1 = incline reporting; target word bits 0 and 1 = speed and incline targets.
+        // machine word bit 3 = incline reporting; target word bits 0 and 1 = speed and incline.
         val both = FtmsCodec.parseFeatures(
-            bytes(0x02, 0x00, 0x00, 0x00, 0x03, 0x00, 0x00, 0x00),
+            bytes(0x08, 0x00, 0x00, 0x00, 0x03, 0x00, 0x00, 0x00),
         )!!
         assertTrue(both.supportsInclineReporting)
         assertTrue(both.supportsSpeedTarget)
@@ -292,11 +297,113 @@ class FtmsCodecTest {
 
         // Reports incline, accepts no targets at all.
         val readOnly = FtmsCodec.parseFeatures(
-            bytes(0x02, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00),
+            bytes(0x08, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00),
         )!!
         assertTrue(readOnly.supportsInclineReporting)
         assertFalse(readOnly.supportsSpeedTarget)
         assertFalse(readOnly.supportsInclineTarget)
+    }
+
+    /** Cadence support must not be mistaken for inclination support. */
+    @Test
+    fun `the cadence feature bit does not claim inclination`() {
+        val cadenceOnly = FtmsCodec.parseFeatures(
+            bytes(0x02, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00),
+        )!!
+        assertFalse(cadenceOnly.supportsInclineReporting)
+    }
+
+    // ---- "data not available" sentinels ------------------------------------------------------
+
+    /**
+     * `0x7FFF` is the spec's "Data Not Available" for a signed 16-bit field.
+     *
+     * Taken at face value it decodes to 3276.7%, which is not merely a wrong number: `limits()`
+     * feeds the machine's figures into `MachineCoordinator`, so a machine that cannot measure its
+     * incline would appear to have declared an enormous one.
+     */
+    @Test
+    fun `an unavailable inclination decodes to unknown, not 3276 percent`() {
+        val data = FtmsCodec.parseTreadmillData(
+            bytes(0x08, 0x00, 0x90, 0x01, 0xFF, 0x7F, 0xFF, 0x7F),
+        )!!
+        assertNull(data.inclinePercent)
+        assertNull(data.rampAngleDegrees)
+    }
+
+    /** The same sentinel guards force and power on the belt. */
+    @Test
+    fun `unavailable force and power decode to unknown`() {
+        // Flags 0x1000 = force on belt (bit 12), plus speed.
+        val data = FtmsCodec.parseTreadmillData(
+            bytes(0x00, 0x10, 0x90, 0x01, 0xFF, 0x7F, 0xFF, 0x7F),
+        )!!
+        assertNull(data.forceOnBeltNewtons)
+        assertNull(data.powerWatts)
+    }
+
+    // ---- rower cursor discipline ------------------------------------------------------------
+
+    /**
+     * A declared field must be **consumed** even when its value is not wanted.
+     *
+     * This was written as `out.strokeRatePerMin ?: r.u8()`, and Kotlin's elvis short-circuits: with
+     * an instantaneous rate already present the average was never read, the cursor never advanced,
+     * and every later field decoded one byte early. Nothing threw — the distance below simply came
+     * back wrong.
+     *
+     * Flags `0x0006` = average stroke rate (bit 1) + total distance (bit 2), with the stroke pair
+     * present since bit 0 is clear.
+     */
+    @Test
+    fun `an average stroke rate still advances the cursor`() {
+        val data = FtmsCodec.parseRowerData(
+            bytes(
+                0x06, 0x00,
+                0x30,             // stroke rate 24/min
+                0x2C, 0x01,       // stroke count 300
+                0x28,             // average stroke rate 20/min
+                0xE8, 0x03, 0x00, // distance 1000 m
+            ),
+        )!!
+
+        assertEquals(24.0, data.strokeRatePerMin!!, 1e-9)
+        assertEquals(20.0, data.averageStrokeRatePerMin!!, 1e-9)
+        // The assertion that actually pins the bug: read one byte early this was 0x0328E8 = 206,568.
+        assertEquals(1000, data.totalDistanceMetres)
+    }
+
+    /** The same discipline for average pace, which sits behind the instantaneous one. */
+    @Test
+    fun `an average pace still advances the cursor`() {
+        // Flags 0x0019 = bit 0 set (no stroke pair) + instantaneous pace (3) + average pace (4).
+        val data = FtmsCodec.parseRowerData(
+            bytes(0x19, 0x00, 0x78, 0x00, 0x82, 0x00),
+        )!!
+        assertEquals(120, data.paceSecondsPer500m)
+        assertEquals(130, data.averagePaceSecondsPer500m)
+    }
+
+    // ---- NaN is not a command ---------------------------------------------------------------
+
+    /**
+     * `Math.round(NaN)` is **0**, so a NaN setpoint would pass the range check and be transmitted as
+     * a valid `0.00 km/h` — a command nobody asked for, which the coordinator would be told
+     * succeeded. Both encoders reject it before rounding.
+     */
+    @Test(expected = IllegalArgumentException::class)
+    fun `a NaN speed is refused rather than sent as zero`() {
+        FtmsCodec.encodeSetTargetSpeed(Double.NaN)
+    }
+
+    @Test(expected = IllegalArgumentException::class)
+    fun `a NaN incline is refused rather than sent as flat`() {
+        FtmsCodec.encodeSetTargetInclination(Double.NaN)
+    }
+
+    @Test(expected = IllegalArgumentException::class)
+    fun `an infinite speed is refused`() {
+        FtmsCodec.encodeSetTargetSpeed(Double.POSITIVE_INFINITY)
     }
 
     // ---- status -----------------------------------------------------------------------------

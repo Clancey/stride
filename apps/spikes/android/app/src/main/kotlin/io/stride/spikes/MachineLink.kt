@@ -92,13 +92,23 @@ object MachineLink {
             "then try again."
 
     /**
-     * How often the poll retries direct discovery when nothing is attached.
+     * How often the poll retries discovery when nothing is attached.
      *
      * Long enough that a console with no treadmill wired to it is not enumerating USB forever, short
      * enough that powering the treadmill on, finishing a pairing, or granting the USB dialog is
      * picked up while the rider is still looking at the screen.
      */
-    private const val DIRECT_REOPEN_INTERVAL_MS = 5_000L
+    private const val REOPEN_INTERVAL_MS = 5_000L
+
+    /**
+     * How often the poll retries a heart rate strap that is enabled but not connected.
+     *
+     * Longer than [REOPEN_INTERVAL_MS] because the failure is far more likely to be permanent — most
+     * riders never pair a strap at all — and because each attempt walks every bonded device and
+     * opens a GATT connection to each. Retrying that every five seconds forever would keep the
+     * radio busy on behalf of a device that does not exist.
+     */
+    private const val HEART_RATE_REOPEN_INTERVAL_MS = 30_000L
 
     /**
      * What a control says when GlassOS is answering but has no machine attached to it.
@@ -240,6 +250,18 @@ object MachineLink {
     @Volatile private var ftms: FtmsClient? = null
 
     /**
+     * A heart rate strap, when the rider has one paired and enabled.
+     *
+     * Held outside [openTransport] on purpose: a strap is not a machine transport and is not chosen
+     * by [StrideSettings.Transport]. It stays connected across a transport switch, because nothing
+     * about changing how Stride reaches the treadmill should drop the rider's heart rate.
+     */
+    @Volatile private var heartRate: HeartRateSensor? = null
+
+    private var heartRateThread: HandlerThread? = null
+    private var heartRateHandler: Handler? = null
+
+    /**
      * What the last handshake concluded, in a sentence fit to show a rider. Null on the GlassOS path
      * or before the attempt has finished.
      *
@@ -334,6 +356,50 @@ object MachineLink {
     /** Calories as the machine estimates them. Null means unknown. */
     val calories: Double? get() = fresh()?.calories
 
+    /**
+     * Heart rate in bpm, from the best source that has something fresh to say.
+     *
+     * A **strap wins over the machine** whenever it has a current reading. That is not a tie-break,
+     * it is an accuracy judgement: a chest strap measures continuously, and a treadmill measures
+     * through grips a running rider is not holding. Preferring the machine would replace a good
+     * number with a worse one, or with nothing.
+     *
+     * Null when neither has anything fresh, which must be drawn as [NO_READING] and never as zero.
+     */
+    val heartRateBpm: Int?
+        get() = strapHeartRate() ?: fresh()?.heartRateBpm
+
+    /** Which source [heartRateBpm] came from, or null when there is no reading. */
+    val heartRateSource: HeartRateSource?
+        get() = when {
+            strapHeartRate() != null -> HeartRateSource.STRAP
+            fresh()?.heartRateBpm != null -> HeartRateSource.MACHINE
+            else -> null
+        }
+
+    /** True when a strap is connected, whether or not it is currently reporting. */
+    val heartRateStrapLinked: Boolean get() = heartRate?.connected == true
+
+    /** The paired strap's name, for the settings screen. Null when none is connected. */
+    val heartRateStrapName: String? get() = heartRate?.takeIf { it.connected }?.deviceName
+
+    /** Strap battery percentage, when it publishes one. */
+    val heartRateStrapBattery: Int? get() = heartRate?.takeIf { it.connected }?.batteryPercent
+
+    /**
+     * The strap's reading, if it is still fresh.
+     *
+     * A reading whose strap reports it has lost skin contact is discarded rather than shown. The
+     * strap is telling us the number is not about the rider any more, and a stale 150 bpm on a belt
+     * that has slipped is worse than an honest blank.
+     */
+    private fun strapHeartRate(): Int? {
+        val (reading, at) = heartRate?.takeIf { it.connected }?.latest() ?: return null
+        if (SystemClock.elapsedRealtime() - at > HeartRateSensor.READING_TTL_MS) return null
+        if (reading.sensorContact == false) return null
+        return reading.bpm
+    }
+
     /** Workout seconds as the machine counts them. Null means unknown. */
     val elapsedSeconds: Long? get() = fresh()?.elapsedSeconds
 
@@ -409,9 +475,20 @@ object MachineLink {
         val c = HandlerThread("machine-connect").also { it.start() }
         connectThread = c
         connectHandler = Handler(c.looper)
+        // A third thread, purely for the strap. Sharing the connect thread meant an optional
+        // accessory could sit in front of the machine handshake: a paired strap that is switched off
+        // blocks its GATT connect for the full timeout, and every motor RPC queued behind it waited.
+        // Nothing that can move a belt may queue behind something that cannot.
+        val hrt = HandlerThread("heart-rate").also { it.start() }
+        heartRateThread = hrt
+        heartRateHandler = Handler(hrt.looper)
         // Opening the transport is blocking I/O — USB enumeration, a BLE connect, and a multi-frame
         // handshake — so it happens on the link thread rather than on whoever called attach.
         h.post { openTransport(app) }
+        // On its own thread: a strap that is paired but switched off blocks the GATT connect for its
+        // full timeout, and spending that on the poll thread would stall every other metric for ten
+        // seconds while heart rate -- the one metric nothing else depends on -- decided it was absent.
+        heartRateHandler?.post { openHeartRate(app) }
         h.post(poll)
         // Shake hands immediately, in parallel with the first poll rather than after it.
         //
@@ -433,8 +510,65 @@ object MachineLink {
         connectThread?.quitSafely()
         connectThread = null
         connectHandler = null
+        heartRateHandler?.removeCallbacksAndMessages(null)
+        heartRateThread?.quitSafely()
+        heartRateThread = null
+        heartRateHandler = null
         closeTransport()
+        // Closed here rather than in closeTransport, because a transport switch must not drop the
+        // rider's heart rate: the strap has nothing to do with how Stride reaches the treadmill.
+        heartRate?.let { runCatching { it.close() } }
+        heartRate = null
         appContext = null
+    }
+
+    /**
+     * Connect a heart rate strap, if the rider has enabled the feature and paired one.
+     *
+     * Silent about failure by design. A strap is an optional accessory and its absence is the normal
+     * case; raising an error for "no strap paired" would put a warning in front of every rider who
+     * has simply never owned one. The settings screen reports what was found, which is where someone
+     * looking for it will look.
+     */
+    private fun openHeartRate(app: Context) {
+        StrideSettings.attach(app)
+        if (!StrideSettings.heartRateStrap) return
+        if (heartRate?.connected == true) return
+        if (!heartRateOpening.compareAndSet(false, true)) return
+        try {
+            heartRate?.let { runCatching { it.close() } }
+            heartRate = try {
+                HeartRateSensor.open(app)
+            } catch (t: Throwable) {
+                Log.w(TAG, "heart rate strap failed to open", t)
+                null
+            }
+            heartRate?.let { Log.i(TAG, "heart rate strap connected: ${it.deviceName}") }
+        } finally {
+            // Timed from the end of the attempt, not the start. An attempt that took the full GATT
+            // timeout has already spent the interval, and restarting immediately would busy the
+            // radio on behalf of a strap that is not there.
+            nextHeartRateOpenAt = SystemClock.elapsedRealtime() + HEART_RATE_REOPEN_INTERVAL_MS
+            heartRateOpening.set(false)
+        }
+    }
+
+    /**
+     * Turn the strap on or off at the rider's request.
+     *
+     * Disabling closes the link immediately rather than merely ignoring it, so a rider who turns it
+     * off gets their strap's battery back.
+     */
+    fun retargetHeartRate() {
+        val app = appContext ?: return
+        connectHandler?.post {
+            if (StrideSettings.heartRateStrap) {
+                openHeartRate(app)
+            } else {
+                heartRate?.let { runCatching { it.close() } }
+                heartRate = null
+            }
+        }
     }
 
     /**
@@ -465,7 +599,7 @@ object MachineLink {
             // The rider just asked for this transport, so a permission dialog is expected rather
             // than a surprise, and a previous denial should not silence it forever.
             usbPermissionAsked = false
-            nextDirectOpenAt = 0L
+            nextReopenAt = 0L
             openTransport(app)
             // Connect immediately rather than waiting for a poll to notice. A rider who flips the
             // switch is watching the screen right then, and the difference between "controls live
@@ -597,10 +731,22 @@ object MachineLink {
     }
 
     /**
-     * Throttles [reopenDirectIfDropped]'s discovery retry. Cleared by [closeTransport] and
-     * [retarget] so a deliberate switch is never made to wait out the previous one's backoff.
+     * Throttles [reopenIfDropped]'s discovery retry. Cleared by [closeTransport] and [retarget] so a
+     * deliberate switch is never made to wait out the previous one's backoff.
      */
-    private var nextDirectOpenAt = 0L
+    private var nextReopenAt = 0L
+
+    /** Throttles [reopenHeartRateIfDropped]. Not cleared by a transport switch; see that method. */
+    @Volatile private var nextHeartRateOpenAt = 0L
+
+    /**
+     * True while a strap connect is in flight.
+     *
+     * Without it, a connect that outlives its own retry interval lets the next poll queue a second
+     * one behind it, and a strap that is paired but switched off -- ten seconds per attempt --
+     * accumulates them faster than they drain.
+     */
+    private val heartRateOpening = java.util.concurrent.atomic.AtomicBoolean(false)
 
     /** Whether this rider action has already raised the USB permission dialog. */
     private var usbPermissionAsked = false
@@ -629,7 +775,7 @@ object MachineLink {
         inclinePresetsFetched = false
         speedPresetsFetched = false
         presetsGeneration.incrementAndGet()
-        nextDirectOpenAt = 0L
+        nextReopenAt = 0L
         synchronized(connectLock) {
             connectFailures = 0
             nextConnectAt = 0L
@@ -657,8 +803,12 @@ object MachineLink {
                 // succeeded means the link is up, so this is the cheapest moment to try.
                 fetchPresetsOnce()
             } else {
-                reopenDirectIfDropped()
+                reopenIfDropped()
             }
+            // Outside the read check on purpose: a strap is not part of the machine link, so its
+            // reconnect must not be gated on the machine having failed to answer. A rider whose
+            // treadmill is reporting perfectly and whose strap slipped off still wants it back.
+            reopenHeartRateIfDropped()
             if (read?.consoleState == GlassOsClient.ConsoleState.DISCONNECTED_NAME || read == null) {
                 // Also on a read that failed outright, not only on one that came back saying
                 // "disconnected". During boot GlassOS is not listening yet, so the read does not
@@ -783,22 +933,52 @@ object MachineLink {
      * all, and USB enumeration plus a handshake attempt on every poll is real work to do forever on
      * a console that simply has no treadmill wired to it.
      */
-    private fun reopenDirectIfDropped() {
+    private fun reopenIfDropped() {
         val app = appContext ?: return
-        if (StrideSettings.transport != StrideSettings.Transport.DIRECT) return
-        val session = directSession
-        if (session != null && session.connected) return
+        // Which transports even have a link that can drop. GlassOS talks to a local socket and opens
+        // one per call, so there is nothing to re-establish; the other two hold a physical link.
+        val dropped = when (StrideSettings.transport) {
+            StrideSettings.Transport.GLASSOS -> return
+            StrideSettings.Transport.DIRECT -> directSession?.connected != true
+            // Added with FTMS. Without this branch an FTMS machine that went out of range, was
+            // switched off, or dropped its BLE link stayed dead until the rider restarted Stride or
+            // toggled the transport, because the retry was written for the direct path alone.
+            StrideSettings.Transport.FTMS -> ftmsTransport?.connected != true
+        }
+        if (!dropped) return
 
-        val now = SystemClock.elapsedRealtime()
-        if (now < nextDirectOpenAt) return
-        nextDirectOpenAt = now + DIRECT_REOPEN_INTERVAL_MS
+        if (SystemClock.elapsedRealtime() < nextReopenAt) return
 
-        Log.i(
-            TAG,
-            if (session == null) "no direct transport yet; retrying discovery" else "direct transport dropped; re-running handshake",
-        )
+        Log.i(TAG, "${StrideSettings.transport} transport dropped or absent; reopening")
         closeTransport()
         openTransport(app)
+        // Timed from the *end* of the attempt, and set after closeTransport rather than before it.
+        // closeTransport deliberately clears this so a rider switching transports never waits out
+        // the previous one's backoff — which also meant a throttle set before it was wiped on the
+        // way past, and the "every few seconds" retry ran on every poll instead.
+        nextReopenAt = SystemClock.elapsedRealtime() + REOPEN_INTERVAL_MS
+    }
+
+    /**
+     * Reconnect a heart rate strap that has dropped.
+     *
+     * Separate from [reopenIfDropped] because a strap is not a machine transport: it must be retried
+     * whichever transport is selected, and must not be torn down when one is switched.
+     *
+     * The work is posted to the connect thread rather than run here. A strap that is paired but
+     * switched off blocks its GATT connect for the full timeout, and spending that on the poll
+     * thread would stall speed, incline and distance for ten seconds while heart rate — the one
+     * metric nothing else depends on — decided it was absent.
+     */
+    private fun reopenHeartRateIfDropped() {
+        if (heartRate?.connected == true) return
+        if (heartRateOpening.get()) return
+        if (SystemClock.elapsedRealtime() < nextHeartRateOpenAt) return
+        val app = appContext ?: return
+        // The enabled check lives in openHeartRate, which attaches settings first. Reading the flag
+        // here would touch SharedPreferences from the poll thread before anything guarantees
+        // StrideSettings has been attached, and that throws rather than returning a default.
+        heartRateHandler?.post { openHeartRate(app) }
     }
 
     /**

@@ -165,6 +165,7 @@ class SpikeBridge(private val context: Context) : MethodChannel.MethodCallHandle
                 // --- settings + system grants ---
                 "settingsGet" -> result.success(settingsGet())
                 "transportSet" -> result.success(transportSet(call))
+                "heartRateStrapSet" -> result.success(heartRateStrapSet(call))
                 "grantsGet" -> result.success(grantsGet())
                 "grantsRepair" -> result.success(StridePermissions.repair(context))
                 "grantOpenSettings" -> result.success(
@@ -627,6 +628,10 @@ class SpikeBridge(private val context: Context) : MethodChannel.MethodCallHandle
             // Without it, a re-read immediately after transportSet reports the *old* transport's
             // findings, and the rider sees the previous link's capabilities under the new setting.
             "retargetCount" to MachineLink.retargetCount,
+            "heartRateStrap" to StrideSettings.heartRateStrap,
+            "heartRateStrapLinked" to MachineLink.heartRateStrapLinked,
+            "heartRateStrapName" to MachineLink.heartRateStrapName,
+            "heartRateStrapBattery" to MachineLink.heartRateStrapBattery,
         )
     }
 
@@ -642,6 +647,23 @@ class SpikeBridge(private val context: Context) : MethodChannel.MethodCallHandle
         // preference nothing read at runtime, so the rider could select the direct path and keep
         // talking to GlassOS with no indication anything had failed to change.
         MachineLink.retarget()
+        return true
+    }
+
+    /**
+     * Turn the heart rate strap on or off.
+     *
+     * Acts on the choice rather than only recording it, the same lesson `transportSet` learned: a
+     * stored preference nothing reads at runtime is a switch that appears to work and does nothing.
+     */
+    private fun heartRateStrapSet(call: MethodCall): Boolean {
+        StrideSettings.attach(context)
+        val enabled = call.argument<Boolean>("enabled") ?: return false
+        StrideSettings.heartRateStrap = enabled
+        MachineLink.retargetHeartRate()
+        // The overlay decides whether to build a bpm pill when it lays its chrome out, so without
+        // this the switch appears to do nothing until something unrelated rebuilds the strip.
+        OverlayService.refreshChrome()
         return true
     }
 
@@ -663,6 +685,10 @@ class SpikeBridge(private val context: Context) : MethodChannel.MethodCallHandle
         "distanceMiles" to MachineLink.distanceMiles,
         "paceMinPerMile" to MachineLink.paceMinPerMile,
         "calories" to MachineLink.calories,
+        "heartRateBpm" to MachineLink.heartRateBpm,
+        // Named rather than implied: a machine-reported rate comes from grips the rider is probably
+        // not holding, and its absence means "let go", not "no pulse".
+        "heartRateSource" to MachineLink.heartRateSource?.label,
         "elapsedSeconds" to MachineLink.elapsedSeconds,
         "consoleState" to MachineLink.consoleState,
         "beltMayBeMoving" to MachineLink.beltMayBeMoving,

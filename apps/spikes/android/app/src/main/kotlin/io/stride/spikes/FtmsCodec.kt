@@ -52,6 +52,25 @@ package io.stride.spikes
  * Zwift, in both of that function's flag layouts. That is the closest thing to a reference vector
  * available without hardware.
  *
+ * ## Which revision this follows, and why
+ *
+ * **FTMS 1.0 (2017), as shipped in equipment — not the later GSS revision.** The two disagree on
+ * two field widths, and the disagreement shifts every field after them:
+ *
+ * | Field | FTMS 1.0 (used here) | Later GSS |
+ * |---|---|---|
+ * | Treadmill instantaneous / average pace | `uint8` | `uint16` |
+ * | Resistance level (bike, cross trainer, rower) | `sint16` | `uint8` |
+ *
+ * FTMS 1.0 is what `qdomyos-zwift` implements and it is validated against a large amount of real
+ * hardware: its treadmill parser advances **one** byte per pace field, and its indoor bike parser
+ * advances **two** for resistance. Following the newer document would put this codec one byte out
+ * against every machine that project has ever been tested on. A spec revision does not re-flash
+ * equipment that is already in people's houses, so the wire wins over the document.
+ *
+ * If a machine ever turns up that uses the newer widths, the discriminator is the packet length
+ * implied by its flags — not a guess from the values, which decode plausibly either way.
+ *
  * ## Units are the spec's, not the app's
  *
  * Everything here stays in the units FTMS defines — km/h, metres, percent. Conversion to the mph and
@@ -166,6 +185,10 @@ object FtmsCodec {
      *   different speed than the one the rider asked for.
      */
     fun encodeSetTargetSpeed(kph: Double): ByteArray {
+        // Checked before rounding, because Math.round(NaN) is 0 -- so a NaN speed would sail
+        // through the range check below and be transmitted as a perfectly valid "0.00 km/h", a
+        // command the caller never asked for and which the coordinator would be told succeeded.
+        require(kph.isFinite()) { "speed must be a finite number, not $kph" }
         val raw = Math.round(kph * 100.0)
         require(raw in 0L..0xFFFFL) { "speed $kph km/h is outside the uint16 0.01 km/h range" }
         return byteArrayOf(OpCode.SET_TARGET_SPEED.toByte()) + uint16Le(raw.toInt())
@@ -178,6 +201,7 @@ object FtmsCodec {
      * is the easiest thing to get wrong here, so it is pinned by a negative-value test.
      */
     fun encodeSetTargetInclination(percent: Double): ByteArray {
+        require(percent.isFinite()) { "incline must be a finite number, not $percent" }
         val raw = Math.round(percent * 10.0)
         require(raw in -0x8000L..0x7FFFL) { "incline $percent% is outside the sint16 0.1% range" }
         return byteArrayOf(OpCode.SET_TARGET_INCLINATION.toByte()) + sint16Le(raw.toInt())
@@ -259,6 +283,8 @@ object FtmsCodec {
         val strokeCount: Int? = null,
         /** Rower pace, seconds per 500 m. */
         val paceSecondsPer500m: Int? = null,
+        val averageStrokeRatePerMin: Double? = null,
+        val averagePaceSecondsPer500m: Int? = null,
         val stepsPerMinute: Int? = null,
         val averageStepRate: Int? = null,
         val strideCount: Int? = null,
@@ -351,6 +377,19 @@ object FtmsCodec {
 
     private const val ENERGY_PER_MINUTE_NOT_AVAILABLE = 0xFF
 
+    /**
+     * "Data Not Available" for a signed 16-bit field.
+     *
+     * Machines send this for an inclination, ramp angle or power they cannot measure. Taken at face
+     * value it decodes to 3276.7% or 32767 W — numbers a rider would have to know to disbelieve, and
+     * which `MachineCoordinator` would intersect into its limits as though the machine had declared
+     * them.
+     */
+    private const val SINT16_NOT_AVAILABLE = 0x7FFF
+
+    /** A signed 16-bit reading, or null when the machine said it has none. */
+    private fun Int?.availableS16(): Int? = this?.takeIf { it != SINT16_NOT_AVAILABLE }
+
     /** The expended-energy triple every machine-data characteristic shares: total, /hour, /minute. */
     private fun MachineData.withEnergy(r: Reader): MachineData = copy(
         totalEnergyKcal = r.u16()?.takeIf { it != ENERGY_NOT_AVAILABLE },
@@ -406,8 +445,8 @@ object FtmsCodec {
         if (flags and TreadmillFlag.INCLINATION != 0) {
             // One flag, two fields, four bytes.
             out = out.copy(
-                inclinePercent = r.s16()?.div(10.0),
-                rampAngleDegrees = r.s16()?.div(10.0),
+                inclinePercent = r.s16().availableS16()?.div(10.0),
+                rampAngleDegrees = r.s16().availableS16()?.div(10.0),
             )
         }
         if (flags and TreadmillFlag.ELEVATION_GAIN != 0) {
@@ -439,7 +478,10 @@ object FtmsCodec {
             out = out.copy(remainingSeconds = r.u16())
         }
         if (flags and TreadmillFlag.FORCE_ON_BELT != 0) {
-            out = out.copy(forceOnBeltNewtons = r.s16(), powerWatts = r.s16())
+            out = out.copy(
+                forceOnBeltNewtons = r.s16().availableS16(),
+                powerWatts = r.s16().availableS16(),
+            )
         }
 
         return if (r.truncated) null else out
@@ -650,7 +692,12 @@ object FtmsCodec {
             out = out.copy(strokeRatePerMin = r.u8()?.div(2.0), strokeCount = r.u16())
         }
         if (flags and RowerFlag.AVERAGE_STROKE_RATE != 0) {
-            out = out.copy(strokeRatePerMin = out.strokeRatePerMin ?: r.u8()?.div(2.0))
+            // Read unconditionally into its own field. This was written as
+            // `out.strokeRatePerMin ?: r.u8()`, and Kotlin's elvis short-circuits: when an
+            // instantaneous rate was already present the read never happened, the cursor never
+            // advanced, and every field after it decoded one byte early. A declared field must
+            // always be consumed, whether or not its value is wanted.
+            out = out.copy(averageStrokeRatePerMin = r.u8()?.div(2.0))
         }
         if (flags and RowerFlag.TOTAL_DISTANCE != 0) {
             out = out.copy(totalDistanceMetres = r.u24())
@@ -659,7 +706,7 @@ object FtmsCodec {
             out = out.copy(paceSecondsPer500m = r.u16())
         }
         if (flags and RowerFlag.AVERAGE_PACE != 0) {
-            out = out.copy(paceSecondsPer500m = out.paceSecondsPer500m ?: r.u16())
+            out = out.copy(averagePaceSecondsPer500m = r.u16())
         }
         if (flags and RowerFlag.INSTANTANEOUS_POWER != 0) {
             out = out.copy(powerWatts = r.s16())
@@ -751,7 +798,12 @@ object FtmsCodec {
         val machine = u32(bytes, 0)
         val target = u32(bytes, 4)
         return Features(
-            supportsInclineReporting = machine and (1L shl 1) != 0L,
+            // Bit 3, not bit 1. Bit 1 is Cadence Supported, so reading it here reported "this
+            // machine measures incline" for every bike that reports cadence and none of the
+            // treadmills that do not. The target bits below are separately numbered and are the
+            // ones that gate commands, which is why this only ever mis-described a machine rather
+            // than enabling a control it would refuse.
+            supportsInclineReporting = machine and (1L shl 3) != 0L,
             supportsSpeedTarget = target and (1L shl 0) != 0L,
             supportsInclineTarget = target and (1L shl 1) != 0L,
         )
@@ -772,6 +824,23 @@ object FtmsCodec {
         const val STOPPED_OR_PAUSED_BY_USER = 0x02
         const val STOPPED_BY_SAFETY_KEY = 0x03
         const val STARTED_OR_RESUMED_BY_USER = 0x04
+
+        /**
+         * The machine has taken control back.
+         *
+         * Sent when something else claimed the machine, or when it timed the grant out. It is not a
+         * workout transition, which is why [workoutStateFromStatus] ignores it and
+         * [controlPermissionLost] exists separately: the consequence is that the *next* command is
+         * refused unless control is requested again, and if that next command is a stop, the belt
+         * keeps running.
+         */
+        const val CONTROL_PERMISSION_LOST = 0xFF
+    }
+
+    /** Whether a Status notification says the machine has revoked our control grant. */
+    fun controlPermissionLost(bytes: ByteArray?): Boolean {
+        if (bytes == null || bytes.isEmpty()) return false
+        return u8(bytes, 0) == Status.CONTROL_PERMISSION_LOST
     }
 
     /** What a Status notification implies about the workout, as a GlassOS `WORKOUT_*` value. */

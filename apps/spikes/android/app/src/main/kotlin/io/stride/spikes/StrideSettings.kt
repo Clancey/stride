@@ -22,6 +22,7 @@ object StrideSettings {
     private const val KEY_TRACK_FLOOR = "overlay.trackFloor"
     private const val KEY_TRANSPORT = "machine.transport"
     private const val KEY_FAN = "machine.fanState"
+    private const val KEY_HR_STRAP = "sensor.heartRateStrap"
 
     /** How Stride is permitted to reach the machine. */
     enum class Transport {
@@ -116,6 +117,20 @@ object StrideSettings {
         get() = Transport.parse(requirePrefs().getString(KEY_TRANSPORT, null))
         set(value) {
             requirePrefs().edit().putString(KEY_TRANSPORT, value.name).apply()
+        }
+
+    /**
+     * Whether Stride should connect to a paired Bluetooth heart rate strap.
+     *
+     * Off by default, and deliberately a separate setting from [transport] rather than part of it: a
+     * strap is an accessory, not a way of reaching the machine, and a rider on any transport can
+     * wear one. Off by default because connecting to somebody's chest strap is not something to do
+     * because they installed a launcher.
+     */
+    var heartRateStrap: Boolean
+        get() = requirePrefs().getBoolean(KEY_HR_STRAP, false)
+        set(value) {
+            requirePrefs().edit().putBoolean(KEY_HR_STRAP, value).apply()
         }
 
     /**

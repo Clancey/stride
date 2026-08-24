@@ -135,6 +135,15 @@ class _SettingsScreenState extends State<SettingsScreen>
                         (_settings['machineCapabilities'] as Map?)
                             ?.cast<String, dynamic>(),
                     switching: _switching,
+                    heartRateStrap:
+                        _settings['heartRateStrap'] as bool? ?? false,
+                    heartRateStrapLinked:
+                        _settings['heartRateStrapLinked'] as bool? ?? false,
+                    heartRateStrapName:
+                        _settings['heartRateStrapName'] as String?,
+                    heartRateStrapBattery:
+                        _settings['heartRateStrapBattery'] as int?,
+                    onHeartRateStrap: _setHeartRateStrap,
                   ),
                 ],
               ),
@@ -203,6 +212,39 @@ class _SettingsScreenState extends State<SettingsScreen>
       if (!mounted) return;
       final now = _settings['retargetCount'] as int?;
       if (now != null && now != before) return;
+    }
+  }
+
+  /// Turn the heart rate strap on or off.
+  ///
+  /// No confirmation either way. A strap cannot move anything, so the warning
+  /// the transport switch needs would be noise here — and turning it back off
+  /// is the recovery path, which should never sit behind a dialog.
+  Future<void> _setHeartRateStrap(bool enabled) async {
+    final ok = await SpikeBridge.heartRateStrapSet(enabled);
+    if (!mounted) return;
+    if (!ok) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text("That setting couldn't be saved.")),
+      );
+      return;
+    }
+    // Connecting runs a GATT handshake, so re-read for a moment rather than
+    // once: reading immediately would show "not found" for a strap that is
+    // still being connected to.
+    setState(() => _switching = true);
+    try {
+      for (var i = 0; i < 12; i++) {
+        await Future<void>.delayed(const Duration(milliseconds: 300));
+        if (!mounted) return;
+        await _load();
+        if (!mounted) return;
+        if ((_settings['heartRateStrapLinked'] as bool? ?? false) == enabled) {
+          return;
+        }
+      }
+    } finally {
+      if (mounted) setState(() => _switching = false);
     }
   }
 
@@ -469,6 +511,11 @@ class _AdvancedSection extends StatelessWidget {
     this.machineLinked = false,
     this.machineCapabilities,
     this.switching = false,
+    this.heartRateStrap = false,
+    this.heartRateStrapLinked = false,
+    this.heartRateStrapName,
+    this.heartRateStrapBattery,
+    required this.onHeartRateStrap,
   });
 
   final bool open;
@@ -488,6 +535,17 @@ class _AdvancedSection extends StatelessWidget {
   /// The machine's own answer about which controls it implements, or null if
   /// it was never asked. Each value may itself be null, meaning "unknown".
   final Map<String, dynamic>? machineCapabilities;
+
+  /// Whether the rider has asked Stride to use a heart rate strap.
+  final bool heartRateStrap;
+
+  /// Whether a strap is actually connected right now. Distinct from the above:
+  /// asking for one is not the same as finding one.
+  final bool heartRateStrapLinked;
+
+  final String? heartRateStrapName;
+  final int? heartRateStrapBattery;
+  final ValueChanged<bool> onHeartRateStrap;
 
   /// The transports a rider can pick, in the order they are offered.
   ///
@@ -601,8 +659,109 @@ class _AdvancedSection extends StatelessWidget {
               ],
             ),
           ),
+          const SizedBox(height: StrideSpace.lg),
+          _Section(
+            title: 'Heart rate',
+            subtitle:
+                'A Bluetooth chest strap, separate from how Stride reaches the '
+                'treadmill. It works on any connection above.',
+            child: _HeartRateRow(
+              enabled: heartRateStrap,
+              linked: heartRateStrapLinked,
+              name: heartRateStrapName,
+              battery: heartRateStrapBattery,
+              busy: switching,
+              onChanged: onHeartRateStrap,
+            ),
+          ),
         ],
       ],
+    );
+  }
+}
+
+/// The heart rate strap switch and whatever it has found.
+///
+/// Separate from the transport chooser because a strap is an accessory rather
+/// than a way of reaching the machine: a rider on any of the three transports
+/// can wear one, and burying it in that list would imply a choice between them.
+class _HeartRateRow extends StatelessWidget {
+  const _HeartRateRow({
+    required this.enabled,
+    required this.linked,
+    required this.name,
+    required this.battery,
+    required this.busy,
+    required this.onChanged,
+  });
+
+  final bool enabled;
+  final bool linked;
+  final String? name;
+  final int? battery;
+  final bool busy;
+  final ValueChanged<bool> onChanged;
+
+  /// What to say, reporting only what has actually been established.
+  String _summary() {
+    if (!enabled) {
+      return 'Off. Stride shows the heart rate your machine reports, if it '
+          'reports one.';
+    }
+    if (linked) {
+      final battery = this.battery;
+      final suffix = battery == null ? '' : ' Battery $battery%.';
+      return 'On, and connected to ${name ?? 'a strap'}.$suffix';
+    }
+    // Named specifically because pairing is the fix, and Stride does not scan:
+    // in a gym full of straps, scanning would offer a stranger's.
+    return "On, but no strap found. Pair it in Android's Bluetooth settings "
+        'first — Stride only connects to a strap you have already paired.';
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return Container(
+      padding: const EdgeInsets.all(StrideSpace.md),
+      decoration: BoxDecoration(
+        color: StrideColors.panelHigh,
+        borderRadius: BorderRadius.circular(StrideRadius.md),
+        border: Border.all(
+          color: enabled && linked ? StrideColors.accent : StrideColors.line,
+          width: enabled && linked ? 1.6 : 1,
+        ),
+      ),
+      child: Row(
+        children: [
+          Expanded(
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Text(
+                  'Bluetooth chest strap',
+                  style: Theme.of(context).textTheme.titleMedium,
+                ),
+                const SizedBox(height: StrideSpace.xxs),
+                Text(
+                  _summary(),
+                  style: Theme.of(context).textTheme.bodyMedium,
+                ),
+              ],
+            ),
+          ),
+          if (busy)
+            const Padding(
+              padding: EdgeInsets.symmetric(horizontal: StrideSpace.sm),
+              child: SizedBox(
+                width: 20,
+                height: 20,
+                child: CircularProgressIndicator(strokeWidth: 2),
+              ),
+            )
+          else
+            Switch(value: enabled, onChanged: onChanged),
+        ],
+      ),
     );
   }
 }
