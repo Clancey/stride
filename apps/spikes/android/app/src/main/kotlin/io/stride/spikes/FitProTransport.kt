@@ -280,7 +280,73 @@ class UsbSerialTransport private constructor(
             null
         }
 
-        private const val ACTION_PERMISSION = "io.stride.spikes.USB_PERMISSION"
+        /**
+         * Whether Android has actually granted access to the attached console.
+         *
+         * Asked of the USB service rather than inferred from a broadcast: below API 33 the
+         * permission-result action can be sent by any app on the device, so the extra it carries is
+         * a claim and this is the fact.
+         */
+        internal fun hasConsolePermission(context: Context): Boolean {
+            val manager = context.getSystemService(Context.USB_SERVICE) as? UsbManager ?: return false
+            val device = consoleDevice(manager) ?: return false
+            return try {
+                manager.hasPermission(device)
+            } catch (t: Throwable) {
+                false
+            }
+        }
+
+        /**
+         * What the USB bus actually shows, in a sentence a rider can read back to us.
+         *
+         * The reason this exists rather than a log line: "Stride checked the USB port and found
+         * nothing to talk to" is true for at least three different situations — no device at all, a
+         * device whose ids we do not recognise, and a device we recognise but have not been granted
+         * access to — and the fix is different for each. A report that cannot tell them apart costs
+         * a round trip with whoever owns the treadmill, and there is only one of those.
+         *
+         * Unrecognised devices are listed with their ids precisely because those are the numbers
+         * that would let us add support for a console nobody here has ever seen.
+         */
+        internal fun describeBus(context: Context): String {
+            val manager = context.getSystemService(Context.USB_SERVICE) as? UsbManager
+                ?: return "Android reported no USB service on this console."
+            val devices = try {
+                manager.deviceList.values.toList()
+            } catch (t: Throwable) {
+                return "Stride could not read the USB device list (${t.javaClass.simpleName})."
+            }
+            if (devices.isEmpty()) return "Nothing is attached to the USB port."
+
+            val console = devices.firstOrNull { variantOf(it) != null }
+            if (console != null) {
+                val variant = variantOf(console)
+                val granted = try {
+                    manager.hasPermission(console)
+                } catch (t: Throwable) {
+                    false
+                }
+                return if (granted) {
+                    "An iFit ${variant?.name} console is on USB and Stride may use it."
+                } else {
+                    "An iFit ${variant?.name} console is on USB, but Android hasn't granted Stride " +
+                        "access to it yet."
+                }
+            }
+            val listed = devices.joinToString(", ") { "vendor ${it.vendorId}/product ${it.productId}" }
+            return "USB has $listed, none of which is a console Stride recognises."
+        }
+
+        /**
+         * The broadcast Android sends once the rider answers the USB permission dialog.
+         *
+         * Public because something has to *listen* for it. Nothing did: the dialog was raised, the
+         * rider tapped Allow, and the result went nowhere — the grant only took effect on whatever
+         * retry happened to come next, which on a console showing "found nothing to talk to" is not
+         * a connection anybody waits around for.
+         */
+        const val ACTION_PERMISSION = "io.stride.spikes.USB_PERMISSION"
 
         /**
          * Find and open the console's serial device, or null.
@@ -332,14 +398,46 @@ class UsbSerialTransport private constructor(
          * Separate from [open] so the permission dialog is raised by an explicit rider action and
          * never as a side effect of polling.
          */
+        /**
+         * True while a dialog raised by [requestPermission] has not been answered.
+         *
+         * One guard shared by both callers. The settings screen asks as part of the rider's tap, and
+         * the link's own retry asks when it finds an ungranted device — and those happen within a
+         * second of each other, because tapping the row is what triggers the retry. Android does not
+         * deduplicate, so without this the rider is handed the same dialog twice and answering the
+         * first leaves a second one sitting on a console with no Back button.
+         */
+        private val permissionInFlight = java.util.concurrent.atomic.AtomicBoolean(false)
+
+        /** Called when the dialog has been answered, so the next genuine need can ask again. */
+        internal fun permissionSettled() {
+            permissionInFlight.set(false)
+        }
+
         fun requestPermission(context: Context): Boolean {
             val manager = context.getSystemService(Context.USB_SERVICE) as? UsbManager ?: return false
             val device = consoleDevice(manager) ?: return false
-            if (manager.hasPermission(device)) return true
-            // FLAG_IMMUTABLE is required from API 31 and harmless below it; the intent carries no
-            // extras we would ever want a recipient to fill in.
-            val flags = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
-                PendingIntent.FLAG_IMMUTABLE
+            if (manager.hasPermission(device)) {
+                permissionSettled()
+                return true
+            }
+            if (!permissionInFlight.compareAndSet(false, true)) {
+                Log.i(FitProTransport.TAG, "usb permission dialog already open; not asking twice")
+                return false
+            }
+            // MUTABLE, and this is the one place it has to be.
+            //
+            // The old comment here said the intent "carries no extras we would ever want a recipient
+            // to fill in", and that is exactly backwards: the recipient is Android, and the extra it
+            // fills in is `EXTRA_PERMISSION_GRANTED` — the answer to the dialog. An immutable
+            // PendingIntent cannot be written to, so the broadcast comes back reporting *denied* no
+            // matter what the rider tapped. Nothing noticed while nothing was listening for the
+            // broadcast; the moment something does, immutable makes every grant look like a refusal.
+            //
+            // FLAG_MUTABLE only exists from API 31. Below that a PendingIntent is mutable by
+            // default and the flag is unnecessary, which is why this is 0 rather than IMMUTABLE.
+            val flags = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+                PendingIntent.FLAG_MUTABLE
             } else {
                 0
             }

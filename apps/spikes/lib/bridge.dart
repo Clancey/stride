@@ -162,6 +162,7 @@ class SpikeBridge {
       _bool('transportSet', <String, dynamic>{'transport': transport});
   static Future<bool> heartRateStrapSet(bool enabled) =>
       _bool('heartRateStrapSet', <String, dynamic>{'enabled': enabled});
+  static Future<bool> usbPermissionRequest() => _bool('usbPermissionRequest');
   static Future<List<Map<String, dynamic>>> grantsGet() => _list('grantsGet');
   static Future<bool> grantOpenSettings(String id) =>
       _bool('grantOpenSettings', <String, dynamic>{'id': id});

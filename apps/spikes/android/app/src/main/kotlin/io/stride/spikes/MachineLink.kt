@@ -1,6 +1,11 @@
 package io.stride.spikes
 
+import android.content.BroadcastReceiver
 import android.content.Context
+import android.content.Intent
+import android.content.IntentFilter
+import android.hardware.usb.UsbManager
+import android.os.Build
 import android.os.Handler
 import android.os.HandlerThread
 import android.os.SystemClock
@@ -74,6 +79,21 @@ object MachineLink {
         "No direct connection to the treadmill. Stride checked the USB port and Bluetooth and found " +
             "nothing to talk to."
 
+    /**
+     * The same failure, but saying which of its several causes actually happened.
+     *
+     * [DIRECT_NO_TRANSPORT] is true of a console with nothing plugged in, one whose device ids we do
+     * not recognise, and one we simply have not been granted access to — three situations with three
+     * different fixes and one sentence between them. A rider reporting "it says it found nothing"
+     * told us almost nothing; this is what makes the next report conclusive.
+     */
+    fun directNoTransportDetail(context: Context): String =
+        "No direct connection to the treadmill. " + UsbSerialTransport.describeBus(context) +
+            // Both were tried, so both are reported. Naming only USB left a rider attempting the
+            // Bluetooth console with "nothing is attached to the USB port", which reads as though
+            // the half they were actually using had never been looked at.
+            " Bluetooth was checked too, and no paired console answered."
+
     /** What the direct path says when a transport exists but nothing on it answered. */
     const val DIRECT_NO_ANSWER: String =
         "Stride found a connection but the treadmill didn't answer. Switch back to GlassOS to keep " +
@@ -99,6 +119,23 @@ object MachineLink {
      * picked up while the rider is still looking at the screen.
      */
     private const val REOPEN_INTERVAL_MS = 5_000L
+
+    /** Where the backoff stops growing. A minute is long enough to stop mattering. */
+    private const val MAX_REOPEN_FAILURES = 4
+
+    /**
+     * How long to wait before retrying a transport that would not open, given how many attempts in
+     * a row have already failed.
+     *
+     * A flat five seconds was wrong in a way that only shows on hardware where the transport never
+     * opens — which is exactly the case a rider reports. Opening runs on the poll thread and is not
+     * cheap: a BLE discovery is a six-second scan plus up to ten seconds per bonded device, so the
+     * attempt can outlast its own retry interval and the console spends its life in a reconnect
+     * loop that also churns the Bluetooth stack. Doubling backs off to a minute, which still picks
+     * up a treadmill being switched on without hammering one that is not there.
+     */
+    internal fun reopenBackoffMs(failures: Int): Long =
+        REOPEN_INTERVAL_MS shl failures.coerceIn(0, MAX_REOPEN_FAILURES)
 
     /**
      * How often the poll retries a heart rate strap that is enabled but not connected.
@@ -493,11 +530,15 @@ object MachineLink {
         heartRateHandler = Handler(hrt.looper)
         // Opening the transport is blocking I/O — USB enumeration, a BLE connect, and a multi-frame
         // handshake — so it happens on the link thread rather than on whoever called attach.
-        h.post { openTransport(app) }
+        h.post {
+            openTransport(app)
+            armReopen()
+        }
         // On its own thread: a strap that is paired but switched off blocks the GATT connect for its
         // full timeout, and spending that on the poll thread would stall every other metric for ten
         // seconds while heart rate -- the one metric nothing else depends on -- decided it was absent.
         heartRateHandler?.post { openHeartRate(app) }
+        registerUsbPermissionReceiver(app)
         h.post(poll)
         // Shake hands immediately, in parallel with the first poll rather than after it.
         //
@@ -528,6 +569,10 @@ object MachineLink {
         // rider's heart rate: the strap has nothing to do with how Stride reaches the treadmill.
         heartRate?.let { runCatching { it.close() } }
         heartRate = null
+        if (usbReceiverRegistered) {
+            runCatching { appContext?.unregisterReceiver(usbPermissionReceiver) }
+            usbReceiverRegistered = false
+        }
         appContext = null
     }
 
@@ -609,7 +654,12 @@ object MachineLink {
             // than a surprise, and a previous denial should not silence it forever.
             usbPermissionAsked = false
             nextReopenAt = 0L
+            // A deliberate switch starts the retry budget over: whatever made the previous transport
+            // fail says nothing about this one, and a rider should never be made to wait out a
+            // backoff earned by a link they just abandoned.
+            reopenFailures = 0
             openTransport(app)
+            armReopen()
             // Connect immediately rather than waiting for a poll to notice. A rider who flips the
             // switch is watching the screen right then, and the difference between "controls live
             // now" and "controls live in up to two seconds" is the difference between the setting
@@ -699,7 +749,7 @@ object MachineLink {
             null
         }
         if (transport == null) {
-            openFailure = DIRECT_NO_TRANSPORT
+            openFailure = directNoTransportDetail(app)
             // A console whose USB device is present but ungranted looks exactly like one that is
             // absent, and the grant can only come from a dialog somebody has to raise. Nothing
             // raised it, so direct-over-USB could never open on a fresh install however many times
@@ -748,6 +798,9 @@ object MachineLink {
      */
     private var nextReopenAt = 0L
 
+    /** Consecutive failed reopen attempts, which is what [reopenBackoffMs] grows against. */
+    private var reopenFailures = 0
+
     /** Throttles [reopenHeartRateIfDropped]. Not cleared by a transport switch; see that method. */
     @Volatile private var nextHeartRateOpenAt = 0L
 
@@ -762,6 +815,86 @@ object MachineLink {
 
     /** Whether this rider action has already raised the USB permission dialog. */
     private var usbPermissionAsked = false
+
+    /**
+     * Wakes the link the moment Android reports the USB grant.
+     *
+     * Without this the grant landed silently and only took effect on whatever retry came next,
+     * which is a five-second wait staring at a screen that says nothing was found. Acting on it
+     * immediately is the difference between "I allowed it and it connected" and "I allowed it and
+     * nothing happened", and only one of those gets reported as working.
+     */
+    private val usbPermissionReceiver = object : BroadcastReceiver() {
+        override fun onReceive(context: Context?, intent: Intent?) {
+            if (intent?.action != UsbSerialTransport.ACTION_PERMISSION) return
+            val claimed = intent.getBooleanExtra(UsbManager.EXTRA_PERMISSION_GRANTED, false)
+            val app = appContext ?: return
+            // Trust the USB service, not the broadcast.
+            //
+            // Below API 33 a receiver cannot be registered as not-exported, so this action is
+            // something any installed app can send, with any extras it likes. Acting on the extra
+            // alone would let anything on the console force Stride to tear down and rebuild its
+            // machine link at will — and closing a transport clears the coordinator's queue, which
+            // could include a stop the rider had just asked for. Asking `hasPermission` costs one
+            // Binder call and is a fact rather than a claim.
+            UsbSerialTransport.permissionSettled()
+            val granted = claimed && UsbSerialTransport.hasConsolePermission(app)
+            Log.i(TAG, "usb permission broadcast: claimed=$claimed, actually granted=$granted")
+            if (!granted) return
+            // Only meaningful while the direct path is the one selected. A grant arriving for a
+            // console being driven over GlassOS is not a reason to disturb a working link.
+            if (StrideSettings.transport != StrideSettings.Transport.DIRECT) return
+            // On the machine thread, which is the single owner of every transport field. The
+            // receiver runs on a binder thread, and posting this anywhere else would let a close
+            // and an open race whatever the poll was already doing — orphaning a GATT handle, or
+            // closing a link another thread had just installed.
+            handler?.post {
+                // The grant is what the previous attempt was missing, so let the next one happen
+                // now rather than waiting out a backoff earned by a different problem.
+                usbPermissionAsked = false
+                nextReopenAt = 0L
+                reopenFailures = 0
+                closeTransport()
+                openTransport(app)
+                armReopen()
+            }
+        }
+    }
+
+    @Volatile private var usbReceiverRegistered = false
+
+    private fun registerUsbPermissionReceiver(app: Context) {
+        if (usbReceiverRegistered) return
+        val filter = IntentFilter(UsbSerialTransport.ACTION_PERMISSION)
+        try {
+            // NOT_EXPORTED from API 33: this listens for a broadcast Stride itself asked Android to
+            // send back, so nothing outside the app has any business delivering it.
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                app.registerReceiver(usbPermissionReceiver, filter, Context.RECEIVER_NOT_EXPORTED)
+            } else {
+                @Suppress("UnspecifiedRegisterReceiverFlag")
+                app.registerReceiver(usbPermissionReceiver, filter)
+            }
+            usbReceiverRegistered = true
+        } catch (t: Throwable) {
+            Log.w(TAG, "could not register the USB permission receiver", t)
+        }
+    }
+
+    /**
+     * Whether clearing the preset caches is a change the overlay needs to hear about.
+     *
+     * Pulled out and made internal so the rule can be tested: the bug it fixes is invisible in a
+     * unit test of anything larger, because what went wrong was a *rate* — the whole overlay being
+     * torn down and rebuilt every five seconds on a console where no transport could be opened.
+     * There was nothing to clear on any of those passes.
+     */
+    internal fun presetsWorthAnnouncing(
+        incline: List<Double>?,
+        speed: List<Double>?,
+        inclineFetched: Boolean,
+        speedFetched: Boolean,
+    ): Boolean = incline != null || speed != null || inclineFetched || speedFetched
 
     private fun closeTransport() {
         MachineCoordinator.rebind(null)
@@ -782,12 +915,30 @@ object MachineLink {
         client = null
         snapshot = null
         snapshotAt = 0L
+        // Only announce a preset change when there was something to lose.
+        //
+        // The overlay rebuilds its entire chrome whenever this generation moves, which is correct
+        // when real quick-picks arrive and replace the fallback ladder. But this method is also what
+        // the poll calls every few seconds while a transport cannot be opened at all — a rider on a
+        // console where the direct path finds nothing was getting the whole overlay torn down and
+        // rebuilt on a five-second cycle, which reads exactly as it sounds: flashing. Nothing had
+        // changed on any of those passes, because there were never any presets in the first place.
+        val hadPresets = presetsWorthAnnouncing(
+            incline = inclinePresetsCache,
+            speed = speedPresetsCache,
+            inclineFetched = inclinePresetsFetched,
+            speedFetched = speedPresetsFetched,
+        )
         inclinePresetsCache = null
         speedPresetsCache = null
         inclinePresetsFetched = false
         speedPresetsFetched = false
-        presetsGeneration.incrementAndGet()
+        if (hadPresets) presetsGeneration.incrementAndGet()
         nextReopenAt = 0L
+        // Deliberately NOT clearing reopenFailures here. This method is called *inside* every retry,
+        // immediately before the attempt whose result decides the next backoff, so resetting it here
+        // would pin the counter at one and the interval at a constant — which is the same trap
+        // nextReopenAt fell into. A rider deliberately switching transports clears it in retarget().
         synchronized(connectLock) {
             connectFailures = 0
             nextConnectAt = 0L
@@ -810,6 +961,12 @@ object MachineLink {
             if (read != null) {
                 snapshot = read
                 snapshotAt = System.currentTimeMillis()
+                // A real reading over GlassOS settles the question the probe could not. Without
+                // this, a console whose daemon started *after* an inconclusive probe kept the
+                // unresolved state forever - harmless for the transport, which is already right,
+                // but the settings screen went on claiming there was no GlassOS service while
+                // GlassOS was plainly working.
+                StrideSettings.resolveTransportFromReading()
                 // Presets are static for the machine, so fetch them once on the same background
                 // thread as the poll rather than inventing a second worker. A read having just
                 // succeeded means the link is up, so this is the cheapest moment to try.
@@ -968,14 +1125,19 @@ object MachineLink {
 
         if (SystemClock.elapsedRealtime() < nextReopenAt) return
 
-        Log.i(TAG, "${StrideSettings.transport} transport dropped or absent; reopening")
+        Log.i(
+            TAG,
+            "${StrideSettings.transport} transport dropped or absent; reopening " +
+                "(attempt ${reopenFailures + 1})",
+        )
         closeTransport()
         openTransport(app)
+        armReopen()
         // Timed from the *end* of the attempt, and set after closeTransport rather than before it.
         // closeTransport deliberately clears this so a rider switching transports never waits out
         // the previous one's backoff — which also meant a throttle set before it was wiped on the
         // way past, and the "every few seconds" retry ran on every poll instead.
-        nextReopenAt = SystemClock.elapsedRealtime() + REOPEN_INTERVAL_MS
+
     }
 
     /**
@@ -1004,6 +1166,26 @@ object MachineLink {
                 retarget()
             }
         }
+    }
+
+    /**
+     * Record how an open attempt went and decide when the next one may happen.
+     *
+     * Called after **every** open, not only the poll's retry. `attach` and `retarget` used to open a
+     * transport and leave the deadline at zero, so the very next poll immediately ran a second full
+     * close-and-open — two consecutive BLE passes, each of which can take ten seconds per bonded
+     * device, before anything backed off at all. The settings screen waits nine seconds for a switch
+     * to land, so a rider could be told the change had not worked while the first attempt was still
+     * running.
+     *
+     * The backoff is computed from the failure count *before* it grows, so the first retry after a
+     * failure is prompt and only repeated failures stretch out.
+     */
+    private fun armReopen() {
+        val opened = directSession != null || ftmsTransport != null || client != null
+        val waitFor = if (opened) 0 else reopenFailures
+        reopenFailures = if (opened) 0 else (reopenFailures + 1).coerceAtMost(MAX_REOPEN_FAILURES)
+        nextReopenAt = SystemClock.elapsedRealtime() + reopenBackoffMs(waitFor)
     }
 
     /** Throttles [redetectIfUnresolved]. */

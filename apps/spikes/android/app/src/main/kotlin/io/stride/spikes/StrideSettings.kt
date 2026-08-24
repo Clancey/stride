@@ -163,6 +163,20 @@ object StrideSettings {
     val transportResolved: Boolean get() = detectedTransport != null
 
     /**
+     * Settle detection because GlassOS is demonstrably working.
+     *
+     * A live reading is better evidence than the port probe that produced the unresolved state, and
+     * it is the one case the probe can miss: a daemon that bound its port a moment after Stride
+     * looked. Only meaningful while nothing has been established, so this cannot override a
+     * FitPro1 console that was already found.
+     */
+    fun resolveTransportFromReading() {
+        if (detectedTransport != null) return
+        detectedTransport = Transport.GLASSOS
+        TransportDetector.noteGlassOsWorking()
+    }
+
+    /**
      * Whether Stride should connect to a paired Bluetooth heart rate strap.
      *
      * Off by default, and deliberately a separate setting from [transport] rather than part of it: a
