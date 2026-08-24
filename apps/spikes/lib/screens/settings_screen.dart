@@ -167,13 +167,20 @@ class _SettingsScreenState extends State<SettingsScreen>
   Future<void> _setTransport(String transport) async {
     final current = _settings['transport'] as String? ?? 'glassos';
     final automatic = _settings['transportAutomatic'] as bool? ?? true;
-    // Tapping the row that is already in use is a no-op only when it is already
-    // the rider's own choice. While the transport is automatic that same tap is
-    // the rider *pinning* it, which has to be written down -- otherwise the
-    // selection silently stays automatic and can change under them on the next
-    // restart. Someone deliberately holding a console on iFit is exactly the
-    // person that would surprise.
-    if (transport == current && !automatic) return;
+    final linked = _settings['machineLinked'] as bool? ?? false;
+    // Tapping the row already in use does something in two cases, and nothing
+    // only in the third.
+    //
+    // While the transport is automatic, that tap is the rider *pinning* it,
+    // which has to be written down -- otherwise the selection silently stays
+    // automatic and can change under them on the next restart. Someone
+    // deliberately holding a console on iFit is exactly who that would surprise.
+    //
+    // And while it is chosen but not connected, the tap is a retry. That is the
+    // only way back for a rider whose machine was switched on, or plugged in,
+    // or granted permission, after the last attempt failed -- without it the row
+    // they are already on is inert and the app looks stuck.
+    if (transport == current && !automatic && linked) return;
     // Only *leaving* iFit needs a warning. Coming back to it is the recovery
     // path, and putting a confirmation in front of the way out of a broken
     // link is how a rider ends up stuck on a transport that does not answer.

@@ -107,14 +107,6 @@ interface FitProTransport : Closeable {
 }
 
 /**
- * USB serial to a wired console — the `glassos_sindarin_usb` path.
- *
- * The vendor lock is not a convenience. `ICON = 8508` is the only vendor whose device this protocol
- * describes, and enumerating every attached USB device and talking to whichever one answered would
- * mean writing register frames into an unknown peripheral. Matching the vendor id is the difference
- * between addressing the treadmill and addressing something that happens to be plugged in.
- */
-/**
  * Whether Android's synchronous `bulkTransfer` can actually move data over this endpoint.
  *
  * That is a wider question than "is this endpoint declared bulk": `bulkTransfer` is implemented on
@@ -123,8 +115,16 @@ interface FitProTransport : Closeable {
  * that distinction is load-bearing here rather than academic.
  */
 private val UsbEndpoint.isBulkOrInterrupt: Boolean
-    get() = type == UsbConstants.USB_ENDPOINT_XFER_BULK || type == UsbConstants.USB_ENDPOINT_XFER_INT
+    get() = UsbSerialTransport.isDataPipeType(type)
 
+/**
+ * USB serial to a wired console — the `glassos_sindarin_usb` path.
+ *
+ * The vendor lock is not a convenience. `ICON = 8508` is the only vendor whose device this protocol
+ * describes, and enumerating every attached USB device and talking to whichever one answered would
+ * mean writing register frames into an unknown peripheral. Matching the vendor id is the difference
+ * between addressing the treadmill and addressing something that happens to be plugged in.
+ */
 class UsbSerialTransport private constructor(
     private val manager: UsbManager,
     private val device: UsbDevice,
@@ -259,6 +259,35 @@ class UsbSerialTransport private constructor(
         /** ICON Health & Fitness. The only vendor this protocol is documented against. */
         const val VENDOR_ICON = 8508
 
+        /**
+         * The same rule as [isBulkOrInterrupt], against a raw endpoint type.
+         *
+         * Separated so it can be tested: `UsbEndpoint` is final and cannot be constructed or mocked
+         * in a unit test, and this predicate is the whole of the rule that decided whether an X22i
+         * was reachable at all. A rule that important should not be the one thing with no test.
+         */
+        internal fun isDataPipeType(type: Int): Boolean =
+            type == UsbConstants.USB_ENDPOINT_XFER_BULK ||
+                type == UsbConstants.USB_ENDPOINT_XFER_INT
+
+        /** A short description of a device's usable pipes, or null when it has none. */
+        private fun usableEndpoints(device: UsbDevice): String? {
+            val described = (0 until device.interfaceCount)
+                .map { device.getInterface(it) }
+                .flatMap { iface -> (0 until iface.endpointCount).map { iface.getEndpoint(it) } }
+                .filter { it.isBulkOrInterrupt }
+                .map { endpoint ->
+                    val kind = if (endpoint.type == UsbConstants.USB_ENDPOINT_XFER_INT) {
+                        "interrupt"
+                    } else {
+                        "bulk"
+                    }
+                    val way = if (endpoint.direction == UsbConstants.USB_DIR_IN) "in" else "out"
+                    "$kind $way"
+                }
+            return described.takeIf { it.isNotEmpty() }?.joinToString(", ")
+        }
+
         /** One request message, padded. See [FitProCodec.chunkMessages]. */
         private const val MESSAGE_SIZE = 20
 
@@ -338,11 +367,21 @@ class UsbSerialTransport private constructor(
                 } catch (t: Throwable) {
                     false
                 }
+                // The pipes are named because their *type* is what made this console unreachable,
+                // and no amount of "a console is on USB" could have shown that. A description that
+                // stops before the endpoints cannot tell a board Stride can drive from one it is
+                // about to reject.
+                val pipes = usableEndpoints(console)
+                val suffix = if (pipes == null) {
+                    " Stride found no usable data pipe on it, so it cannot be opened."
+                } else {
+                    " Data pipes: $pipes."
+                }
                 return if (granted) {
-                    "An iFit ${variant?.name} console is on USB and Stride may use it."
+                    "An iFit ${variant?.name} console is on USB and Stride may use it.$suffix"
                 } else {
                     "An iFit ${variant?.name} console is on USB, but Android hasn't granted Stride " +
-                        "access to it yet."
+                        "access to it yet.$suffix"
                 }
             }
             val listed = devices.joinToString(", ") { "vendor ${it.vendorId}/product ${it.productId}" }
@@ -394,9 +433,16 @@ class UsbSerialTransport private constructor(
             val iface = (0 until device.interfaceCount)
                 .map { device.getInterface(it) }
                 .firstOrNull { candidate ->
-                    (0 until candidate.endpointCount)
+                    // One usable pipe each way, rather than any two usable pipes. An interface
+                    // offering two INs and no OUT satisfies a count of two and then fails the
+                    // direction lookups below, and because the search has already committed to it
+                    // there is no second candidate considered — a console whose data interface is
+                    // not its first would be unreachable for a reason nothing logs.
+                    val usable = (0 until candidate.endpointCount)
                         .map { candidate.getEndpoint(it) }
-                        .count { it.isBulkOrInterrupt } >= 2
+                        .filter { it.isBulkOrInterrupt }
+                    usable.any { it.direction == UsbConstants.USB_DIR_IN } &&
+                        usable.any { it.direction == UsbConstants.USB_DIR_OUT }
                 } ?: return null
 
             val endpoints = (0 until iface.endpointCount).map { iface.getEndpoint(it) }
