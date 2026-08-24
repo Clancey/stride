@@ -7,6 +7,28 @@ what shipped rather than what was intended. Notes for a version come from
 `docs/release-notes/<version>.md` when that file exists, and from the commit subjects since the previous
 tag when it does not.
 
+## 1.1.0 — versionCode 13 — 2026-08-23
+
+**Stride can now drive equipment that isn't iFit's.** Until now it reached the treadmill one way: through iFit's own GlassOS service on the console. This release adds two more paths, and you choose between them under **Settings → Advanced → Machine connection**.
+
+**Direct hardware access** talks to the motor controller underneath GlassOS, over USB or Bluetooth, using the register protocol GlassOS itself speaks. It asks the treadmill which controls it actually has and only offers those, so what works depends on your machine.
+
+**Bluetooth fitness machine** speaks the standard fitness machine profile (FTMS) to equipment that isn't this console at all — a bike, an elliptical, a rower, or another treadmill. Pair the machine in Android's Bluetooth settings first; Stride only connects to something you have already paired. It reads what the machine says it can do and offers the controls it accepts, and the settings screen names what it found, so a treadmill reporting itself as a rower tells you straight away that Stride is talking to the wrong thing.
+
+**iFit remains the default and is unchanged.** If you don't go looking for these, nothing about your machine behaves differently.
+
+**Heart rate straps.** Stride will read a paired Bluetooth chest strap and put your heart rate on the metrics strip. It's off until you turn it on, under **Settings → Advanced → Heart rate**. A strap works on any of the three connections above — it isn't tied to how Stride reaches the treadmill. Machines that report their own heart rate feed the same readout, and a strap is preferred when it has a current reading, because a chest strap measures continuously and a treadmill measures through grips you probably aren't holding.
+
+**A real track, and a Play-certifiable build.** The lap oval was rebuilt as a track that fills the console, and a sideloaded install can now be certified against Play so apps that check will run.
+
+**The safety key is still the only emergency stop**, on every connection. Stride's stop is best-effort and always has been. Everything that protects you — the speed and incline limits, the ramp limiting, stop preemption — sits above all three connections in one place, so choosing a different one does not choose different safety rules.
+
+**What has not been tested on hardware.** The direct and Bluetooth paths were built from protocol descriptions recovered and cross-checked against other open-source implementations, not from captures of your machine. Neither has been run against a real treadmill yet. Both are marked experimental in the settings screen and both warn you before switching. If a connection stops answering, switch back to iFit and speed, incline and fan return.
+
+Installs as an update over 1.0.11.
+
+Tested on a NordicTrack Commercial 1750.
+
 ## 1.0.11 — versionCode 12 — 2026-08-15
 
 - Call Connect, and don't claim a workout the treadmill hasn't started ([#8](https://github.com/Clancey/stride/pull/8))
