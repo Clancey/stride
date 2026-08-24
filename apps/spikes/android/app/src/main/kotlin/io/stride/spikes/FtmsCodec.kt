@@ -73,7 +73,13 @@ object FtmsCodec {
         /** Treadmill Data — notified telemetry. */
         const val TREADMILL_DATA = 0x2ACD
 
-        /** Indoor Bike Data. Parsed for capability reporting; Stride does not drive bikes yet. */
+        /** Cross Trainer (elliptical) Data. **24-bit flags field**, unlike every sibling. */
+        const val CROSS_TRAINER_DATA = 0x2ACE
+
+        /** Rower Data. */
+        const val ROWER_DATA = 0x2AD1
+
+        /** Indoor Bike Data. */
         const val INDOOR_BIKE_DATA = 0x2AD2
 
         /** Training Status. */
@@ -208,17 +214,23 @@ object FtmsCodec {
         return ControlResponse(requestOpCode = u8(bytes, 1), result = u8(bytes, 2))
     }
 
-    // -------------------------------------------------------- treadmill data
+    // ----------------------------------------------------------- machine data
 
     /**
-     * One Treadmill Data notification, decoded.
+     * One sample from any FTMS machine-data characteristic, normalised.
+     *
+     * One type for all four characteristics rather than four look-alike types, because the consumer
+     * — Stride's overlay — wants speed, distance, heart rate and calories regardless of whether they
+     * came off a treadmill, a bike, an elliptical or a rower. Each parser fills the subset its
+     * characteristic actually carries and leaves the rest null; a rower has no incline and a
+     * treadmill has no stroke rate, and saying so with null is the honest encoding.
      *
      * Every field is nullable and null means **the machine did not send it**, never zero. That
      * distinction is load-bearing in this project: `MachineLink.NO_READING` exists because a
      * fabricated `0.0` next to a treadmill reads as "the belt is stopped", and the same rule that
      * governs the GlassOS parser governs this one.
      */
-    data class TreadmillData(
+    data class MachineData(
         val speedKph: Double? = null,
         val averageSpeedKph: Double? = null,
         val totalDistanceMetres: Int? = null,
@@ -237,7 +249,116 @@ object FtmsCodec {
         val remainingSeconds: Int? = null,
         val forceOnBeltNewtons: Int? = null,
         val powerWatts: Int? = null,
+        val averagePowerWatts: Int? = null,
+        /** Revolutions per minute. The wire carries half-RPM units; this is already halved. */
+        val cadenceRpm: Double? = null,
+        val averageCadenceRpm: Double? = null,
+        val resistanceLevel: Int? = null,
+        /** Rower strokes per minute. The wire carries half-stroke units; already halved. */
+        val strokeRatePerMin: Double? = null,
+        val strokeCount: Int? = null,
+        /** Rower pace, seconds per 500 m. */
+        val paceSecondsPer500m: Int? = null,
+        val stepsPerMinute: Int? = null,
+        val averageStepRate: Int? = null,
+        val strideCount: Int? = null,
     )
+
+    /** Which characteristic a sample came from, and therefore which parser reads it. */
+    enum class MachineType(val characteristic: Int) {
+        TREADMILL(Uuid.TREADMILL_DATA),
+        CROSS_TRAINER(Uuid.CROSS_TRAINER_DATA),
+        ROWER(Uuid.ROWER_DATA),
+        INDOOR_BIKE(Uuid.INDOOR_BIKE_DATA),
+        ;
+
+        /** What to call this in the diagnostics screen. */
+        val label: String
+            get() = when (this) {
+                TREADMILL -> "treadmill"
+                CROSS_TRAINER -> "cross trainer"
+                ROWER -> "rower"
+                INDOOR_BIKE -> "indoor bike"
+            }
+    }
+
+    /**
+     * Decode a notification from [type]'s characteristic.
+     *
+     * The one entry point the transport uses, so that "which parser for which characteristic" is
+     * decided once here rather than at every call site.
+     */
+    fun parseMachineData(type: MachineType, bytes: ByteArray?): MachineData? = when (type) {
+        MachineType.TREADMILL -> parseTreadmillData(bytes)
+        MachineType.CROSS_TRAINER -> parseCrossTrainerData(bytes)
+        MachineType.ROWER -> parseRowerData(bytes)
+        MachineType.INDOOR_BIKE -> parseIndoorBikeData(bytes)
+    }
+
+    /**
+     * A bounds-checked little-endian cursor over one notification.
+     *
+     * The four parsers below are structurally identical — read a flags word, then walk fields whose
+     * offsets depend on which flags were set — and writing that walk out four times by hand is
+     * exactly where an off-by-one hides. Every read advances the cursor by the width it consumed, so
+     * a field can never be read at an offset the parser merely *believed* was right.
+     *
+     * Once a read runs past the end, [truncated] latches and every later read returns null. Callers
+     * check it once at the end rather than after every field.
+     */
+    private class Reader(private val b: ByteArray, start: Int) {
+        private var at = start
+
+        var truncated = false
+            private set
+
+        private fun room(n: Int): Boolean {
+            if (at + n > b.size) {
+                truncated = true
+                return false
+            }
+            return true
+        }
+
+        private fun byte(i: Int): Int = b[i].toInt() and 0xFF
+
+        fun u8(): Int? {
+            if (!room(1)) return null
+            return byte(at).also { at += 1 }
+        }
+
+        fun u16(): Int? {
+            if (!room(2)) return null
+            return (byte(at) or (byte(at + 1) shl 8)).also { at += 2 }
+        }
+
+        fun s16(): Int? = u16()?.toShort()?.toInt()
+
+        fun u24(): Int? {
+            if (!room(3)) return null
+            return (byte(at) or (byte(at + 1) shl 8) or (byte(at + 2) shl 16)).also { at += 3 }
+        }
+    }
+
+    /**
+     * "Data Not Available" for a uint16 energy field, per the spec.
+     *
+     * Distinguished from a real value because 65535 kcal rendered as a calorie count is nonsense the
+     * rider would have to interpret, and because it is genuinely "unknown" — the same thing GlassOS
+     * spells as `NaN`.
+     */
+    private const val ENERGY_NOT_AVAILABLE = 0xFFFF
+
+    private const val ENERGY_PER_MINUTE_NOT_AVAILABLE = 0xFF
+
+    /** The expended-energy triple every machine-data characteristic shares: total, /hour, /minute. */
+    private fun MachineData.withEnergy(r: Reader): MachineData = copy(
+        totalEnergyKcal = r.u16()?.takeIf { it != ENERGY_NOT_AVAILABLE },
+        energyPerHourKcal = r.u16()?.takeIf { it != ENERGY_NOT_AVAILABLE },
+        energyPerMinuteKcal = r.u8()?.takeIf { it != ENERGY_PER_MINUTE_NOT_AVAILABLE },
+    )
+
+    // ---- treadmill (0x2ACD) ----
 
     private object TreadmillFlag {
         /** Inverted: speed is present when this is **clear**. See the class note. */
@@ -257,15 +378,6 @@ object FtmsCodec {
     }
 
     /**
-     * "Data Not Available" for a uint16 energy field, per the spec.
-     *
-     * Distinguished from a real value because 65535 kcal rendered as a calorie count is nonsense the
-     * rider would have to interpret, and because it is genuinely "unknown" — the same thing GlassOS
-     * spells as `NaN`.
-     */
-    private const val ENERGY_NOT_AVAILABLE = 0xFFFF
-
-    /**
      * Decode a Treadmill Data notification.
      *
      * Returns null when the payload is too short to hold even the flags, or when a declared field
@@ -274,140 +386,307 @@ object FtmsCodec {
      * stale incline sit beside a fresh speed, and the pair would describe a machine that never
      * existed. One consistent sample or none.
      */
-    fun parseTreadmillData(bytes: ByteArray?): TreadmillData? {
+    fun parseTreadmillData(bytes: ByteArray?): MachineData? {
         if (bytes == null || bytes.size < 2) return null
         val flags = u16(bytes, 0)
-        var at = 2
+        val r = Reader(bytes, 2)
+        var out = MachineData()
 
-        // A field that would run off the end means the packet disagrees with its own flags. Bail out
-        // rather than guess, and let the caller keep the previous sample until a whole one arrives.
-        fun room(n: Int): Boolean = at + n <= bytes.size
-
-        var speed: Double? = null
         if (flags and TreadmillFlag.MORE_DATA == 0) {
-            if (!room(2)) return null
-            speed = u16(bytes, at) / 100.0
-            at += 2
+            out = out.copy(speedKph = r.u16()?.div(100.0))
         }
-
-        var averageSpeed: Double? = null
         if (flags and TreadmillFlag.AVERAGE_SPEED != 0) {
-            if (!room(2)) return null
-            averageSpeed = u16(bytes, at) / 100.0
-            at += 2
+            out = out.copy(averageSpeedKph = r.u16()?.div(100.0))
         }
-
-        var distance: Int? = null
         if (flags and TreadmillFlag.TOTAL_DISTANCE != 0) {
             // uint24. The only three-byte field in the characteristic, and the usual reason an
             // otherwise-correct parser drifts by one byte from here on.
-            if (!room(3)) return null
-            distance = u24(bytes, at)
-            at += 3
+            out = out.copy(totalDistanceMetres = r.u24())
         }
-
-        var incline: Double? = null
-        var rampAngle: Double? = null
         if (flags and TreadmillFlag.INCLINATION != 0) {
             // One flag, two fields, four bytes.
-            if (!room(4)) return null
-            incline = s16(bytes, at) / 10.0
-            rampAngle = s16(bytes, at + 2) / 10.0
-            at += 4
+            out = out.copy(
+                inclinePercent = r.s16()?.div(10.0),
+                rampAngleDegrees = r.s16()?.div(10.0),
+            )
         }
-
-        var positiveGain: Double? = null
-        var negativeGain: Double? = null
         if (flags and TreadmillFlag.ELEVATION_GAIN != 0) {
-            if (!room(4)) return null
-            positiveGain = u16(bytes, at) / 10.0
-            negativeGain = u16(bytes, at + 2) / 10.0
-            at += 4
+            out = out.copy(
+                positiveElevationGainMetres = r.u16()?.div(10.0),
+                negativeElevationGainMetres = r.u16()?.div(10.0),
+            )
         }
-
-        var instantaneousPace: Double? = null
         if (flags and TreadmillFlag.INSTANTANEOUS_PACE != 0) {
-            if (!room(1)) return null
-            instantaneousPace = u8(bytes, at) / 10.0
-            at += 1
+            out = out.copy(instantaneousPaceKmPerMin = r.u8()?.div(10.0))
         }
-
-        var averagePace: Double? = null
         if (flags and TreadmillFlag.AVERAGE_PACE != 0) {
-            if (!room(1)) return null
-            averagePace = u8(bytes, at) / 10.0
-            at += 1
+            out = out.copy(averagePaceKmPerMin = r.u8()?.div(10.0))
         }
-
-        var totalEnergy: Int? = null
-        var energyPerHour: Int? = null
-        var energyPerMinute: Int? = null
         if (flags and TreadmillFlag.EXPENDED_ENERGY != 0) {
             // One flag, three fields, five bytes.
-            if (!room(5)) return null
-            totalEnergy = u16(bytes, at).takeIf { it != ENERGY_NOT_AVAILABLE }
-            energyPerHour = u16(bytes, at + 2).takeIf { it != ENERGY_NOT_AVAILABLE }
-            energyPerMinute = u8(bytes, at + 4).takeIf { it != 0xFF }
-            at += 5
+            out = out.withEnergy(r)
         }
-
-        var heartRate: Int? = null
         if (flags and TreadmillFlag.HEART_RATE != 0) {
-            if (!room(1)) return null
-            heartRate = u8(bytes, at)
-            at += 1
+            out = out.copy(heartRateBpm = r.u8())
         }
-
-        var met: Double? = null
         if (flags and TreadmillFlag.METABOLIC_EQUIVALENT != 0) {
-            if (!room(1)) return null
-            met = u8(bytes, at) / 10.0
-            at += 1
+            out = out.copy(metabolicEquivalent = r.u8()?.div(10.0))
         }
-
-        var elapsed: Int? = null
         if (flags and TreadmillFlag.ELAPSED_TIME != 0) {
-            if (!room(2)) return null
-            elapsed = u16(bytes, at)
-            at += 2
+            out = out.copy(elapsedSeconds = r.u16())
         }
-
-        var remaining: Int? = null
         if (flags and TreadmillFlag.REMAINING_TIME != 0) {
-            if (!room(2)) return null
-            remaining = u16(bytes, at)
-            at += 2
+            out = out.copy(remainingSeconds = r.u16())
         }
-
-        var force: Int? = null
-        var power: Int? = null
         if (flags and TreadmillFlag.FORCE_ON_BELT != 0) {
-            if (!room(4)) return null
-            force = s16(bytes, at)
-            power = s16(bytes, at + 2)
-            at += 4
+            out = out.copy(forceOnBeltNewtons = r.s16(), powerWatts = r.s16())
         }
 
-        return TreadmillData(
-            speedKph = speed,
-            averageSpeedKph = averageSpeed,
-            totalDistanceMetres = distance,
-            inclinePercent = incline,
-            rampAngleDegrees = rampAngle,
-            positiveElevationGainMetres = positiveGain,
-            negativeElevationGainMetres = negativeGain,
-            instantaneousPaceKmPerMin = instantaneousPace,
-            averagePaceKmPerMin = averagePace,
-            totalEnergyKcal = totalEnergy,
-            energyPerHourKcal = energyPerHour,
-            energyPerMinuteKcal = energyPerMinute,
-            heartRateBpm = heartRate,
-            metabolicEquivalent = met,
-            elapsedSeconds = elapsed,
-            remainingSeconds = remaining,
-            forceOnBeltNewtons = force,
-            powerWatts = power,
-        )
+        return if (r.truncated) null else out
+    }
+
+    // ---- indoor bike (0x2AD2) ----
+
+    private object BikeFlag {
+        /** Inverted, exactly as on the treadmill. */
+        const val MORE_DATA = 1 shl 0
+        const val AVERAGE_SPEED = 1 shl 1
+        const val INSTANTANEOUS_CADENCE = 1 shl 2
+        const val AVERAGE_CADENCE = 1 shl 3
+        const val TOTAL_DISTANCE = 1 shl 4
+        const val RESISTANCE_LEVEL = 1 shl 5
+        const val INSTANTANEOUS_POWER = 1 shl 6
+        const val AVERAGE_POWER = 1 shl 7
+        const val EXPENDED_ENERGY = 1 shl 8
+        const val HEART_RATE = 1 shl 9
+        const val METABOLIC_EQUIVALENT = 1 shl 10
+        const val ELAPSED_TIME = 1 shl 11
+        const val REMAINING_TIME = 1 shl 12
+    }
+
+    /**
+     * Decode an Indoor Bike Data notification.
+     *
+     * The flag *positions* differ from the treadmill's even where the field names match — cadence
+     * occupies bits 2 and 3 here, which on a treadmill are inclination and elevation. Sharing one
+     * flag table between the two would decode a cadence as an incline, so the tables are separate on
+     * purpose rather than by omission.
+     *
+     * Cadence is carried in half-RPM units and is halved here, so callers never have to remember.
+     */
+    fun parseIndoorBikeData(bytes: ByteArray?): MachineData? {
+        if (bytes == null || bytes.size < 2) return null
+        val flags = u16(bytes, 0)
+        val r = Reader(bytes, 2)
+        var out = MachineData()
+
+        if (flags and BikeFlag.MORE_DATA == 0) {
+            out = out.copy(speedKph = r.u16()?.div(100.0))
+        }
+        if (flags and BikeFlag.AVERAGE_SPEED != 0) {
+            out = out.copy(averageSpeedKph = r.u16()?.div(100.0))
+        }
+        if (flags and BikeFlag.INSTANTANEOUS_CADENCE != 0) {
+            out = out.copy(cadenceRpm = r.u16()?.div(2.0))
+        }
+        if (flags and BikeFlag.AVERAGE_CADENCE != 0) {
+            out = out.copy(averageCadenceRpm = r.u16()?.div(2.0))
+        }
+        if (flags and BikeFlag.TOTAL_DISTANCE != 0) {
+            out = out.copy(totalDistanceMetres = r.u24())
+        }
+        if (flags and BikeFlag.RESISTANCE_LEVEL != 0) {
+            out = out.copy(resistanceLevel = r.s16())
+        }
+        if (flags and BikeFlag.INSTANTANEOUS_POWER != 0) {
+            out = out.copy(powerWatts = r.s16())
+        }
+        if (flags and BikeFlag.AVERAGE_POWER != 0) {
+            out = out.copy(averagePowerWatts = r.s16())
+        }
+        if (flags and BikeFlag.EXPENDED_ENERGY != 0) {
+            out = out.withEnergy(r)
+        }
+        if (flags and BikeFlag.HEART_RATE != 0) {
+            out = out.copy(heartRateBpm = r.u8())
+        }
+        if (flags and BikeFlag.METABOLIC_EQUIVALENT != 0) {
+            out = out.copy(metabolicEquivalent = r.u8()?.div(10.0))
+        }
+        if (flags and BikeFlag.ELAPSED_TIME != 0) {
+            out = out.copy(elapsedSeconds = r.u16())
+        }
+        if (flags and BikeFlag.REMAINING_TIME != 0) {
+            out = out.copy(remainingSeconds = r.u16())
+        }
+
+        return if (r.truncated) null else out
+    }
+
+    // ---- cross trainer (0x2ACE) ----
+
+    private object CrossTrainerFlag {
+        const val MORE_DATA = 1 shl 0
+        const val AVERAGE_SPEED = 1 shl 1
+        const val TOTAL_DISTANCE = 1 shl 2
+        const val STEP_COUNT = 1 shl 3
+        const val STRIDE_COUNT = 1 shl 4
+        const val ELEVATION_GAIN = 1 shl 5
+        const val INCLINATION = 1 shl 6
+        const val RESISTANCE_LEVEL = 1 shl 7
+        const val INSTANTANEOUS_POWER = 1 shl 8
+        const val AVERAGE_POWER = 1 shl 9
+        const val EXPENDED_ENERGY = 1 shl 10
+        const val HEART_RATE = 1 shl 11
+        const val METABOLIC_EQUIVALENT = 1 shl 12
+        const val ELAPSED_TIME = 1 shl 13
+        const val REMAINING_TIME = 1 shl 14
+    }
+
+    /**
+     * Decode a Cross Trainer (elliptical) Data notification.
+     *
+     * **This characteristic's flags field is 24 bits, not 16.** It is the only one in the family
+     * that is, and it is the single most dangerous thing in this file: pointing
+     * [parseTreadmillData] at a cross trainer packet reads a two-byte header, leaves the cursor one
+     * byte early, and decodes every field from the wrong offset while throwing nothing. That is why
+     * the transport picks a parser from the characteristic UUID rather than from anything in the
+     * payload.
+     */
+    fun parseCrossTrainerData(bytes: ByteArray?): MachineData? {
+        if (bytes == null || bytes.size < 3) return null
+        val flags = u24(bytes, 0)
+        val r = Reader(bytes, 3)
+        var out = MachineData()
+
+        if (flags and CrossTrainerFlag.MORE_DATA == 0) {
+            out = out.copy(speedKph = r.u16()?.div(100.0))
+        }
+        if (flags and CrossTrainerFlag.AVERAGE_SPEED != 0) {
+            out = out.copy(averageSpeedKph = r.u16()?.div(100.0))
+        }
+        if (flags and CrossTrainerFlag.TOTAL_DISTANCE != 0) {
+            out = out.copy(totalDistanceMetres = r.u24())
+        }
+        if (flags and CrossTrainerFlag.STEP_COUNT != 0) {
+            out = out.copy(stepsPerMinute = r.u16(), averageStepRate = r.u16())
+        }
+        if (flags and CrossTrainerFlag.STRIDE_COUNT != 0) {
+            out = out.copy(strideCount = r.u16())
+        }
+        if (flags and CrossTrainerFlag.ELEVATION_GAIN != 0) {
+            out = out.copy(
+                positiveElevationGainMetres = r.u16()?.div(10.0),
+                negativeElevationGainMetres = r.u16()?.div(10.0),
+            )
+        }
+        if (flags and CrossTrainerFlag.INCLINATION != 0) {
+            out = out.copy(
+                inclinePercent = r.s16()?.div(10.0),
+                rampAngleDegrees = r.s16()?.div(10.0),
+            )
+        }
+        if (flags and CrossTrainerFlag.RESISTANCE_LEVEL != 0) {
+            out = out.copy(resistanceLevel = r.s16())
+        }
+        if (flags and CrossTrainerFlag.INSTANTANEOUS_POWER != 0) {
+            out = out.copy(powerWatts = r.s16())
+        }
+        if (flags and CrossTrainerFlag.AVERAGE_POWER != 0) {
+            out = out.copy(averagePowerWatts = r.s16())
+        }
+        if (flags and CrossTrainerFlag.EXPENDED_ENERGY != 0) {
+            out = out.withEnergy(r)
+        }
+        if (flags and CrossTrainerFlag.HEART_RATE != 0) {
+            out = out.copy(heartRateBpm = r.u8())
+        }
+        if (flags and CrossTrainerFlag.METABOLIC_EQUIVALENT != 0) {
+            out = out.copy(metabolicEquivalent = r.u8()?.div(10.0))
+        }
+        if (flags and CrossTrainerFlag.ELAPSED_TIME != 0) {
+            out = out.copy(elapsedSeconds = r.u16())
+        }
+        if (flags and CrossTrainerFlag.REMAINING_TIME != 0) {
+            out = out.copy(remainingSeconds = r.u16())
+        }
+
+        return if (r.truncated) null else out
+    }
+
+    // ---- rower (0x2AD1) ----
+
+    private object RowerFlag {
+        /** Inverted, and it gates **two** fields: stroke rate and stroke count. */
+        const val MORE_DATA = 1 shl 0
+        const val AVERAGE_STROKE_RATE = 1 shl 1
+        const val TOTAL_DISTANCE = 1 shl 2
+        const val INSTANTANEOUS_PACE = 1 shl 3
+        const val AVERAGE_PACE = 1 shl 4
+        const val INSTANTANEOUS_POWER = 1 shl 5
+        const val AVERAGE_POWER = 1 shl 6
+        const val RESISTANCE_LEVEL = 1 shl 7
+        const val EXPENDED_ENERGY = 1 shl 8
+        const val HEART_RATE = 1 shl 9
+        const val METABOLIC_EQUIVALENT = 1 shl 10
+        const val ELAPSED_TIME = 1 shl 11
+        const val REMAINING_TIME = 1 shl 12
+    }
+
+    /**
+     * Decode a Rower Data notification.
+     *
+     * The inverted bit 0 gates a *pair* here — Stroke Rate (one byte, half-stroke units) and Stroke
+     * Count (two bytes) — so it consumes three bytes rather than the two its treadmill counterpart
+     * does. A rower reports no speed at all; its distance and pace are the useful figures.
+     */
+    fun parseRowerData(bytes: ByteArray?): MachineData? {
+        if (bytes == null || bytes.size < 2) return null
+        val flags = u16(bytes, 0)
+        val r = Reader(bytes, 2)
+        var out = MachineData()
+
+        if (flags and RowerFlag.MORE_DATA == 0) {
+            out = out.copy(strokeRatePerMin = r.u8()?.div(2.0), strokeCount = r.u16())
+        }
+        if (flags and RowerFlag.AVERAGE_STROKE_RATE != 0) {
+            out = out.copy(strokeRatePerMin = out.strokeRatePerMin ?: r.u8()?.div(2.0))
+        }
+        if (flags and RowerFlag.TOTAL_DISTANCE != 0) {
+            out = out.copy(totalDistanceMetres = r.u24())
+        }
+        if (flags and RowerFlag.INSTANTANEOUS_PACE != 0) {
+            out = out.copy(paceSecondsPer500m = r.u16())
+        }
+        if (flags and RowerFlag.AVERAGE_PACE != 0) {
+            out = out.copy(paceSecondsPer500m = out.paceSecondsPer500m ?: r.u16())
+        }
+        if (flags and RowerFlag.INSTANTANEOUS_POWER != 0) {
+            out = out.copy(powerWatts = r.s16())
+        }
+        if (flags and RowerFlag.AVERAGE_POWER != 0) {
+            out = out.copy(averagePowerWatts = r.s16())
+        }
+        if (flags and RowerFlag.RESISTANCE_LEVEL != 0) {
+            out = out.copy(resistanceLevel = r.s16())
+        }
+        if (flags and RowerFlag.EXPENDED_ENERGY != 0) {
+            out = out.withEnergy(r)
+        }
+        if (flags and RowerFlag.HEART_RATE != 0) {
+            out = out.copy(heartRateBpm = r.u8())
+        }
+        if (flags and RowerFlag.METABOLIC_EQUIVALENT != 0) {
+            out = out.copy(metabolicEquivalent = r.u8()?.div(10.0))
+        }
+        if (flags and RowerFlag.ELAPSED_TIME != 0) {
+            out = out.copy(elapsedSeconds = r.u16())
+        }
+        if (flags and RowerFlag.REMAINING_TIME != 0) {
+            out = out.copy(remainingSeconds = r.u16())
+        }
+
+        return if (r.truncated) null else out
     }
 
     // --------------------------------------------------------------- ranges

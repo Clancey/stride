@@ -128,7 +128,7 @@ class FtmsMachineCommands(private val transport: FtmsLink) : MachineCommands {
      */
     override fun workoutState(): Int? {
         transport.announcedWorkoutState()?.let { return it }
-        val moving = freshSample()?.speedKph?.let { it > 0.0 } ?: return null
+        val moving = FtmsValues.active(freshSample()) ?: return null
         return if (moving) GlassOsCommands.WORKOUT_RUNNING else GlassOsCommands.WORKOUT_IDLE
     }
 
@@ -229,7 +229,7 @@ class FtmsMachineCommands(private val transport: FtmsLink) : MachineCommands {
         else -> GlassOsClient.ConsoleState.code("IDLE") ?: GlassOsClient.ConsoleState.DISCONNECTED
     }
 
-    private fun freshSample(): FtmsCodec.TreadmillData? = FtmsValues.fresh(transport.latest())
+    private fun freshSample(): FtmsCodec.MachineData? = FtmsValues.fresh(transport.latest())
 
     private companion object {
         const val TAG = "FtmsMachine"
@@ -275,6 +275,30 @@ object FtmsValues {
     }
 
     /**
+     * Whether the machine is being worked, or null when nothing it sent can say.
+     *
+     * Speed is the obvious signal and the wrong one to rely on alone: a rower reports no speed at
+     * all, and a bike on a trainer may report cadence and power without one. Asking "is any measure
+     * of effort non-zero" is the question that has the same meaning on all four machine types.
+     *
+     * Null rather than false when the machine reported none of them, because "nothing is moving" and
+     * "nothing was measured" are different claims, and only one of them is safe to make next to a
+     * machine somebody is standing on.
+     */
+    fun active(sample: FtmsCodec.MachineData?): Boolean? {
+        if (sample == null) return null
+        val signals = listOfNotNull(
+            sample.speedKph,
+            sample.cadenceRpm,
+            sample.strokeRatePerMin,
+            sample.stepsPerMinute?.toDouble(),
+            sample.powerWatts?.toDouble(),
+        )
+        if (signals.isEmpty()) return null
+        return signals.any { it > 0.0 }
+    }
+
+    /**
      * The sample if it is still fresh, else null. See [SAMPLE_TTL_MS].
      *
      * [now] is a parameter rather than a call inside, so the staleness rule can be tested at all.
@@ -282,9 +306,9 @@ object FtmsValues {
      * exercised on a device is a freshness check nobody exercises.
      */
     fun fresh(
-        latest: Pair<FtmsCodec.TreadmillData, Long>?,
+        latest: Pair<FtmsCodec.MachineData, Long>?,
         now: Long = SystemClock.elapsedRealtime(),
-    ): FtmsCodec.TreadmillData? {
+    ): FtmsCodec.MachineData? {
         val (sample, at) = latest ?: return null
         if (now - at > SAMPLE_TTL_MS) return null
         return sample
@@ -299,7 +323,7 @@ object FtmsValues {
      * control on screen that silently refuses.
      */
     fun toSnapshot(
-        sample: FtmsCodec.TreadmillData,
+        sample: FtmsCodec.MachineData,
         features: FtmsCodec.Features?,
         workoutState: Int?,
     ): GlassOsClient.Snapshot {
@@ -352,8 +376,8 @@ class FtmsClient(private val transport: FtmsLink) {
         if (!transport.connected) return null
         val sample = FtmsValues.fresh(transport.latest()) ?: return null
         val state = transport.announcedWorkoutState()
-            ?: sample.speedKph?.let {
-                if (it > 0.0) GlassOsCommands.WORKOUT_RUNNING else GlassOsCommands.WORKOUT_IDLE
+            ?: FtmsValues.active(sample)?.let {
+                if (it) GlassOsCommands.WORKOUT_RUNNING else GlassOsCommands.WORKOUT_IDLE
             }
         return FtmsValues.toSnapshot(sample, transport.features, state)
     }

@@ -43,7 +43,8 @@ userspace has **no direct access**. Three known paths:
 
 A fourth path exists but is not in this table, because it is not a way to reach *this* machine:
 **BLE FTMS (`0x1826`)** reaches equipment that is not iFit's at all. It is now implemented
-(`FtmsCodec`, `FtmsTransport`, `FtmsMachineCommands`) — see §2.5.
+(`FtmsCodec`, `FtmsTransport`, `FtmsMachineCommands`) for all four machine types the profile
+defines — treadmill, indoor bike, cross trainer and rower — see §2.5.
 
 ### 2.2 The mTLS certificate problem — how everyone else handles it
 
@@ -278,6 +279,25 @@ Two caveats worth keeping honest:
 - **qz is GPL-3.** Protocol facts — UUIDs, byte layouts, flag semantics — are not copyrightable and
   are taken here from the Bluetooth SIG specification. qz's *expression* is, and none of it is
   copied. §2.3's split already anticipates this.
+
+All four machine-data characteristics are implemented, not just the treadmill's: Indoor Bike
+(`0x2AD2`), Cross Trainer (`0x2ACE`) and Rower (`0x2AD1`) alongside Treadmill (`0x2ACD`). Indoor Bike
+is in fact the most widely used of the four in qz's own codebase. Supporting only the treadmill
+meant rejecting every other FTMS machine outright, which contradicted the reason for building the
+driver.
+
+The four are **not** interchangeable and the differences are silent rather than loud:
+
+- **Flag positions differ between characteristics even where field names match.** Bits 2 and 3 are
+  cadence on a bike and inclination/elevation on a treadmill. One shared flag table would decode a
+  cadence as an incline.
+- **Cross Trainer carries a 24-bit flags header**, the only one in the family that does. Reading it
+  as 16 bits leaves the cursor a byte early and every field after it decodes from the wrong offset.
+- **The rower's inverted bit 0 gates a pair** — stroke rate *and* stroke count, three bytes — where
+  the treadmill's gates one two-byte field.
+
+None of those throw; they all produce plausible numbers. The parser is therefore selected from the
+characteristic UUID the transport subscribed to, never inferred from the payload.
 
 ## 3. Architecture
 

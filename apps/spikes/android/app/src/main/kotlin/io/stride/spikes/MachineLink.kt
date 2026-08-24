@@ -1026,6 +1026,10 @@ object MachineLink {
             // Not unknown: the fitness machine profile has no fan concept at all.
             "fan" to false,
             "transport" to transport.name,
+            // What the machine said it is, from the data characteristic it exposed. Worth showing:
+            // a rider who selected FTMS and sees "rower" has learned that Stride bound to the wrong
+            // peripheral far faster than they would from a blank speed readout.
+            "machineType" to transport.machineType.label,
             "minSpeedMph" to speed?.let { FtmsValues.kphToMph(it.minKph) },
             "maxSpeedMph" to speed?.let { FtmsValues.kphToMph(it.maxKph) },
             "minIncline" to incline?.minPercent,

@@ -735,9 +735,21 @@ class _CapabilityList extends StatelessWidget {
     final caps = capabilities;
     if (caps == null) return const SizedBox.shrink();
     const labels = {'speed': 'Speed', 'incline': 'Incline', 'fan': 'Fan'};
+    final machineType = caps['machineType'] as String?;
     return Column(
       crossAxisAlignment: CrossAxisAlignment.start,
       children: [
+        // Only the FTMS path knows what kind of machine it found. Naming it is
+        // how a rider discovers Stride bound to the wrong peripheral: "rower"
+        // under a treadmill answers the question far faster than a readout that
+        // is merely blank.
+        if (machineType != null) ...[
+          Text(
+            'Reporting as a $machineType.',
+            style: Theme.of(context).textTheme.bodySmall,
+          ),
+          const SizedBox(height: StrideSpace.xxs),
+        ],
         for (final entry in labels.entries)
           _CapabilityRow(
             label: entry.value,

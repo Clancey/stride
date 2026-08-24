@@ -43,6 +43,9 @@ interface FtmsLink {
     /** True while the GATT link is up. False once it drops or is closed. */
     val connected: Boolean
 
+    /** Which machine-data characteristic this link is bound to, and therefore what it is. */
+    val machineType: FtmsCodec.MachineType
+
     /** What the machine says it can do, or null if it did not answer. */
     val features: FtmsCodec.Features?
 
@@ -51,7 +54,7 @@ interface FtmsLink {
     val inclinationRange: FtmsCodec.InclinationRange?
 
     /** The most recent telemetry sample and the monotonic time it arrived, or null if none has. */
-    fun latest(): Pair<FtmsCodec.TreadmillData, Long>?
+    fun latest(): Pair<FtmsCodec.MachineData, Long>?
 
     /** The last workout state the machine volunteered, as a GlassOS `WORKOUT_*` value. */
     fun announcedWorkoutState(): Int?
@@ -109,10 +112,15 @@ interface FtmsLink {
 class FtmsTransport private constructor(
     private val gatt: BluetoothGatt,
     private val controlPoint: BluetoothGattCharacteristic,
+    override val machineType: FtmsCodec.MachineType,
 ) : FtmsLink, Closeable {
 
     /** Human-readable, for logs and the diagnostics screen. Never parsed. */
-    override val name: String get() = "FTMS ${gatt.device?.address ?: "?"}"
+    override val name: String
+        get() = "FTMS ${machineType.label} ${gatt.device?.address ?: "?"}"
+
+    /** The data characteristic this link is subscribed to. Resolved once, not per notification. */
+    private val dataCharacteristic: UUID = uuid(machineType.characteristic)
 
     @Volatile private var closed = false
 
@@ -136,7 +144,7 @@ class FtmsTransport private constructor(
     @Volatile override var inclinationRange: FtmsCodec.InclinationRange? = null
         private set
 
-    @Volatile private var sample: FtmsCodec.TreadmillData? = null
+    @Volatile private var sample: FtmsCodec.MachineData? = null
     @Volatile private var sampleAt: Long = 0L
 
     /**
@@ -160,7 +168,7 @@ class FtmsTransport private constructor(
      * Callers decide what "too old" means; the transport does not, because the freshness rule is a
      * safety decision and belongs with the rest of them.
      */
-    override fun latest(): Pair<FtmsCodec.TreadmillData, Long>? =
+    override fun latest(): Pair<FtmsCodec.MachineData, Long>? =
         sample?.let { it to sampleAt }
 
     override fun announcedWorkoutState(): Int? = announcedWorkoutState
@@ -254,7 +262,17 @@ class FtmsTransport private constructor(
             UUID.fromString(String.format("%08x-0000-1000-8000-00805f9b34fb", assigned))
 
         private val SERVICE = uuid(FtmsCodec.Uuid.SERVICE)
-        private val TREADMILL_DATA = uuid(FtmsCodec.Uuid.TREADMILL_DATA)
+        /**
+         * The four machine-data characteristics, in the order a machine is offered them.
+         *
+         * Treadmill first because it is what this project exists for; the rest are tried so that a
+         * bike, elliptical or rower is driven rather than rejected. A machine exposes exactly one in
+         * practice, and the *characteristic* is what picks the parser — a cross trainer packet fed
+         * to the treadmill parser would decode silently and wrongly, since its flags field is three
+         * bytes rather than two.
+         */
+        private val MACHINE_DATA: List<Pair<UUID, FtmsCodec.MachineType>> =
+            FtmsCodec.MachineType.entries.map { uuid(it.characteristic) to it }
         private val CONTROL_POINT = uuid(FtmsCodec.Uuid.CONTROL_POINT)
         private val STATUS = uuid(FtmsCodec.Uuid.STATUS)
         private val FEATURE = uuid(FtmsCodec.Uuid.FEATURE)
@@ -455,15 +473,21 @@ class FtmsTransport private constructor(
 
             val ftms = service
             val control = ftms?.getCharacteristic(CONTROL_POINT)
-            val data = ftms?.getCharacteristic(TREADMILL_DATA)
-            if (ftms == null || control == null || data == null) {
-                // Not a treadmill-shaped FTMS machine. Every candidate gets looked at, and one that
-                // does not expose both is simply not what we are here for.
+            // Whichever machine this is. Requiring Treadmill Data specifically was how the first
+            // cut of this driver rejected every FTMS bike, elliptical and rower on the grounds that
+            // they were "not a treadmill" -- while claiming to reach equipment that is not iFit's.
+            val found = MACHINE_DATA.firstNotNullOfOrNull { (id, type) ->
+                ftms?.getCharacteristic(id)?.let { it to type }
+            }
+            if (ftms == null || control == null || found == null) {
+                // Every candidate gets looked at, and one exposing neither a control point nor any
+                // machine-data characteristic is simply not what we are here for.
                 runCatching { gatt.close() }
                 return null
             }
+            val (data, machineType) = found
 
-            val transport = FtmsTransport(gatt, control)
+            val transport = FtmsTransport(gatt, control, machineType)
             pending = transport
 
             // Notifications before reads: a machine that starts pushing telemetry the moment it is
@@ -555,11 +579,11 @@ class FtmsTransport private constructor(
     /** Route one notification to the field it belongs to. Called on a binder thread. */
     private fun onNotification(uuid: UUID, value: ByteArray?) {
         when (uuid) {
-            TREADMILL_DATA -> {
+            dataCharacteristic -> {
                 // A packet that fails to parse is dropped rather than allowed to blank the cache: a
                 // single malformed notification should not make a live machine look unreachable. The
                 // timestamp is what eventually reports a genuinely dead link.
-                val parsed = FtmsCodec.parseTreadmillData(value) ?: return
+                val parsed = FtmsCodec.parseMachineData(machineType, value) ?: return
                 sample = parsed
                 sampleAt = SystemClock.elapsedRealtime()
             }

@@ -26,10 +26,11 @@ class FtmsMachineTest {
      */
     private class FakeLink(
         override val connected: Boolean = true,
+        override val machineType: FtmsCodec.MachineType = FtmsCodec.MachineType.TREADMILL,
         override val features: FtmsCodec.Features? = ALL_FEATURES,
         override val speedRange: FtmsCodec.SpeedRange? = null,
         override val inclinationRange: FtmsCodec.InclinationRange? = null,
-        private val sample: Pair<FtmsCodec.TreadmillData, Long>? = null,
+        private val sample: Pair<FtmsCodec.MachineData, Long>? = null,
         private val announced: Int? = null,
         /** Result code per op code; anything unlisted succeeds. */
         private val results: Map<Int, Int> = emptyMap(),
@@ -330,7 +331,7 @@ class FtmsMachineTest {
     @Test
     fun `an announced state is preferred over inference`() {
         val link = FakeLink(
-            sample = FtmsCodec.TreadmillData(speedKph = 0.0) to 0L,
+            sample = FtmsCodec.MachineData(speedKph = 0.0) to 0L,
             announced = GlassOsCommands.WORKOUT_PAUSED,
         )
         assertEquals(GlassOsCommands.WORKOUT_PAUSED, FtmsMachineCommands(link).workoutState())
@@ -347,6 +348,34 @@ class FtmsMachineTest {
         assertNull(FtmsMachineCommands(FakeLink()).workoutState())
     }
 
+    /**
+     * A rower reports **no speed at all**, so speed cannot be the only signal of activity.
+     *
+     * Inferring from speed alone would report every rower and most trainers as idle while somebody
+     * was working on them, which on a machine with a session running is the wrong answer.
+     */
+    @Test
+    fun `a machine that reports no speed can still be seen to be working`() {
+        val rowing = FakeLink(
+            machineType = FtmsCodec.MachineType.ROWER,
+            sample = FtmsCodec.MachineData(strokeRatePerMin = 24.0) to 0L,
+        )
+        assertEquals(GlassOsCommands.WORKOUT_RUNNING, FtmsMachineCommands(rowing).workoutState())
+
+        val resting = FakeLink(
+            machineType = FtmsCodec.MachineType.ROWER,
+            sample = FtmsCodec.MachineData(strokeRatePerMin = 0.0) to 0L,
+        )
+        assertEquals(GlassOsCommands.WORKOUT_IDLE, FtmsMachineCommands(resting).workoutState())
+    }
+
+    /** A sample carrying no measure of effort at all says nothing, rather than saying "idle". */
+    @Test
+    fun `a sample with no effort signal leaves the state unknown`() {
+        val link = FakeLink(sample = FtmsCodec.MachineData(elapsedSeconds = 60) to 0L)
+        assertNull(FtmsMachineCommands(link).workoutState())
+    }
+
     // ---- snapshot mapping -------------------------------------------------------------------
 
     /**
@@ -358,7 +387,7 @@ class FtmsMachineTest {
     @Test
     fun `a sample maps onto the snapshot in the units the app displays`() {
         val snapshot = FtmsValues.toSnapshot(
-            FtmsCodec.TreadmillData(
+            FtmsCodec.MachineData(
                 speedKph = 8.05,
                 inclinePercent = 3.0,
                 totalDistanceMetres = 1609,
@@ -385,14 +414,14 @@ class FtmsMachineTest {
     @Test
     fun `a running workout stamps a workout id and an idle one does not`() {
         val running = FtmsValues.toSnapshot(
-            FtmsCodec.TreadmillData(speedKph = 0.0),
+            FtmsCodec.MachineData(speedKph = 0.0),
             features = null,
             workoutState = GlassOsCommands.WORKOUT_RUNNING,
         )
         assertNotNull(running.workoutId)
 
         val idle = FtmsValues.toSnapshot(
-            FtmsCodec.TreadmillData(speedKph = 0.0),
+            FtmsCodec.MachineData(speedKph = 0.0),
             features = null,
             workoutState = GlassOsCommands.WORKOUT_IDLE,
         )
@@ -403,7 +432,7 @@ class FtmsMachineTest {
     @Test
     fun `the snapshot reports the fan as unwritable rather than unknown`() {
         val snapshot = FtmsValues.toSnapshot(
-            FtmsCodec.TreadmillData(speedKph = 4.0),
+            FtmsCodec.MachineData(speedKph = 4.0),
             features = FakeLink.ALL_FEATURES,
             workoutState = null,
         )
@@ -415,7 +444,7 @@ class FtmsMachineTest {
     @Test
     fun `pace is withheld on a stopped belt`() {
         val snapshot = FtmsValues.toSnapshot(
-            FtmsCodec.TreadmillData(speedKph = 0.0),
+            FtmsCodec.MachineData(speedKph = 0.0),
             features = null,
             workoutState = GlassOsCommands.WORKOUT_RUNNING,
         )
@@ -433,7 +462,7 @@ class FtmsMachineTest {
      */
     @Test
     fun `a sample older than the TTL is not a reading`() {
-        val sample = FtmsCodec.TreadmillData(speedKph = 8.0) to 1_000L
+        val sample = FtmsCodec.MachineData(speedKph = 8.0) to 1_000L
 
         assertNotNull(FtmsValues.fresh(sample, now = 1_000L + FtmsValues.SAMPLE_TTL_MS))
         assertNull(FtmsValues.fresh(sample, now = 1_000L + FtmsValues.SAMPLE_TTL_MS + 1))

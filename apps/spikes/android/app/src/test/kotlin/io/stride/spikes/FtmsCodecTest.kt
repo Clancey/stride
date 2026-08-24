@@ -423,4 +423,165 @@ class FtmsCodecTest {
         assertEquals(138, data.heartRateBpm)
         assertEquals(600, data.elapsedSeconds)
     }
+
+    // ---- indoor bike (0x2AD2) ---------------------------------------------------------------
+
+    /**
+     * The flag *positions* differ from the treadmill's even where field names match.
+     *
+     * Bits 2 and 3 are cadence here and inclination/elevation on a treadmill. Sharing one flag table
+     * between the two would decode a cadence as an incline — a wrong number, not a failure.
+     *
+     * Flags `0x0044` = instantaneous cadence (bit 2) + instantaneous power (bit 6), plus speed since
+     * More Data is clear. Cadence 90 rpm is carried as 180 half-rpm → `B4 00`.
+     */
+    @Test
+    fun `indoor bike data decodes cadence and power`() {
+        val data = FtmsCodec.parseIndoorBikeData(
+            bytes(
+                0x44, 0x00,
+                0x25, 0x03,
+                0xB4, 0x00,
+                0xFA, 0x00,
+            ),
+        )!!
+
+        assertEquals(8.05, data.speedKph!!, 1e-9)
+        assertEquals(90.0, data.cadenceRpm!!, 1e-9)
+        assertEquals(250, data.powerWatts)
+        // A bike has no incline, and must not invent one.
+        assertNull(data.inclinePercent)
+    }
+
+    /** Distance sits at bit 4 on a bike and is still a uint24, so the fields after it must line up. */
+    @Test
+    fun `indoor bike distance is three bytes and keeps later fields aligned`() {
+        // Flags 0x0210 = total distance (bit 4) + heart rate (bit 9). More Data clear, so speed too.
+        val data = FtmsCodec.parseIndoorBikeData(
+            bytes(
+                0x10, 0x02,
+                0x25, 0x03,
+                0x49, 0x06, 0x00,
+                0x8A,
+            ),
+        )!!
+
+        assertEquals(1609, data.totalDistanceMetres)
+        assertEquals(138, data.heartRateBpm)
+    }
+
+    // ---- cross trainer (0x2ACE) -------------------------------------------------------------
+
+    /**
+     * **The cross trainer's flags field is 24 bits, not 16.**
+     *
+     * This is the single most dangerous difference in the family. Reading a two-byte header here
+     * leaves the cursor one byte early and decodes every field from the wrong offset, silently. The
+     * assertion that matters is the speed: with a two-byte header it would decode as `0x2503`
+     * hundredths — 95.71 km/h — rather than 8.05.
+     *
+     * Flags `0x000040` = inclination (bit 6), plus speed since More Data is clear.
+     */
+    @Test
+    fun `cross trainer data reads a three-byte flags header`() {
+        val data = FtmsCodec.parseCrossTrainerData(
+            bytes(
+                0x40, 0x00, 0x00,
+                0x25, 0x03,
+                0x1E, 0x00,
+                0x11, 0x00,
+            ),
+        )!!
+
+        assertEquals(8.05, data.speedKph!!, 1e-9)
+        assertEquals(3.0, data.inclinePercent!!, 1e-9)
+        assertEquals(1.7, data.rampAngleDegrees!!, 1e-9)
+    }
+
+    /** Bit 3 carries step count *and* average step rate — two fields, four bytes. */
+    @Test
+    fun `cross trainer step count carries two fields`() {
+        // Flags 0x000808 = step count (bit 3) + heart rate (bit 11).
+        val data = FtmsCodec.parseCrossTrainerData(
+            bytes(
+                0x08, 0x08, 0x00,
+                0x25, 0x03,
+                0x78, 0x00,
+                0x64, 0x00,
+                0x8A,
+            ),
+        )!!
+
+        assertEquals(120, data.stepsPerMinute)
+        assertEquals(100, data.averageStepRate)
+        assertEquals(138, data.heartRateBpm)
+    }
+
+    /** A treadmill packet fed to the cross trainer parser must not be silently believed. */
+    @Test
+    fun `a payload too short for a 24-bit header is rejected`() {
+        assertNull(FtmsCodec.parseCrossTrainerData(bytes(0x00, 0x00)))
+    }
+
+    // ---- rower (0x2AD1) ---------------------------------------------------------------------
+
+    /**
+     * The rower's inverted bit 0 gates a **pair**: stroke rate (1 byte, half-strokes) and stroke
+     * count (2 bytes). Three bytes, where the treadmill's equivalent consumes two.
+     *
+     * Flags `0x0004` = total distance (bit 2), plus the stroke pair since More Data is clear.
+     * Stroke rate 24 /min is carried as 48 half-strokes → `30`.
+     */
+    @Test
+    fun `rower data decodes the stroke pair and distance`() {
+        val data = FtmsCodec.parseRowerData(
+            bytes(
+                0x04, 0x00,
+                0x30,
+                0x2C, 0x01,
+                0xE8, 0x03, 0x00,
+            ),
+        )!!
+
+        assertEquals(24.0, data.strokeRatePerMin!!, 1e-9)
+        assertEquals(300, data.strokeCount)
+        assertEquals(1000, data.totalDistanceMetres)
+        // A rower reports no speed. It must stay unknown rather than becoming zero.
+        assertNull(data.speedKph)
+    }
+
+    @Test
+    fun `rower pace decodes as seconds per 500 metres`() {
+        // Flags 0x0008 = instantaneous pace (bit 3). Bit 0 set, so no stroke pair.
+        val data = FtmsCodec.parseRowerData(bytes(0x09, 0x00, 0x78, 0x00))!!
+
+        assertEquals(120, data.paceSecondsPer500m)
+        assertNull(data.strokeCount)
+    }
+
+    // ---- one parser per characteristic -------------------------------------------------------
+
+    /**
+     * The parser is chosen by characteristic, never guessed from the payload.
+     *
+     * The same eight bytes decode to entirely different numbers under each parser, because bit 2 is
+     * cadence on a bike and total distance on a treadmill. Nothing throws — the treadmill parser
+     * happily reports **16,384 km** of distance from a bike's cadence and power bytes. That silent
+     * plausibility is why the transport binds a parser to the UUID it subscribed to rather than
+     * sniffing the payload.
+     */
+    @Test
+    fun `parseMachineData dispatches on the machine type`() {
+        val frame = bytes(0x44, 0x00, 0x25, 0x03, 0xB4, 0x00, 0xFA, 0x00)
+
+        val bike = FtmsCodec.parseMachineData(FtmsCodec.MachineType.INDOOR_BIKE, frame)!!
+        assertEquals(90.0, bike.cadenceRpm!!, 1e-9)
+        assertEquals(250, bike.powerWatts)
+
+        // Same bytes, treadmill parser: bit 2 is total distance there, and the uint24 swallows the
+        // power bytes as well. A wrong answer, not a failure.
+        val treadmill = FtmsCodec.parseMachineData(FtmsCodec.MachineType.TREADMILL, frame)!!
+        assertNull(treadmill.cadenceRpm)
+        assertEquals(16_384_180, treadmill.totalDistanceMetres)
+    }
 }
