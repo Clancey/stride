@@ -114,6 +114,17 @@ interface FitProTransport : Closeable {
  * mean writing register frames into an unknown peripheral. Matching the vendor id is the difference
  * between addressing the treadmill and addressing something that happens to be plugged in.
  */
+/**
+ * Whether Android's synchronous `bulkTransfer` can actually move data over this endpoint.
+ *
+ * That is a wider question than "is this endpoint declared bulk": `bulkTransfer` is implemented on
+ * top of usbfs's `USBDEVFS_BULK` ioctl, which the kernel honours for interrupt endpoints too — only
+ * isochronous and control endpoints are out of reach of it. See [UsbSerialTransport.open] for why
+ * that distinction is load-bearing here rather than academic.
+ */
+private val UsbEndpoint.isBulkOrInterrupt: Boolean
+    get() = type == UsbConstants.USB_ENDPOINT_XFER_BULK || type == UsbConstants.USB_ENDPOINT_XFER_INT
+
 class UsbSerialTransport private constructor(
     private val manager: UsbManager,
     private val device: UsbDevice,
@@ -367,20 +378,33 @@ class UsbSerialTransport private constructor(
             // Endpoints 0 and 1 of the first interface, per the documented bulkTransfer path. The
             // direction flags are read rather than assumed, because an interface that enumerated
             // them the other way round would otherwise have us writing into the read endpoint.
+            //
+            // Bulk *or* interrupt, not bulk alone. A GlassOS-era console (product id 3) enumerates
+            // real bulk endpoints, which is what this originally matched — but a FitPro1 console
+            // (product id 2, e.g. an X22i) reports itself as `class=3` ("ICON Generic HID") with two
+            // *interrupt* endpoints (`dumpsys usb` on real hardware: type=3, i.e.
+            // `USB_ENDPOINT_XFER_INT`, on both). Filtering on bulk alone means `open()` never finds
+            // an interface on that console and returns null before ever attempting a handshake —
+            // silently, since every other failure branch here logs and this one did not, which is
+            // why the direct path read as "no console" instead of "wrong endpoint type". `bulkTransfer`
+            // still works against the interrupt endpoints once found: it maps to usbfs's
+            // `USBDEVFS_BULK` ioctl, which the kernel accepts for both bulk and interrupt endpoints —
+            // this is the same trick vendor-HID "generic report pipe" USB devices are commonly driven
+            // with elsewhere, not something specific to this console.
             val iface = (0 until device.interfaceCount)
                 .map { device.getInterface(it) }
                 .firstOrNull { candidate ->
                     (0 until candidate.endpointCount)
                         .map { candidate.getEndpoint(it) }
-                        .count { it.type == UsbConstants.USB_ENDPOINT_XFER_BULK } >= 2
+                        .count { it.isBulkOrInterrupt } >= 2
                 } ?: return null
 
             val endpoints = (0 until iface.endpointCount).map { iface.getEndpoint(it) }
             val read = endpoints.firstOrNull {
-                it.type == UsbConstants.USB_ENDPOINT_XFER_BULK && it.direction == UsbConstants.USB_DIR_IN
+                it.isBulkOrInterrupt && it.direction == UsbConstants.USB_DIR_IN
             } ?: return null
             val write = endpoints.firstOrNull {
-                it.type == UsbConstants.USB_ENDPOINT_XFER_BULK && it.direction == UsbConstants.USB_DIR_OUT
+                it.isBulkOrInterrupt && it.direction == UsbConstants.USB_DIR_OUT
             } ?: return null
 
             val connection = manager.openDevice(device) ?: return null

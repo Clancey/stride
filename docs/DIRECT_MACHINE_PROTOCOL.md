@@ -141,6 +141,18 @@ Service `00001533-1412-efde-1523-785feabcd123`; notifications enabled via CCC de
 
 USB serial: `bulkTransfer` on endpoints 0/1, vendor **ICON = 8508**.
 
+**The endpoints are not always declared bulk — VERIFIED against a real X22i.** GlassOS 6.14.6, the
+source for the rest of this section, runs on a product-3 (FitPro2) console and its endpoints were
+never independently checked against real hardware. A product-2 (FitPro1) console does not match:
+`dumpsys usb` on a NordicTrack X22i shows it enumerating as `class=3` ("ICON Generic HID") with two
+**interrupt** endpoints (`type=3`, i.e. `USB_ENDPOINT_XFER_INT`), not bulk. `UsbSerialTransport.open`
+originally matched bulk endpoints only, so it found no usable interface on this console and returned
+null before a handshake was ever attempted — the direct path read as "no console" on exactly the
+hardware this whole feature was built for. It now accepts either transfer type: Android's
+`bulkTransfer` reaches usbfs's `USBDEVFS_BULK` ioctl, which the kernel honours for interrupt
+endpoints as well as bulk ones, so no change was needed to the transfer calls themselves once the
+endpoint filter stopped excluding them.
+
 ## The connect handshake — VERIFIED (`xh/n0.F()`)
 
 There is a `CONNECT(4)` and a `DISCONNECT(5)` in the command enum. **Neither is ever sent** — JADX
