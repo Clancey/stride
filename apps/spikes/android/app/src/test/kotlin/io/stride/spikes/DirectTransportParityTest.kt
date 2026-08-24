@@ -262,22 +262,9 @@ class DirectPresetLadderTest {
         assertEquals("CONTROL_TYPE_MPS", 2, GlassOsClient.ControlType.MPS)
     }
 
-    private fun invokeLadder(min: Double, max: Double, step: Double): List<Double> {
-        // Reached reflectively because the helper is private to DirectMachineCommands, and making
-        // it public purely for a test would widen an API for no caller.
-        val companion = DirectMachineCommands::class.java.declaredClasses
-            .first { it.simpleName == "Companion" }
-        val instance = DirectMachineCommands::class.java
-            .getDeclaredField("Companion")
-            .apply { isAccessible = true }
-            .get(null)
-        val method = companion.getDeclaredMethod(
-            "ladder",
-            Double::class.java,
-            Double::class.java,
-            Double::class.java,
-        ).apply { isAccessible = true }
-        @Suppress("UNCHECKED_CAST")
-        return method.invoke(instance, min, max, step) as List<Double>
-    }
+    private fun invokeLadder(min: Double, max: Double, step: Double): List<Double> =
+        // Called directly now that the helper lives in MachinePresets. It was reached reflectively
+        // while it was private to DirectMachineCommands and had no second caller; FTMS derives its
+        // quick picks from the same reported min/max/step, so it has one.
+        MachinePresets.ladder(min, max, step)
 }

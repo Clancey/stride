@@ -22,6 +22,7 @@ object StrideSettings {
     private const val KEY_TRACK_FLOOR = "overlay.trackFloor"
     private const val KEY_TRANSPORT = "machine.transport"
     private const val KEY_FAN = "machine.fanState"
+    private const val KEY_HR_STRAP = "sensor.heartRateStrap"
 
     /** How Stride is permitted to reach the machine. */
     enum class Transport {
@@ -37,6 +38,16 @@ object StrideSettings {
          * than being retrofitted onto working code later.
          */
         DIRECT,
+
+        /**
+         * The Bluetooth SIG **Fitness Machine Service**, to equipment that is not iFit's.
+         *
+         * The only transport here that reaches a machine Stride is *not running on*. Selecting it
+         * does not make it work: the machine must be paired in Android's Bluetooth settings first,
+         * because Stride deliberately does not hold the location permission that BLE scanning
+         * requires below Android 12. See `FtmsTransport`.
+         */
+        FTMS,
         ;
 
         companion object {
@@ -109,11 +120,25 @@ object StrideSettings {
         }
 
     /**
+     * Whether Stride should connect to a paired Bluetooth heart rate strap.
+     *
+     * Off by default, and deliberately a separate setting from [transport] rather than part of it: a
+     * strap is an accessory, not a way of reaching the machine, and a rider on any transport can
+     * wear one. Off by default because connecting to somebody's chest strap is not something to do
+     * because they installed a launcher.
+     */
+    var heartRateStrap: Boolean
+        get() = requirePrefs().getBoolean(KEY_HR_STRAP, false)
+        set(value) {
+            requirePrefs().edit().putBoolean(KEY_HR_STRAP, value).apply()
+        }
+
+    /**
      * True when the direct register path is selected.
      *
      * Read this as "the rider has opted in", never as "the direct path is working". Whether it is
-     * working is a question only the handshake can answer — `MachineLink.directLinked` and
-     * `MachineLink.directCapabilities()` hold that answer, and it varies by machine. Any caller
+     * working is a question only the handshake can answer — `MachineLink.machineLinked` and
+     * `MachineLink.machineCapabilities()` hold that answer, and it varies by machine. Any caller
      * that treats this as a capability check will be wrong.
      */
     val directHardwareAccess: Boolean

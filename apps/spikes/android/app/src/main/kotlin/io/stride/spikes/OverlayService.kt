@@ -1032,6 +1032,16 @@ class OverlayService : Service() {
         MachineLink.calories?.let { String.format(Locale.US, "%.0f", it) }
             ?: MachineLink.NO_READING
 
+    /**
+     * Heart rate, or [MachineLink.NO_READING].
+     *
+     * Never a zero. A strap searching for a signal reports 0 bpm and the codec already drops that;
+     * drawing it would be the same lie as a fabricated speed, and a more alarming one — it is a
+     * claim about the rider rather than about the machine.
+     */
+    private fun heartRateText(): String =
+        MachineLink.heartRateBpm?.toString() ?: MachineLink.NO_READING
+
     private fun baseParams(width: Int, height: Int, gravity: Int): WindowManager.LayoutParams {
         val params = WindowManager.LayoutParams(
             width,
@@ -1520,6 +1530,16 @@ class OverlayService : Service() {
         // stays honestly blank rather than being faked from a single incline sample.
         metrics.addView(metricPillCell("vert gain (ft)", MachineLink.NO_READING, R.drawable.ic_metric_vertgain, Color.rgb(104, 235, 126), 1f))
         metrics.addView(metricDivider())
+        // Only when the rider has turned the strap on. A permanently blank eighth pill would narrow
+        // the seven that do work, to report the absence of an accessory most riders do not own.
+        if (StrideSettings.heartRateStrap) {
+            metrics.addView(
+                metricPillCell("bpm", heartRateText(), R.drawable.ic_metric_heart, Color.rgb(255, 106, 128), 1f).also {
+                    trackPill(it) { heartRateText() }
+                },
+            )
+            metrics.addView(metricDivider())
+        }
         metrics.addView(metricPillCell("speed mph", speedText(), R.drawable.ic_metric_speed, cyan, 1f).also {
             trackPill(it) { speedText() }
         })

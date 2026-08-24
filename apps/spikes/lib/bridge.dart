@@ -160,6 +160,8 @@ class SpikeBridge {
   static Future<Map<String, dynamic>> settingsGet() => _map('settingsGet');
   static Future<bool> transportSet(String transport) =>
       _bool('transportSet', <String, dynamic>{'transport': transport});
+  static Future<bool> heartRateStrapSet(bool enabled) =>
+      _bool('heartRateStrapSet', <String, dynamic>{'enabled': enabled});
   static Future<List<Map<String, dynamic>>> grantsGet() => _list('grantsGet');
   static Future<bool> grantOpenSettings(String id) =>
       _bool('grantOpenSettings', <String, dynamic>{'id': id});

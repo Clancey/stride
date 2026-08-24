@@ -1084,42 +1084,12 @@ class DirectMachineCommands(private val session: DirectMachineSession) : Machine
          *
          * The cap exists because these bounds come off a wire: a machine that reports a 0-3000
          * range through a decoding error would otherwise hand the UI three thousand buttons.
+         *
+         * Delegated to [MachinePresets] because FTMS derives its quick picks from the same three
+         * numbers. Kept as a named alias here so the two call sites above read the same as they did
+         * when the arithmetic lived in this file.
          */
-        fun ladder(min: Double, max: Double, step: Double): List<Double> {
-            if (!min.isFinite() || !max.isFinite() || max < min) return emptyList()
-            if (!step.isFinite() || step <= 0.0) return emptyList()
-
-            val floor = ceil1(min)
-            val ceiling = floor1(max)
-            // Rounding inward can cross the bounds over on a range narrower than 0.1; there is no
-            // honest button to offer in that case, so offer the one value both ends agree on.
-            // Coerced because rounding a sub-0.1 range can land outside it (min 2.55, max 2.57
-            // rounds to 2.6) and a preset the machine would refuse is worse than an ugly label.
-            if (ceiling < floor) return listOf(round1(min).coerceIn(min, max))
-
-            val out = sortedSetOf<Double>(reverseOrder())
-            out += floor
-            out += ceiling
-            var v = kotlin.math.ceil(min / step) * step
-            // Both ends are already in the set, so they survive the cap regardless of where it
-            // bites — a truncated ladder that has lost its extremes is worse than one that has
-            // lost part of its middle.
-            while (v <= max + 1e-9 && out.size < MAX_PRESETS) {
-                val rounded = round1(v)
-                if (rounded in floor..ceiling) out += rounded
-                v += step
-            }
-            return out.toList()
-        }
-
-        const val MAX_PRESETS = 40
-
-        fun round1(v: Double): Double = kotlin.math.round(v * 10.0) / 10.0
-
-        /** One decimal place, never rounding below [v] — used for a range's lower bound. */
-        fun ceil1(v: Double): Double = kotlin.math.ceil(v * 10.0 - 1e-9) / 10.0
-
-        /** One decimal place, never rounding above [v] — used for a range's upper bound. */
-        fun floor1(v: Double): Double = kotlin.math.floor(v * 10.0 + 1e-9) / 10.0
+        fun ladder(min: Double, max: Double, step: Double): List<Double> =
+            MachinePresets.ladder(min, max, step)
     }
 }
