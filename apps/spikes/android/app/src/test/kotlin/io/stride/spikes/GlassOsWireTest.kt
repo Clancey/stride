@@ -181,11 +181,14 @@ class GlassOsWireTest {
     @Test
     fun `the states observed during the recorded workout are the moving ones`() {
         // Captured transition: IDLE -> WARM_UP -> WORKOUT -> WORKOUT_RESULTS -> IDLE
-        assertTrue(GlassOsClient.ConsoleState.beltMayBeMoving("WARM_UP"))
-        assertTrue(GlassOsClient.ConsoleState.beltMayBeMoving("WORKOUT"))
+        assertEquals(true, GlassOsClient.ConsoleState.beltMayBeMoving("WARM_UP"))
+        assertEquals(true, GlassOsClient.ConsoleState.beltMayBeMoving("WORKOUT"))
         assertEquals(false, GlassOsClient.ConsoleState.beltMayBeMoving("IDLE"))
         assertEquals(false, GlassOsClient.ConsoleState.beltMayBeMoving("WORKOUT_RESULTS"))
-        assertEquals(false, GlassOsClient.ConsoleState.beltMayBeMoving(null))
+        // Unknown is not "stopped". A console state we cannot read must never be reported as
+        // a belt that is definitely still.
+        assertNull(GlassOsClient.ConsoleState.beltMayBeMoving(null))
+        assertNull(GlassOsClient.ConsoleState.beltMayBeMoving("NOT_A_STATE"))
     }
 
     // ---- gRPC framing --------------------------------------------------------------------------

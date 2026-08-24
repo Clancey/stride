@@ -51,6 +51,51 @@ object MachineCoordinator {
     const val MIN_INCLINE = -3.0
     const val MAX_INCLINE = 12.0
 
+    /**
+     * What the machine says its own limits are, when a transport can tell us. Null on a link that
+     * cannot be asked.
+     *
+     * Only ever used to make the clamp *tighter* — see [clampSpeed] and [clampIncline]. A machine
+     * reporting a 20 mph ceiling does not raise ours.
+     */
+    @Volatile
+    var machineLimits: MachineLimits? = null
+        private set
+
+    /**
+     * Record the connected machine's own limits, or clear them.
+     *
+     * Called when a transport is bound. The direct path learns these from the console's `MAX_KPH` /
+     * `MIN_KPH` / `MAX_GRADE` / `MIN_GRADE` registers; GlassOS passes null, which leaves the fixed
+     * ceiling in force.
+     */
+    fun applyMachineLimits(limits: MachineLimits?) {
+        machineLimits = limits
+        if (limits != null) Log.i(TAG, "machine limits: $limits")
+    }
+
+    /**
+     * The rider's speed request, clamped to the *intersection* of Stride's ceiling and the machine's.
+     *
+     * The floor stays at [MIN_SPEED_MPH] regardless of what the machine reports as its minimum.
+     * Model 17125 reports a 1.0 mph floor, and clamping a stop request up to it would keep the belt
+     * running — the machine's minimum describes the slowest it will *run*, not the slowest it will
+     * accept, and zero is how it is told to stop.
+     */
+    private fun clampSpeed(mph: Double): Double {
+        val ceiling = minOf(MAX_SPEED_MPH, machineLimits?.maxSpeedMph ?: MAX_SPEED_MPH)
+        return mph.coerceIn(MIN_SPEED_MPH, maxOf(MIN_SPEED_MPH, ceiling))
+    }
+
+    private fun clampIncline(percent: Double): Double {
+        val limits = machineLimits
+        val ceiling = minOf(MAX_INCLINE, limits?.maxInclinePercent ?: MAX_INCLINE)
+        val floor = maxOf(MIN_INCLINE, limits?.minInclinePercent ?: MIN_INCLINE)
+        // A machine reporting a nonsensical pair must not invert the clamp.
+        if (floor > ceiling) return percent.coerceIn(MIN_INCLINE, MAX_INCLINE)
+        return percent.coerceIn(floor, ceiling)
+    }
+
     /** Largest speed increase sent in a single command, in mph. Increases only. */
     private const val MAX_STEP_UP_MPH = 2.0
 
@@ -62,6 +107,14 @@ object MachineCoordinator {
 
     /** Pause after a clearing stop, so the console's state read reflects it. */
     private const val CLEAR_SETTLE_MS = 300L
+
+    /**
+     * Attempts to read the console's workout state before a start is refused.
+     *
+     * More than one because a single null is usually a dropped message rather than a machine that
+     * cannot answer; bounded because a console that has not answered three times is not going to.
+     */
+    private const val MAX_STATE_READS = 3
 
     private const val MPH_TO_KPH = 1.609344
 
@@ -81,16 +134,31 @@ object MachineCoordinator {
         val generation: Int,
         val label: String,
         val onDone: ((Outcome) -> Unit)? = null,
+        /**
+         * The speed-request generation this job belongs to, or null for jobs that are not speed
+         * commands. Lets a new speed request retire a pending ramp without also discarding a queued
+         * incline or fan change, which have nothing to do with it.
+         */
+        val speedGen: Int? = null,
         val run: () -> Outcome,
     )
 
     private val queue = LinkedBlockingDeque<Job>()
     private val generation = AtomicInteger(0)
+
+    /**
+     * Retires pending speed jobs without touching anything else.
+     *
+     * Separate from [generation] because that one is the "everything queued is stale" signal used by
+     * stop and rebind. A rider nudging the speed down should cancel the climb, not their pending
+     * incline change.
+     */
+    private val speedGeneration = AtomicInteger(0)
     private val worker = Executors.newSingleThreadExecutor { r ->
         Thread(r, "machine-coordinator").apply { isDaemon = true }
     }
 
-    @Volatile private var commands: GlassOsCommands? = null
+    @Volatile private var commands: MachineCommands? = null
     @Volatile private var running = false
 
     /** Last outcome, for the UI to report. Never used to decide whether the belt is moving. */
@@ -117,15 +185,55 @@ object MachineCoordinator {
         }
     }
 
-    /** Bind to a client. Idempotent; safe to call from every entry point. */
+    /**
+     * Bind to a command surface. Idempotent; safe to call from every entry point.
+     *
+     * Takes a [MachineCommands] rather than a client so the coordinator does not know or care which
+     * transport is underneath it. That is the point of the split: swapping iFit's gRPC server for
+     * the direct register path swaps the wire, not the clamps.
+     */
     @Synchronized
-    fun attach(client: GlassOsClient) {
-        if (commands == null) commands = GlassOsCommands(client)
+    fun attach(commands: MachineCommands) {
+        if (this.commands == null) this.commands = commands
         if (!running) {
             running = true
             worker.execute(::drain)
         }
     }
+
+    /**
+     * Replace the bound command surface, e.g. when the rider switches transports.
+     *
+     * Bumps the generation before swapping, so anything queued for the old transport is discarded
+     * rather than delivered to the new one. A "set 8 mph" issued against GlassOS must not land on
+     * the register path a moment later — it was authorised against a different machine view.
+     */
+    @Synchronized
+    fun rebind(commands: MachineCommands?) {
+        generation.incrementAndGet()
+        queue.clear()
+        this.commands = commands
+        if (commands != null && !running) {
+            running = true
+            worker.execute(::drain)
+        }
+    }
+
+    /** The transport currently bound, for diagnostics. Null when nothing is attached. */
+    val transportName: String? get() = commands?.transportName
+
+    /**
+     * Read something from whichever transport is bound, on the caller's thread.
+     *
+     * Deliberately not queued. These are questions, not commands: they move nothing, they are
+     * already called from background threads, and putting them behind the command queue would let a
+     * preset fetch delay a stop. [ask] returns null when nothing is bound, which callers must treat
+     * as "not asked" rather than as "the machine said no".
+     *
+     * This exists so [MachineLink] never has to hold a GlassOS client to ask a question. Reaching
+     * past the interface for reads was how the direct path ended up silently talking to GlassOS.
+     */
+    fun <T> ask(read: (MachineCommands) -> T?): T? = commands?.let(read)
 
     /**
      * True when a command could be attempted right now.
@@ -147,7 +255,21 @@ object MachineCoordinator {
      *
      * Returns the `ConsoleState` GlassOS answers with, or null if there was no usable answer.
      */
-    fun connectConsole(): Int? = commands?.connect()
+    fun connectConsole(): Int? {
+        val c = commands ?: return null
+        val state = c.connect()
+        // Refreshed here rather than only when the link is opened, because a handshake can run again
+        // long afterwards — the direct path re-runs it whenever the machine has dropped and come
+        // back — and the limits that came with it are the ones now in force. Applying them only at
+        // open meant a reconnected treadmill kept whatever ceiling the previous machine reported,
+        // or none at all if the first handshake never got that far.
+        //
+        // Null is a real answer meaning "this transport cannot say", not a failure to be ignored:
+        // GlassOS never reports a range, and passing its null through is what makes Stride's own
+        // fixed ceiling stand alone. See applyMachineLimits.
+        applyMachineLimits(c.limits())
+        return state
+    }
 
     /**
      * Begin a workout, reconciling with whatever the console is already doing.
@@ -193,14 +315,40 @@ object MachineCoordinator {
                 },
             )
         }
-        val state = it.workoutState()
+        // Re-read rather than trusting one miss: a null here is "we could not ask", which on the
+        // GlassOS path is often a single dropped RPC and on the direct path is a dropped frame.
+        var state = it.workoutState()
+        var reads = 1
+        while (state == null && reads < MAX_STATE_READS) {
+            if (!settle()) return@submit Outcome.Failed("Interrupted")
+            state = it.workoutState()
+            reads++
+        }
+
+        val moving = (MachineLink.speedMph ?: 0.0) > BELT_MOVING_MPH
         if (shouldAdoptWorkout(state, MachineLink.speedMph)) {
             Log.i(TAG, "console already running with the belt moving; adopting the existing workout")
             return@submit Outcome.Ok
         }
-        clearWorkout(it, state)
+        if (state == null) {
+            // A moving belt we cannot account for is the one case where doing nothing is right.
+            // Clearing would stop someone else's run; starting would send a start sequence to a
+            // console that is already under way. Adopting is the only option that moves nothing.
+            if (moving) {
+                Log.w(TAG, "console state unreadable but the belt is moving; adopting rather than starting")
+                return@submit Outcome.Ok
+            }
+            // Otherwise refuse. Starting blind means issuing a start against a console whose session
+            // we could not clear and whose state we cannot confirm afterwards — and every speed we
+            // then send would be aimed at a machine we never established was listening.
+            Log.w(TAG, "refusing to start: console workout state could not be read")
+            return@submit Outcome.Failed("The console did not report its workout state")
+        }
+
+        val cleared = clearWorkout(it, state)
+        if (!cleared) return@submit Outcome.Failed("The console would not end its previous workout")
         // Re-checked immediately before the one command here that can set the belt in motion.
-        // Everything above blocks — the handshake, the state read, and the clearing loop each wait
+        // Everything above blocks — the handshake, the state reads, and the clearing loop each wait
         // on the console — so by now the rider may have cancelled, or the start watchdog may have
         // given up and put the UI back to idle. Starting anyway would move a treadmill under a
         // screen that shows no workout. The stop that follows a cancel would catch it a moment
@@ -209,34 +357,81 @@ object MachineCoordinator {
         it.startWorkout().toOutcome()
     }
 
+    /** Wait out a console state transition. Returns false if the wait was interrupted. */
+    private fun settle(): Boolean = try {
+        Thread.sleep(CLEAR_SETTLE_MS)
+        true
+    } catch (t: InterruptedException) {
+        Thread.currentThread().interrupt()
+        false
+    }
+
     /**
      * Stop whatever session the console is holding, so a new one may begin.
      *
      * Looped rather than sent once because the console walks through states on its way to idle: a
-     * paused session stops into results, and results has to be cleared in turn. Bounded, and abandoned
-     * the moment a stop stops changing anything, so a console that will not budge is left alone
-     * instead of hammered — StartNewWorkout is still attempted afterwards either way.
+     * paused session stops into results, and results has to be cleared in turn. Bounded, and
+     * abandoned the moment a stop stops changing anything, so a console that will not budge is left
+     * alone instead of hammered.
+     *
+     * Returns whether it is safe to start. A stop the machine *refused* is the interesting case: it
+     * used to be discarded, and the start went out regardless. A console that will not accept a stop
+     * from us is a console we have no way of stopping once the belt is moving, and arming it is
+     * exactly the situation the rest of this file exists to prevent.
      */
-    private fun clearWorkout(commands: GlassOsCommands, initial: Int?) {
+    /**
+     * Ends whatever workout the console is already in, so a start begins a session rather than
+     * colliding with one.
+     *
+     * **Returns true only for a console that positively said IDLE.** Every other ending — a stop
+     * that went unanswered, a state we could not re-read, a console that did not move, or attempts
+     * running out — is false.
+     *
+     * That asymmetry is deliberate and it is the opposite of the `!= false` rule used for
+     * capabilities elsewhere. There, unknown must not disable a control the machine never denied.
+     * Here, the next thing that happens is the one command that can set a belt in motion, and the
+     * caller has already refused to start when it could not read the state at all, saying that
+     * starting blind means issuing a start against a console whose session we could not clear.
+     * Returning true on an unconfirmed clear would do precisely that, one call later — so the two
+     * halves of the decision have to agree, and this is the half that was disagreeing.
+     *
+     * The concrete case: a paused console with the belt stopped and a rider standing on it. If the
+     * stop went unacknowledged, a start resumes the belt underneath them. A rider who is told the
+     * console would not end its previous workout can press Start again; one who is not told cannot
+     * un-stand on a moving belt.
+     */
+    private fun clearWorkout(commands: MachineCommands, initial: Int?): Boolean {
         var state = initial
         var attempts = 0
         while (state != null && state != GlassOsCommands.WORKOUT_IDLE && attempts < MAX_CLEAR_ATTEMPTS) {
             Log.i(TAG, "console workout state $state before start; clearing it")
-            commands.stop()
+            val ack = commands.stop()
             attempts++
-            try {
-                Thread.sleep(CLEAR_SETTLE_MS)
-            } catch (t: InterruptedException) {
-                Thread.currentThread().interrupt()
-                return
+            if (ack is MachineAck.Refused) {
+                Log.w(TAG, "console refused a stop while clearing; not starting")
+                return false
             }
+            if (!settle()) return false
             val next = commands.workoutState()
+            if (next == null) {
+                // The stop may well have landed — an unanswered command is not a rejected one — but
+                // "probably cleared" is not a basis for moving a belt.
+                Log.w(TAG, "console did not report its state after a stop; not starting")
+                return false
+            }
             if (next == state) {
-                Log.w(TAG, "console stayed in state $state after a stop; starting anyway")
-                return
+                Log.w(TAG, "console stayed in state $state after a stop; not starting")
+                return false
             }
             state = next
         }
+        // Covers the loop running out of attempts as well as an initial state that was already
+        // idle. Anything still not idle here was never cleared.
+        if (state != GlassOsCommands.WORKOUT_IDLE) {
+            Log.w(TAG, "console did not reach idle after $attempts stop attempts; not starting")
+            return false
+        }
+        return true
     }
 
     fun pause() = submit("Pause") { it.pause().toOutcome() }
@@ -268,10 +463,17 @@ object MachineCoordinator {
      * because slowing down is never the dangerous direction.
      */
     fun setSpeedMph(mph: Double) {
-        val target = mph.coerceIn(MIN_SPEED_MPH, MAX_SPEED_MPH)
+        val target = clampSpeed(mph)
+        // Every new speed request retires the previous one, including a ramp still climbing. Without
+        // this, asking to slow down merely queues *behind* the remaining steps of the climb, so the
+        // belt keeps accelerating after the rider has asked it not to. The generation is bumped
+        // before anything is queued so the new jobs carry the new value.
+        val gen = speedGeneration.incrementAndGet()
         val current = MachineLink.speedMph
         if (current == null || target <= current || target - current <= MAX_STEP_UP_MPH) {
-            submit(label = "Speed ${format(target)} mph") { it.setSpeedKph(target * MPH_TO_KPH).toOutcome() }
+            submit(label = "Speed ${format(target)} mph", speedGen = gen) {
+                it.setSpeedKph(target * MPH_TO_KPH).toOutcome()
+            }
             return
         }
         // Break the climb into steps. Each is queued as its own generation-checked job, so a stop
@@ -279,18 +481,18 @@ object MachineCoordinator {
         var next = current + MAX_STEP_UP_MPH
         while (next < target) {
             val step = next
-            submit(label = "Speed ${format(step)} mph", delayMs = STEP_INTERVAL_MS) {
+            submit(label = "Speed ${format(step)} mph", delayMs = STEP_INTERVAL_MS, speedGen = gen) {
                 it.setSpeedKph(step * MPH_TO_KPH).toOutcome()
             }
             next += MAX_STEP_UP_MPH
         }
-        submit(label = "Speed ${format(target)} mph", delayMs = STEP_INTERVAL_MS) {
+        submit(label = "Speed ${format(target)} mph", delayMs = STEP_INTERVAL_MS, speedGen = gen) {
             it.setSpeedKph(target * MPH_TO_KPH).toOutcome()
         }
     }
 
     fun setInclinePercent(percent: Double) {
-        val target = percent.coerceIn(MIN_INCLINE, MAX_INCLINE)
+        val target = clampIncline(percent)
         submit("Incline ${format(target)}%") { it.setInclinePercent(target).toOutcome() }
     }
 
@@ -325,14 +527,24 @@ object MachineCoordinator {
      * starts is worse than a fan that comes on a moment late.
      *
      * A remembered setting always wins; Auto is only the fallback for a rider who has never chosen.
+     *
+     * Auto is attempted whenever the console has not specifically said no. GlassOS can answer this
+     * question outright because it reads a per-console configuration blob; the direct path has no
+     * equivalent and can only find out by asking, so an unknown answer is treated as "worth trying
+     * once". A machine that refuses is not an error — it is a machine without an automatic fan, and
+     * it has just told us so, which is why the refusal is swallowed here and remembered there.
      */
     fun restoreFan(remembered: Int?) {
         submit("Restore fan") { commands ->
+            val speculative = remembered == null
             val target = remembered
-                ?: if (commands.autoFanSupported() == true) GlassOsCommands.FAN_AUTO else null
+                ?: if (commands.autoFanSupported() != false) GlassOsCommands.FAN_AUTO else null
                 ?: return@submit Outcome.Ok
-            lastFanState = target
-            commands.setFanState(target).toOutcome()
+            val ack = commands.setFanState(target)
+            // Only remember a state the machine actually took. Recording a speculative Auto that was
+            // refused would make every later restore replay a command this console has rejected.
+            if (ack is MachineAck.Ok || !speculative) lastFanState = target
+            if (speculative && ack is MachineAck.Refused) Outcome.Ok else ack.toOutcome()
         }
     }
 
@@ -342,11 +554,15 @@ object MachineCoordinator {
         label: String,
         delayMs: Long = 0L,
         onDone: ((Outcome) -> Unit)? = null,
-        run: (GlassOsCommands) -> Outcome,
+        speedGen: Int? = null,
+        // MachineCommands, not GlassOsCommands: the coordinator owns the clamps and the ramp and
+        // must not know which wire is underneath it. That split is what lets the direct register
+        // path substitute for GlassOS without a second copy of any of the safety rules.
+        run: (MachineCommands) -> Outcome,
     ) {
         val gen = generation.get()
         queue.addLast(
-            Job(gen, label, onDone) {
+            Job(gen, label, onDone, speedGen) {
                 if (delayMs > 0) {
                     try {
                         Thread.sleep(delayMs)
@@ -356,8 +572,10 @@ object MachineCoordinator {
                     }
                 }
                 // Re-checked after the sleep as well as before dequeue: a stop during the gap
-                // between ramp steps must cancel the rest of the climb.
+                // between ramp steps must cancel the rest of the climb, and so must a newer speed
+                // request that arrived while this step was waiting its turn.
                 if (generation.get() != gen) return@Job Outcome.Superseded
+                if (speedGen != null && speedGeneration.get() != speedGen) return@Job Outcome.Superseded
                 // Deliberately not short-circuited on [MachineLink.consoleDetached]. Refusing here
                 // without touching the wire would be faster, but it also makes the app's own
                 // reading of the console the thing that decides whether a rider may use their
@@ -390,6 +608,14 @@ object MachineCoordinator {
             }
             lastLabel = job.label
             lastOutcome = outcome
+            // A ramp step that failed must not be followed by the next, larger one. Each step is
+            // only safe because the one below it landed; continuing past a failure would deliver an
+            // increase bigger than MAX_STEP_UP_MPH in a single jump, which is the exact thing the
+            // ramp exists to prevent.
+            if (outcome is Outcome.Failed && job.speedGen != null) {
+                speedGeneration.incrementAndGet()
+                Log.w(TAG, "${job.label} failed; cancelling the rest of the ramp")
+            }
             if (outcome !is Outcome.Superseded) Log.i(TAG, "${job.label} -> $outcome")
             // Before the general listeners, and individually guarded: this is how a caller learns
             // its own command failed, and a caller that throws must not cost every other listener
@@ -405,10 +631,10 @@ object MachineCoordinator {
         }
     }
 
-    private fun GlassOsCommands.Ack.toOutcome(): Outcome = when (this) {
-        is GlassOsCommands.Ack.Ok -> Outcome.Ok
-        is GlassOsCommands.Ack.Refused -> Outcome.Rejected(detail)
-        is GlassOsCommands.Ack.NoAnswer -> Outcome.Failed(reason)
+    private fun MachineAck.toOutcome(): Outcome = when (this) {
+        is MachineAck.Ok -> Outcome.Ok
+        is MachineAck.Refused -> Outcome.Rejected(detail)
+        is MachineAck.NoAnswer -> Outcome.Failed(reason)
     }
 
     private fun format(v: Double): String =

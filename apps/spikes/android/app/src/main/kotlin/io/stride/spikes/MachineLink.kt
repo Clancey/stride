@@ -69,6 +69,25 @@ object MachineLink {
     const val CONTROL_NEEDS_WORKOUT_NOTICE: String =
         "The treadmill won't change speed or incline until a workout is running. Start one first."
 
+    /** What the direct path says when no cable or radio was found at all. */
+    const val DIRECT_NO_TRANSPORT: String =
+        "No direct connection to the treadmill. Stride checked the USB port and Bluetooth and found " +
+            "nothing to talk to."
+
+    /** What the direct path says when a transport exists but nothing on it answered. */
+    const val DIRECT_NO_ANSWER: String =
+        "Stride found a connection but the treadmill didn't answer. Switch back to GlassOS to keep " +
+            "using the console."
+
+    /**
+     * How often the poll retries direct discovery when nothing is attached.
+     *
+     * Long enough that a console with no treadmill wired to it is not enumerating USB forever, short
+     * enough that powering the treadmill on, finishing a pairing, or granting the USB dialog is
+     * picked up while the rider is still looking at the screen.
+     */
+    private const val DIRECT_REOPEN_INTERVAL_MS = 5_000L
+
     /**
      * What a control says when GlassOS is answering but has no machine attached to it.
      *
@@ -187,13 +206,50 @@ object MachineLink {
     @Volatile private var snapshotAt: Long = 0L
     @Volatile private var client: GlassOsClient? = null
 
+    /**
+     * The direct path, when [StrideSettings.transport] selects it. Null on the GlassOS path.
+     *
+     * Held separately from [client] rather than behind a shared interface because the two are not
+     * interchangeable: only GlassOS has quick-pick presets, and only the direct session has a
+     * handshake whose result the rider needs to see.
+     */
+    @Volatile private var directSession: DirectMachineSession? = null
+    @Volatile private var direct: DirectMachineClient? = null
+
+    /**
+     * What the direct handshake concluded, in a sentence fit to show a rider. Null on the GlassOS
+     * path or before the attempt has finished.
+     *
+     * Read through from the session rather than cached here. The handshake runs from two places —
+     * [openDirect] when the link is first opened, and [DirectMachineCommands.connect] when it has
+     * dropped and come back — and a copy taken at the first would keep describing a failure the
+     * second had already fixed.
+     *
+     * [openFailure] covers the case the session cannot describe: there is no session, because no
+     * transport could be opened at all.
+     */
+    val directDetail: String?
+        get() = directSession?.lastConnect?.detail ?: openFailure
+
+    @Volatile private var openFailure: String? = null
+        private set
+
     @Volatile private var inclinePresetsCache: List<Double>? = null
     @Volatile private var speedPresetsCache: List<Double>? = null
     // Distinct from the caches being null: null there means "no presets", this means "not asked".
-    @Volatile private var presetsFetched: Boolean = false
+    @Volatile private var inclinePresetsFetched: Boolean = false
+    @Volatile private var speedPresetsFetched: Boolean = false
+
+    /**
+     * Bumped whenever a preset answer lands. The overlay builds its rails once, before any machine
+     * has been asked anything, so without a signal that the answers have arrived it would show the
+     * fallback ladder for the life of the window.
+     */
+    val presetsGeneration = java.util.concurrent.atomic.AtomicInteger(0)
 
     private var thread: HandlerThread? = null
     private var handler: Handler? = null
+    @Volatile private var appContext: Context? = null
 
     private var connectThread: HandlerThread? = null
     private var connectHandler: Handler? = null
@@ -291,11 +347,13 @@ object MachineLink {
         get() = fresh()?.let { GlassOsClient.ConsoleState.beltMayBeMoving(it.consoleState) }
 
     /**
-     * Fan speed. Still null: GlassOS does expose a fan service, but this build does not read it,
-     * and a fan number nobody has checked against the physical fan is worth less than an honest
-     * blank.
+     * Fan speed, 0..[FAN_MAX], or null when we do not know.
+     *
+     * Null on the GlassOS path: it exposes a fan service, but this build does not read it, and a fan
+     * number nobody has checked against the physical fan is worth less than an honest blank. The
+     * direct path does read it, from whichever fan register the machine said it implements.
      */
-    val fanLevel: Int? = null
+    val fanLevel: Int? get() = fresh()?.fanLevel
 
     const val FAN_MAX: Int = 3
 
@@ -313,7 +371,8 @@ object MachineLink {
      */
     fun attach(context: Context) {
         if (thread != null) return
-        client = GlassOsClient(context.applicationContext).also { MachineCoordinator.attach(it) }
+        val app = context.applicationContext
+        appContext = app
         val t = HandlerThread("machine-link").also { it.start() }
         thread = t
         val h = Handler(t.looper)
@@ -326,6 +385,9 @@ object MachineLink {
         val c = HandlerThread("machine-connect").also { it.start() }
         connectThread = c
         connectHandler = Handler(c.looper)
+        // Opening the transport is blocking I/O — USB enumeration, a BLE connect, and a multi-frame
+        // handshake — so it happens on the link thread rather than on whoever called attach.
+        h.post { openTransport(app) }
         h.post(poll)
         // Shake hands immediately, in parallel with the first poll rather than after it.
         //
@@ -347,12 +409,161 @@ object MachineLink {
         connectThread?.quitSafely()
         connectThread = null
         connectHandler = null
+        closeTransport()
+        appContext = null
+    }
+
+    /**
+     * Re-open the link against whatever [StrideSettings.transport] now says.
+     *
+     * Called when the rider changes the transport. Everything measured through the old path is
+     * dropped rather than carried across, because a speed read from GlassOS is not evidence about a
+     * direct link, and a stale reading is the one thing this object exists to prevent.
+     */
+    /**
+     * Counts completed [retarget]s, so a caller can tell when a switch has actually landed.
+     *
+     * The switch is asynchronous — it closes a link, opens another, and runs a handshake that can
+     * take seconds on BLE — but the settings screen wants to show what the new transport found. It
+     * cannot simply re-read after the call returns, because at that moment nothing has happened yet.
+     * Bumped at the *end* of the work, so observing a change means the new link is fully open and
+     * every value derived from it is the new one.
+     */
+    private val retargetSeq = java.util.concurrent.atomic.AtomicInteger(0)
+
+    /** @see retargetSeq */
+    val retargetCount: Int get() = retargetSeq.get()
+
+    fun retarget() {
+        val app = appContext ?: return
+        handler?.post {
+            closeTransport()
+            // The rider just asked for this transport, so a permission dialog is expected rather
+            // than a surprise, and a previous denial should not silence it forever.
+            usbPermissionAsked = false
+            nextDirectOpenAt = 0L
+            openTransport(app)
+            // Connect immediately rather than waiting for a poll to notice. A rider who flips the
+            // switch is watching the screen right then, and the difference between "controls live
+            // now" and "controls live in up to two seconds" is the difference between the setting
+            // looking like it worked and looking broken. closeTransport() has already cleared the
+            // backoff and the success TTL, so this attempt is never skipped as too-soon or
+            // short-circuited by the previous transport's handshake.
+            reconnect()
+            retargetSeq.incrementAndGet()
+        }
+    }
+
+    /**
+     * Point the link at whichever transport the rider has chosen.
+     *
+     * Exactly one of [client] and [direct] is ever non-null, and that is the mechanism — not a
+     * convention — by which DIRECT sends nothing to GlassOS. In DIRECT there is no [GlassOsClient]
+     * in existence to send anything with: no poll, no handshake, no preset fetch, no stray read.
+     * The rest of this object asks its questions through [MachineCoordinator], which holds one
+     * [MachineCommands] and neither knows nor exposes which wire is behind it.
+     */
+    private fun openTransport(app: Context) {
+        StrideSettings.attach(app)
+        when (StrideSettings.transport) {
+            StrideSettings.Transport.GLASSOS -> {
+                val c = GlassOsClient(app)
+                client = c
+                // GlassOS cannot be asked for the machine's limits, so the fixed ceiling stands.
+                MachineCoordinator.applyMachineLimits(null)
+                MachineCoordinator.rebind(GlassOsCommands(c))
+            }
+            StrideSettings.Transport.DIRECT -> openDirect(app)
+        }
+    }
+
+    /**
+     * Bring up the direct path: find a transport, greet the machine, and only then hand the
+     * coordinator something that can move a belt.
+     *
+     * Every failure leaves the coordinator unbound rather than bound to a half-open session. An
+     * unbound coordinator refuses commands, which is the correct answer when we could not establish
+     * that the console understands us.
+     */
+    private fun openDirect(app: Context) {
+        val transport = try {
+            FitProTransport.open(app)
+        } catch (t: Throwable) {
+            Log.w(TAG, "direct transport failed to open", t)
+            null
+        }
+        if (transport == null) {
+            openFailure = DIRECT_NO_TRANSPORT
+            // A console whose USB device is present but ungranted looks exactly like one that is
+            // absent, and the grant can only come from a dialog somebody has to raise. Nothing
+            // raised it, so direct-over-USB could never open on a fresh install however many times
+            // the rider tried. Asked once per rider action rather than once per retry: this also
+            // runs from the poll's discovery retry, and a permission dialog every two seconds is
+            // its own kind of broken.
+            if (!usbPermissionAsked) {
+                usbPermissionAsked = true
+                runCatching { UsbSerialTransport.requestPermission(app) }
+                    .onFailure { Log.w(TAG, "requesting USB permission failed", it) }
+            }
+            MachineCoordinator.rebind(null)
+            return
+        }
+
+        val session = DirectMachineSession(transport)
+        directSession = session
+        val result = try {
+            // No reference reading is available at startup: nobody has told us what the console
+            // shows. The probe can still confirm the link answers and read the machine's limits; it
+            // simply cannot reach VALUES_CONFIRMED until someone checks a number against the panel.
+            session.connect(reference = null)
+        } catch (t: Throwable) {
+            Log.w(TAG, "direct handshake failed", t)
+            null
+        }
+
+        if (result == null) {
+            openFailure = DIRECT_NO_ANSWER
+            session.close()
+            directSession = null
+            MachineCoordinator.rebind(null)
+            return
+        }
+
+        openFailure = null
+        direct = DirectMachineClient(session)
+        // The machine's own ceiling, so the clamp becomes the intersection of ours and theirs.
+        MachineCoordinator.applyMachineLimits(session.probe.limits)
+        MachineCoordinator.rebind(DirectMachineCommands(session))
+    }
+
+    /**
+     * Throttles [reopenDirectIfDropped]'s discovery retry. Cleared by [closeTransport] and
+     * [retarget] so a deliberate switch is never made to wait out the previous one's backoff.
+     */
+    private var nextDirectOpenAt = 0L
+
+    /** Whether this rider action has already raised the USB permission dialog. */
+    private var usbPermissionAsked = false
+
+    private fun closeTransport() {
+        MachineCoordinator.rebind(null)
+        direct = null
+        directSession?.let { runCatching { it.close() } }
+        directSession = null
+        openFailure = null
+        // Closed, not merely dropped. Clearing the field stops *future* work from finding it; the
+        // close is what stops work that is already in flight on another thread from finishing a
+        // call it started before the rider switched away. See GlassOsClient.close.
+        client?.let { runCatching { it.close() } }
         client = null
         snapshot = null
         snapshotAt = 0L
         inclinePresetsCache = null
         speedPresetsCache = null
-        presetsFetched = false
+        inclinePresetsFetched = false
+        speedPresetsFetched = false
+        presetsGeneration.incrementAndGet()
+        nextDirectOpenAt = 0L
         synchronized(connectLock) {
             connectFailures = 0
             nextConnectAt = 0L
@@ -367,7 +578,7 @@ object MachineLink {
     private val poll = object : Runnable {
         override fun run() {
             val read = try {
-                client?.read()
+                client?.read() ?: direct?.read()
             } catch (t: Throwable) {
                 // A failed read means "we do not know". Never a crash, and never a stale number.
                 null
@@ -379,6 +590,8 @@ object MachineLink {
                 // thread as the poll rather than inventing a second worker. A read having just
                 // succeeded means the link is up, so this is the cheapest moment to try.
                 fetchPresetsOnce()
+            } else {
+                reopenDirectIfDropped()
             }
             if (read?.consoleState == GlassOsClient.ConsoleState.DISCONNECTED_NAME || read == null) {
                 // Also on a read that failed outright, not only on one that came back saying
@@ -397,7 +610,7 @@ object MachineLink {
     }
 
     /**
-     * Ask GlassOS to attach the console.
+     * Ask the machine to attach.
      *
      * Fired at [attach] and again from the poll whenever a reading says nothing is attached, or no
      * reading comes back at all. Done repeatedly rather than once at startup because the console
@@ -481,24 +694,85 @@ object MachineLink {
     }
 
     /**
+     * Re-run the handshake when the cable or radio has gone away and come back.
+     *
+     * Only fires once the transport itself reports it is down, so a console that merely declined one
+     * poll does not get torn off mid-run. Reconnecting deliberately goes through the full [connect]
+     * again rather than resuming: the probe is reset, the coordinator's generation is bumped, and no
+     * previously requested speed can survive the gap. That is checklist item 7 — reconnection must
+     * not replay a target — enforced by construction rather than by remembering to.
+     */
+    /**
+     * Reopen the direct link when it has dropped — **or when there was never one to drop.**
+     *
+     * The second half is the important one. `openDirect` leaves no session at all if no device
+     * answered, so guarding on an existing session meant that selecting DIRECT before the console
+     * was reachable produced a dead setting that could only be revived by toggling it again. Every
+     * ordinary way that happens — the treadmill powered on afterwards, a BLE console still pairing,
+     * a USB cable seated late, the permission grant arriving from the dialog we raise below — is a
+     * few seconds of waiting, which is exactly the case that used to require the rider to know the
+     * cure was to flip the switch twice.
+     *
+     * Rate-limited because, unlike the dropped-session case, this runs when nothing is attached at
+     * all, and USB enumeration plus a handshake attempt on every poll is real work to do forever on
+     * a console that simply has no treadmill wired to it.
+     */
+    private fun reopenDirectIfDropped() {
+        val app = appContext ?: return
+        if (StrideSettings.transport != StrideSettings.Transport.DIRECT) return
+        val session = directSession
+        if (session != null && session.connected) return
+
+        val now = SystemClock.elapsedRealtime()
+        if (now < nextDirectOpenAt) return
+        nextDirectOpenAt = now + DIRECT_REOPEN_INTERVAL_MS
+
+        Log.i(
+            TAG,
+            if (session == null) "no direct transport yet; retrying discovery" else "direct transport dropped; re-running handshake",
+        )
+        closeTransport()
+        openTransport(app)
+    }
+
+    /**
      * Fetch the quick-pick presets exactly once per link.
      *
-     * On transport failure [GlassOsClient.controls] returns null and this leaves [presetsFetched]
-     * false so a later poll retries; only a decoded `ControlList` (even an empty one) counts as
-     * fetched. An empty shaped list is stored as null rather than as `emptyList()`, so callers see
-     * the same "no presets" signal whether the machine listed none or matched none of the type.
+     * Asked through [MachineCoordinator.ask] rather than through a GlassOS client, which is what
+     * makes this work identically on both transports: GlassOS answers from the console's published
+     * control list, the direct path answers from the machine's own `MIN_KPH`/`MAX_KPH` and
+     * `MIN_GRADE`/`MAX_GRADE` registers. The rider gets quick picks either way, and this function
+     * does not know or care which happened.
+     *
+     * A null answer means the question could not be asked, and leaves that axis unfetched so a later
+     * poll retries it. The two axes are fetched **independently**: a machine that answers about speed
+     * but not incline — a flat treadmill, or a console whose incline control list is missing — must
+     * still get its speed rail, and coupling them meant one null answer suppressed both.
+     *
+     * An empty list is a real answer and is kept as one. It means "this machine offers no presets on
+     * this axis", which is not the same as "we have not asked yet", and collapsing the two is what
+     * let the overlay fall back to a hardcoded ladder for a machine that had positively said it had
+     * nothing to offer.
+     *
+     * [presetsGeneration] is bumped whenever an answer lands so the overlay can rebuild rails that
+     * were built before the machine had told us anything.
      */
     private fun fetchPresetsOnce() {
-        if (presetsFetched) return
-        val c = client ?: return
-        val incline = c.controls("InclineService") ?: return
-        val speed = c.controls("SpeedService") ?: return
-        inclinePresetsCache =
-            shapePresets(incline, GlassOsClient.ControlType.INCLINE) { it }.takeIf { it.isNotEmpty() }
-        speedPresetsCache =
-            shapePresets(speed, GlassOsClient.ControlType.MPS) { it * MPS_TO_MPH }
-                .takeIf { it.isNotEmpty() }
-        presetsFetched = true
+        if (inclinePresetsFetched && speedPresetsFetched) return
+        if (!inclinePresetsFetched) {
+            MachineCoordinator.ask { it.inclinePresets() }?.let {
+                inclinePresetsCache = it
+                inclinePresetsFetched = true
+                presetsGeneration.incrementAndGet()
+            }
+        }
+        if (!speedPresetsFetched) {
+            MachineCoordinator.ask { it.speedPresetsMph() }?.let {
+                speedPresetsCache = it
+                speedPresetsFetched = true
+                presetsGeneration.incrementAndGet()
+            }
+        }
     }
 
     /**
@@ -571,12 +845,100 @@ object MachineLink {
 
     fun canCommandFan(): Boolean = canCommand() && fanWritable != false
 
-    /** Why a control is unavailable, in the words to show the rider who just tapped it. */
-    fun unavailableReason(): String = when {
-        consoleDetached -> CONSOLE_DETACHED_NOTICE
-        canCommand() -> CONTROL_NEEDS_WORKOUT_NOTICE
-        else -> CONTROL_LOCKED_NOTICE
+    /**
+     * Why a control is unavailable, in the words to show the rider who just tapped it.
+     *
+     * Ordered most specific first. The direct path knows a great deal about *why* it is not working
+     * — no cable, nothing answering, a machine that listed the registers it implements and did not
+     * include this one — and a rider who taps a dead incline pill deserves that sentence rather
+     * than a generic "can't reach the console". [directDetail] is set by the handshake and is
+     * already written for a rider to read.
+     */
+    fun unavailableReason(): String {
+        // The direct path's own conclusion outranks the generic sentences, but only on the direct
+        // path: CONSOLE_DETACHED_NOTICE talks about GlassOS having no treadmill attached, which is
+        // not a thing that can be true when we are not talking to GlassOS at all.
+        val detail = directDetail
+        if (!canCommand() && detail != null) return detail
+        return when {
+            consoleDetached -> CONSOLE_DETACHED_NOTICE
+            canCommand() -> CONTROL_NEEDS_WORKOUT_NOTICE
+            else -> CONTROL_LOCKED_NOTICE
+        }
     }
+
+    /**
+     * Why one specific control is unavailable.
+     *
+     * Split from [unavailableReason] because the answers genuinely differ: on the direct path the
+     * machine itself reports which registers it implements, so "this treadmill has no fan control"
+     * is a fact we hold rather than a guess. Saying that is the difference between a rider thinking
+     * Stride is broken and a rider knowing their machine has no fan.
+     */
+    fun unavailableReason(control: Control): String {
+        if (!canCommand()) return unavailableReason()
+        val writable = when (control) {
+            Control.SPEED -> speedWritable
+            Control.INCLINE -> inclineWritable
+            Control.FAN -> fanWritable
+        }
+        if (writable != false) return CONTROL_NEEDS_WORKOUT_NOTICE
+        // Only the direct path can tell "the machine does not have this" from "not right now",
+        // because only it has the supported-register list the machine sent during the handshake.
+        val unsupported = directSession?.supports(control) == false
+        return if (unsupported) {
+            when (control) {
+                Control.SPEED -> "This treadmill didn't list speed control as something it accepts."
+                Control.INCLINE -> "This treadmill didn't list an incline motor, so Stride can't move it."
+                Control.FAN -> "This treadmill didn't list a fan, so there's nothing for Stride to set."
+            }
+        } else {
+            CONTROL_NEEDS_WORKOUT_NOTICE
+        }
+    }
+
+    /** The three things a rider can ask the machine to change. */
+    enum class Control { SPEED, INCLINE, FAN }
+
+    /**
+     * Whether a machine actually answered the direct handshake.
+     *
+     * Not "is a session bound". A session is deliberately bound even when nothing answered, because
+     * that is what gives [DirectMachineCommands.connect] somewhere to retry from when the treadmill
+     * is powered on a minute later. Reporting that as linked would put "the treadmill answered" on
+     * the settings screen next to a treadmill that never did.
+     */
+    val directLinked: Boolean get() = directSession?.lastConnect?.connected == true
+
+    /**
+     * What the machine itself said it supports, for the settings screen to display.
+     *
+     * Null when the direct path has not been opened — which the screen must show as "not tried"
+     * rather than "unsupported". The values are the machine's own answer, decoded from the
+     * supported-register bitmask in its `DEVICE_INFO` reply, so this is reporting rather than
+     * predicting. That distinction is the whole point: the screen used to state flatly that incline
+     * and fan would not work, which was a guess, and on any machine that implements them it was
+     * simply false.
+     */
+    fun directCapabilities(): Map<String, Any?>? {
+        val session = directSession ?: return null
+        val limits = session.probe.limits
+        return mapOf(
+            "speed" to session.supports(Control.SPEED),
+            "incline" to session.supports(Control.INCLINE),
+            "fan" to session.supports(Control.FAN),
+            "transport" to session.transportName,
+            // The machine's own range, read from MIN_KPH/MAX_KPH and MIN_GRADE/MAX_GRADE. This is
+            // the rider's answer to "what can this thing actually do", and it is worth showing
+            // because it is the strongest evidence the link is real: a plausible range means the
+            // frames are being decoded correctly, and a nonsense one means they are not.
+            "minSpeedMph" to limits?.minSpeedMph,
+            "maxSpeedMph" to limits?.maxSpeedMph,
+            "minIncline" to limits?.minInclinePercent,
+            "maxIncline" to limits?.maxInclinePercent,
+        )
+    }
+
 }
 
 /**

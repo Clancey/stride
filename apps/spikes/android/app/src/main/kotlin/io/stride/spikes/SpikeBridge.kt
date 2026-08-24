@@ -617,6 +617,16 @@ class SpikeBridge(private val context: Context) : MethodChannel.MethodCallHandle
             // Reported separately from the choice itself. The rider can select the direct path;
             // that is not the same as it working, and the UI must be able to say so.
             "transportImplemented" to StrideSettings.transportImplemented,
+            // What the direct path actually found, rather than what the UI assumes it would find.
+            // Null until an attempt has been made, which is a third state the screen needs: "not
+            // tried" is not "did not work".
+            "directDetail" to MachineLink.directDetail,
+            "directLinked" to MachineLink.directLinked,
+            "directCapabilities" to MachineLink.directCapabilities(),
+            // Lets the screen tell "the switch has not run yet" from "it ran and found nothing".
+            // Without it, a re-read immediately after transportSet reports the *old* transport's
+            // findings, and the rider sees the previous link's capabilities under the new setting.
+            "retargetCount" to MachineLink.retargetCount,
         )
     }
 
@@ -628,6 +638,10 @@ class SpikeBridge(private val context: Context) : MethodChannel.MethodCallHandle
         val parsed = StrideSettings.Transport.entries
             .firstOrNull { it.name.equals(raw, ignoreCase = true) } ?: return false
         StrideSettings.transport = parsed
+        // Act on the choice instead of only recording it. Before this, the switch was a stored
+        // preference nothing read at runtime, so the rider could select the direct path and keep
+        // talking to GlassOS with no indication anything had failed to change.
+        MachineLink.retarget()
         return true
     }
 
@@ -654,6 +668,14 @@ class SpikeBridge(private val context: Context) : MethodChannel.MethodCallHandle
         "beltMayBeMoving" to MachineLink.beltMayBeMoving,
         "fanLevel" to MachineLink.fanLevel,
         "canCommand" to MachineLink.canCommand(),
+        "canCommandSpeed" to MachineLink.canCommandSpeed(),
+        "canCommandIncline" to MachineLink.canCommandIncline(),
+        "canCommandFan" to MachineLink.canCommandFan(),
+        // The rider-facing sentence for each control, resolved where the rules live.
+        "speedNotice" to MachineLink.unavailableReason(MachineLink.Control.SPEED),
+        "inclineNotice" to MachineLink.unavailableReason(MachineLink.Control.INCLINE),
+        "fanNotice" to MachineLink.unavailableReason(MachineLink.Control.FAN),
+        "directDetail" to MachineLink.directDetail,
         // Resolved here, not in Dart. MachineLink owns every safety sentence and the rule for
         // choosing between them; a second copy of that rule in Dart is a second thing to get wrong.
         "metricsNotice" to MachineLink.metricsNotice,

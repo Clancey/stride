@@ -21,6 +21,10 @@ class _SettingsScreenState extends State<SettingsScreen>
   Map<String, dynamic> _settings = const {};
   bool? _trackFloorChosen;
   bool _loading = true;
+
+  /// True while a transport switch is in flight, so the screen can say so
+  /// rather than showing the old link's capabilities under the new setting.
+  bool _switching = false;
   bool _advancedOpen = false;
 
   @override
@@ -125,6 +129,12 @@ class _SettingsScreenState extends State<SettingsScreen>
                         setState(() => _advancedOpen = !_advancedOpen),
                     transport: _settings['transport'] as String? ?? 'glassos',
                     onTransport: _setTransport,
+                    directDetail: _settings['directDetail'] as String?,
+                    directLinked: _settings['directLinked'] as bool? ?? false,
+                    directCapabilities:
+                        (_settings['directCapabilities'] as Map?)
+                            ?.cast<String, dynamic>(),
+                    switching: _switching,
                   ),
                 ],
               ),
@@ -147,6 +157,10 @@ class _SettingsScreenState extends State<SettingsScreen>
       final confirmed = await _confirmDirect();
       if (confirmed != true) return;
     }
+    // Remembered before the switch, because what we are waiting for is this
+    // number changing. Reading it afterwards would race the very work we are
+    // trying to wait for.
+    final before = _settings['retargetCount'] as int?;
     final ok = await SpikeBridge.transportSet(direct ? 'direct' : 'glassos');
     if (!mounted) return;
     if (!ok) {
@@ -155,7 +169,36 @@ class _SettingsScreenState extends State<SettingsScreen>
       );
       return;
     }
-    await _load();
+    setState(() => _switching = true);
+    try {
+      await _awaitRetarget(before);
+    } finally {
+      if (mounted) setState(() => _switching = false);
+    }
+  }
+
+  /// Re-read settings until the transport switch has actually finished.
+  ///
+  /// Switching closes one link and opens another, and opening the direct one
+  /// runs a full handshake — address discovery, `DEVICE_INFO`, a probe — which
+  /// takes long enough to see. Reading once when `transportSet` returns shows
+  /// the *old* transport's findings under the new setting, which reads as the
+  /// switch having silently failed.
+  ///
+  /// Bounded, and it refreshes on the way out either way: a switch that never
+  /// reports completion still leaves the screen showing the truth as of now,
+  /// which beats spinning forever on a treadmill that will not answer.
+  Future<void> _awaitRetarget(int? before) async {
+    const step = Duration(milliseconds: 300);
+    const attempts = 30; // ~9s, longer than a BLE connect and probe.
+    for (var i = 0; i < attempts; i++) {
+      await Future<void>.delayed(step);
+      if (!mounted) return;
+      await _load();
+      if (!mounted) return;
+      final now = _settings['retargetCount'] as int?;
+      if (now != null && now != before) return;
+    }
   }
 
   Future<bool?> _confirmDirect() => showDialog<bool>(
@@ -164,9 +207,12 @@ class _SettingsScreenState extends State<SettingsScreen>
       backgroundColor: StrideColors.panelRaised,
       title: const Text('Turn on direct hardware access?'),
       content: const Text(
-        'This bypasses iFit and talks to the treadmill controller directly. '
-        'It is experimental and unfinished: nothing is connected behind it yet, '
-        'so speed, incline and fan will stop responding until you switch back.\n\n'
+        'This bypasses iFit and talks to the treadmill controller directly '
+        'over USB or Bluetooth.\n\n'
+        'It is experimental. Stride will ask the treadmill which controls it '
+        'has and only offer those, so what works depends on your machine — and '
+        'if nothing answers, speed, incline and fan stop responding until you '
+        'switch back.\n\n'
         'The safety key remains the only emergency stop either way.',
       ),
       actions: [
@@ -398,6 +444,10 @@ class _AdvancedSection extends StatelessWidget {
     required this.onToggle,
     required this.transport,
     required this.onTransport,
+    this.directDetail,
+    this.directLinked = false,
+    this.directCapabilities,
+    this.switching = false,
   });
 
   final bool open;
@@ -405,9 +455,52 @@ class _AdvancedSection extends StatelessWidget {
   final String transport;
   final ValueChanged<bool> onTransport;
 
+  /// What the handshake concluded, written for a rider. Null before it has run.
+  final String? directDetail;
+
+  /// Whether a direct session is actually bound right now.
+  final bool directLinked;
+
+  /// True while the switch is still opening the new link and handshaking.
+  final bool switching;
+
+  /// The machine's own answer about which controls it implements, or null if
+  /// it was never asked. Each value may itself be null, meaning "unknown".
+  final Map<String, dynamic>? directCapabilities;
+
+  /// What to say about the direct path.
+  ///
+  /// Every branch reports something that has actually been established rather
+  /// than asserting in advance what will not work. The old copy said flatly
+  /// that speed, incline and fan would not respond, which was written when
+  /// nothing was wired behind the switch; on a machine that implements them it
+  /// was simply untrue, and telling a rider their controls are dead when they
+  /// are live is the wrong direction to be wrong in.
+  String _summary() {
+    // While the switch is running, neither the old findings nor the absence of
+    // new ones is the truth, so say what is actually happening instead.
+    if (switching) {
+      return direct
+          ? 'Connecting to the treadmill…'
+          : 'Handing control back to iFit…';
+    }
+    if (!direct) {
+      return 'Bypass iFit and drive the controller directly over USB or '
+          'Bluetooth. Stride asks the treadmill what it supports.';
+    }
+    final detail = directDetail;
+    if (detail != null && !directLinked) return detail;
+    if (directLinked) {
+      return 'On, and the treadmill answered. Stride is using the controls it '
+          'said it has.';
+    }
+    return 'On. Stride is looking for the treadmill over USB and Bluetooth.';
+  }
+
+  bool get direct => transport == 'direct';
+
   @override
   Widget build(BuildContext context) {
-    final direct = transport == 'direct';
     return Column(
       crossAxisAlignment: CrossAxisAlignment.start,
       children: [
@@ -421,8 +514,8 @@ class _AdvancedSection extends StatelessWidget {
           _Section(
             title: 'Machine connection',
             subtitle:
-                'Stride talks to the treadmill through iFit, which is the only path that works '
-                'today.',
+                'Stride talks to the treadmill through iFit by default. Direct '
+                'access skips iFit and speaks to the controller itself.',
             child: Container(
               padding: const EdgeInsets.all(StrideSpace.md),
               decoration: BoxDecoration(
@@ -451,23 +544,130 @@ class _AdvancedSection extends StatelessWidget {
                         ),
                         const SizedBox(height: StrideSpace.xxs),
                         Text(
-                          direct
-                              ? 'On. Speed, incline and fan will not respond until you turn this '
-                                    'back off.'
-                              : 'Bypass iFit and drive the controller directly. Unfinished — '
-                                    'nothing is connected behind it yet.',
+                          _summary(),
                           style: Theme.of(context).textTheme.bodyMedium,
                         ),
+                        if (direct && directLinked) ...[
+                          const SizedBox(height: StrideSpace.xs),
+                          _CapabilityList(capabilities: directCapabilities),
+                        ],
                       ],
                     ),
                   ),
-                  Switch(value: direct, onChanged: onTransport),
+                  // Disabled mid-switch. Flipping again while a handshake is
+                  // running would queue a second one behind it, and the rider
+                  // would be told about a link that had already been replaced.
+                  if (switching)
+                    const Padding(
+                      padding: EdgeInsets.symmetric(horizontal: StrideSpace.sm),
+                      child: SizedBox(
+                        width: 20,
+                        height: 20,
+                        child: CircularProgressIndicator(strokeWidth: 2),
+                      ),
+                    )
+                  else
+                    Switch(value: direct, onChanged: onTransport),
                 ],
               ),
             ),
           ),
         ],
       ],
+    );
+  }
+}
+
+/// The machine's own answer about which controls it implements.
+///
+/// Sourced from the supported-register bitmask the treadmill returns during the
+/// direct handshake, so this is reporting what the hardware said rather than
+/// predicting what it will do. Three states, not two: a control the machine did
+/// not list is genuinely absent, but one we could not ask about is unknown, and
+/// showing those the same way is how the previous copy came to be wrong.
+class _CapabilityList extends StatelessWidget {
+  const _CapabilityList({required this.capabilities});
+
+  final Map<String, dynamic>? capabilities;
+
+  @override
+  Widget build(BuildContext context) {
+    final caps = capabilities;
+    if (caps == null) return const SizedBox.shrink();
+    const labels = {'speed': 'Speed', 'incline': 'Incline', 'fan': 'Fan'};
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        for (final entry in labels.entries)
+          _CapabilityRow(
+            label: entry.value,
+            supported: caps[entry.key] as bool?,
+            detail: _range(caps, entry.key),
+          ),
+      ],
+    );
+  }
+
+  /// The range the treadmill reported for this control, or null if it did not.
+  ///
+  /// Shown next to the tick because it is the most convincing evidence a rider
+  /// has that the direct link is genuinely working: these numbers came off the
+  /// machine, and if the framing were wrong they would be nonsense rather than
+  /// a believable "0.5 – 12.0 mph".
+  static String? _range(Map<String, dynamic> caps, String key) {
+    final (lo, hi, unit) = switch (key) {
+      'speed' => (caps['minSpeedMph'], caps['maxSpeedMph'], ' mph'),
+      'incline' => (caps['minIncline'], caps['maxIncline'], '%'),
+      _ => (null, null, ''),
+    };
+    if (lo is! num || hi is! num) return null;
+    return '${lo.toStringAsFixed(1)} – ${hi.toStringAsFixed(1)}$unit';
+  }
+}
+
+class _CapabilityRow extends StatelessWidget {
+  const _CapabilityRow({
+    required this.label,
+    required this.supported,
+    this.detail,
+  });
+
+  final String label;
+  final bool? supported;
+
+  /// The machine's reported range for this control, appended when it gave one.
+  final String? detail;
+
+  @override
+  Widget build(BuildContext context) {
+    final (icon, colour, text) = switch (supported) {
+      true => (Icons.check_circle_outline, StrideColors.accent, 'Available'),
+      false => (
+        Icons.remove_circle_outline,
+        StrideColors.textMuted,
+        'Not on this treadmill',
+      ),
+      // Unknown stays visually distinct from unsupported. The rider should be
+      // able to tell "your machine hasn't got one" from "we couldn't ask".
+      null => (Icons.help_outline, StrideColors.textMuted, 'Unknown'),
+    };
+    // The range only means anything when the control exists, so it is appended
+    // rather than shown on its own line: "Speed — Available (0.5 – 12.0 mph)".
+    final suffix = supported == true && detail != null ? ' ($detail)' : '';
+    return Padding(
+      padding: const EdgeInsets.only(top: StrideSpace.xxs),
+      child: Row(
+        children: [
+          Icon(icon, size: 16, color: colour),
+          const SizedBox(width: StrideSpace.xs),
+          Expanded(
+            child: Text(
+              '$label — $text$suffix',
+              style: Theme.of(context).textTheme.bodySmall,
+            ),
+          ),
+        ],
+      ),
     );
   }
 }

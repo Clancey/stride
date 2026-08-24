@@ -47,6 +47,25 @@
          ways to read it are a Play Store app (which is the broken thing) or root. -->
     <uses-permission android:name="com.google.android.providers.gsf.permission.READ_GSERVICES"/>
 
+    <!-- Direct machine access. Only used when the rider selects the DIRECT transport; the GlassOS
+         path talks to a local socket and needs none of this.
+
+         USB host needs no runtime permission to *enumerate*, but opening a device requires the
+         per-device consent dialog, which UsbSerialTransport requests. The feature is declared
+         required="false" so a console without a host-capable port still installs the app.
+
+         Bluetooth is split by API level. BLUETOOTH/BLUETOOTH_ADMIN are the pre-31 install-time
+         permissions and are capped there; BLUETOOTH_CONNECT is the API 31+ runtime replacement.
+         neverForLocation is accurate and not a convenience: this scans for one known treadmill
+         service UUID and has no business inferring where the rider is. -->
+    <uses-feature android:name="android.hardware.usb.host" android:required="false"/>
+    <uses-permission android:name="android.permission.BLUETOOTH" android:maxSdkVersion="30"/>
+    <uses-permission android:name="android.permission.BLUETOOTH_ADMIN" android:maxSdkVersion="30"/>
+    <uses-permission android:name="android.permission.BLUETOOTH_CONNECT"/>
+    <uses-permission android:name="android.permission.BLUETOOTH_SCAN"
+        android:usesPermissionFlags="neverForLocation"/>
+    <uses-feature android:name="android.hardware.bluetooth_le" android:required="false"/>
+
     <!-- S4 app enumeration under targetSdk 30+ package-visibility filtering.
          This <queries> block restores visibility of exactly the things the launcher legitimately
          resolves: MAIN/LAUNCHER + MAIN/LEANBACK_LAUNCHER (the app grid, incl. TV-only apps),

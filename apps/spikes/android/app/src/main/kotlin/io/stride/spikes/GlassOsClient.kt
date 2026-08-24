@@ -101,6 +101,16 @@ class GlassOsClient(private val context: Context) {
         framed: ByteArray,
         readTimeoutSeconds: Long = 0,
     ): ByteArray? {
+        // Checked on every single call, not merely at construction, and this is the mechanism that
+        // makes "direct sends nothing to GlassOS" true rather than merely likely.
+        //
+        // Dropping the reference in MachineLink is not enough on its own. A handshake or command
+        // already in flight has its own reference on its own thread, captured before the rider
+        // switched, and it will happily finish the call it started — putting a Connect on the
+        // GlassOS socket moments after the rider asked for the machine to be driven directly.
+        // Narrowing that window with a re-check would leave a smaller window. Closing the client
+        // removes it: every captured reference becomes inert at the instant of the switch.
+        if (closed) return null
         val base = ensureClient() ?: return null
         // Reads keep the short default so a stalled console degrades to "no reading" instead of
         // freezing the overlay. Commands need longer: StartNewWorkout spins the machine up and
@@ -143,6 +153,19 @@ class GlassOsClient(private val context: Context) {
     }
 
     /** Perform a unary call with an empty request. Returns null on any failure. */
+    /**
+     * Make this client refuse all further traffic, permanently.
+     *
+     * One-way on purpose: a closed client is never reopened, it is replaced. Reopening would mean a
+     * reference captured before a switch could come back to life after a second switch, which is
+     * precisely the class of bug this exists to remove.
+     */
+    fun close() {
+        closed = true
+    }
+
+    @Volatile private var closed = false
+
     private fun call(service: String, method: String): GlassOsWire.Fields? =
         callRaw(service, method)?.let { GlassOsWire.parse(it) }
 
@@ -281,6 +304,13 @@ class GlassOsClient(private val context: Context) {
         val speedWritable: Boolean?,
         val inclineWritable: Boolean?,
         val fanWritable: Boolean?,
+        /**
+         * Fan level, 0..[MachineLink.FAN_MAX], or null when unknown.
+         *
+         * Defaulted so the GlassOS path — which does not read the fan — keeps saying "unknown"
+         * rather than inventing a zero. The direct path fills it in from `FAN_STATE`.
+         */
+        val fanLevel: Int? = null,
     )
 
     /**
@@ -394,9 +424,40 @@ class GlassOsClient(private val context: Context) {
             else -> null
         }
 
-        /** True when the machine is in a state where the belt may be under power. */
-        fun beltMayBeMoving(name: String?): Boolean =
-            name == "WORKOUT" || name == "WARM_UP" || name == "COOL_DOWN" || name == "RESUME"
+        /**
+         * The number for a name produced by [name], or null if it is not one of ours.
+         *
+         * The inverse of [name], derived from it rather than written out a second time, so the two
+         * cannot drift apart. The direct path needs it: FitPro reports a workout mode, Stride
+         * translates that to a console-state *name*, and callers that compare numbers — including
+         * [MachineLink.connectNow]'s DISCONNECTED test — need the number that name stands for.
+         */
+        fun code(name: String): Int? = (0..13).firstOrNull { name(it) == name }
+
+        /**
+         * True when the machine is in a state where the belt may be under power.
+         *
+         * Null when the console state is unknown — either it never reported one or it reported a
+         * value this build does not recognise. That is deliberately *not* folded into `false`: this
+         * predicate exists to decide whether motion is possible, and answering "no" for a state we
+         * cannot read is the one wrong answer that matters. Callers already treat null as "assume
+         * it might be", and `== true` is the idiom for "definitely moving".
+         */
+        fun beltMayBeMoving(name: String?): Boolean? = when (name) {
+            "WORKOUT", "WARM_UP", "COOL_DOWN", "RESUME" -> true
+            "IDLE", "PAUSED", "WORKOUT_RESULTS", "SAFETY_KEY_REMOVED", "LOCKED", "SLEEP" -> false
+            // DISCONNECTED is false, and it is the one entry on that line worth arguing about. It is
+            // not "I do not know what I am doing" — it is "there is no treadmill attached to me",
+            // which is a definite statement, and a console with nothing attached is not running a
+            // workout for us to worry about. It is grouped here rather than with the nulls below
+            // because the nulls mean "cannot say", and this one says.
+            DISCONNECTED_NAME -> false
+            // CONSOLE_STATE_UNKNOWN, DEMO, ERROR and anything unrecognised fall through to null on
+            // purpose. A demo routine can drive the belt, an errored console has not told us what it
+            // is doing, and a state this build does not know is by definition not one it can rule
+            // motion out from.
+            else -> null
+        }
     }
 
     /**
@@ -406,6 +467,17 @@ class GlassOsClient(private val context: Context) {
      * eleven types (resistance, gear, watts, …) belong to bikes and rowers and are ignored rather
      * than coerced — a resistance level is not a treadmill speed, and forcing it into one would
      * invent buttons the machine never offered.
+     */
+    /**
+     * `Control.type`, from the gRPC enum `pb.e` in GlassOS. VERIFIED.
+     *
+     * **There is a second, differently numbered ControlType in the same APK** — the Kotlin SDK's
+     * `IFitControlType` (`vf/a`), whose order is `unknown, gear, incline, mps, …`, making incline 2
+     * and mps 3. That one is an internal SDK type and is *not* what crosses the wire. The wire enum
+     * is the protobuf one below, reached from `Control.type_` via `pb.e.b(int)`.
+     *
+     * Reconciling these two the wrong way would not fail: it would silently filter the speed presets
+     * out of the incline rail and vice versa.
      */
     object ControlType {
         const val UNKNOWN = 0

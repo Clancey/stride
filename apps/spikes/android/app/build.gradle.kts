@@ -114,6 +114,15 @@ android {
         checkReleaseBuilds = true
         textReport = true
     }
+
+    testOptions {
+        // android.util.Log is a stub that throws in unit tests, and this code logs on exactly the
+        // paths worth testing — the fan register discovery, the resume fallback, the handshake. A
+        // throwing Log turns those into untestable branches, and worse, `setFanState` wraps its
+        // call in runCatching, so the exception surfaced as a wrong return value rather than an
+        // error. Returning defaults makes the logging invisible to tests instead of fatal.
+        unitTests.isReturnDefaultValues = true
+    }
 }
 
 kotlin {

@@ -19,32 +19,18 @@ import android.util.Log
  *
  * Every call blocks. Callers must be off the main thread.
  */
-class GlassOsCommands(private val client: GlassOsClient) {
+class GlassOsCommands(private val client: GlassOsClient) : MachineCommands {
 
-    /**
-     * What the machine said. Distinct from "the belt is now doing what you asked" — that is only
-     * knowable from telemetry, which is why [MachineCoordinator] confirms a stop by watching speed
-     * rather than by trusting [Ack.Ok].
-     */
-    sealed interface Ack {
-        /** The machine accepted the command. */
-        data object Ok : Ack
-
-        /** The machine answered and refused. [detail] is its error field, when it gave one. */
-        data class Refused(val detail: String) : Ack
-
-        /** No usable answer: transport failure, timeout, or an unparseable reply. */
-        data class NoAnswer(val reason: String) : Ack
-    }
+    override val transportName: String get() = "iFit (GlassOS)"
 
     // ------------------------------------------------------------- setpoints
 
     /** Set the belt speed in km/h. [kph] is sent as given; clamping belongs to the coordinator. */
-    fun setSpeedKph(kph: Double): Ack =
+    override fun setSpeedKph(kph: Double): MachineAck =
         command("SpeedService", "SetSpeed", GlassOsWire.encodeDouble(1, kph))
 
     /** Set the incline in percent. */
-    fun setInclinePercent(percent: Double): Ack =
+    override fun setInclinePercent(percent: Double): MachineAck =
         command("InclineService", "SetIncline", GlassOsWire.encodeDouble(1, percent))
 
     // ------------------------------------------------------------- lifecycle
@@ -60,19 +46,19 @@ class GlassOsCommands(private val client: GlassOsClient) {
      * `0a 02 10 01` — field 1 holding `WorkoutResult{success:true}` — and was reported to the rider
      * as a refusal while the belt was in fact starting.
      */
-    fun startWorkout(): Ack {
+    override fun startWorkout(): MachineAck {
         val raw = client.postRaw("WorkoutService", "StartNewWorkout", GlassOsWire.EMPTY_FRAME, COMMAND_TIMEOUT_S)
-            ?: return Ack.NoAnswer("WorkoutService/StartNewWorkout: no reply")
+            ?: return MachineAck.NoAnswer("WorkoutService/StartNewWorkout: no reply")
         val result = GlassOsWire.parse(raw).message(1)
-            ?: return Ack.Ok
+            ?: return MachineAck.Ok
         return interpretWorkoutResult("WorkoutService", "StartNewWorkout", result, raw)
     }
 
-    fun pause(): Ack = command("WorkoutService", "Pause", ByteArray(0))
+    override fun pause(): MachineAck = command("WorkoutService", "Pause", ByteArray(0))
 
-    fun resume(): Ack = command("WorkoutService", "Resume", ByteArray(0))
+    override fun resume(): MachineAck = command("WorkoutService", "Resume", ByteArray(0))
 
-    fun stop(): Ack = command("WorkoutService", "Stop", ByteArray(0))
+    override fun stop(): MachineAck = command("WorkoutService", "Stop", ByteArray(0))
 
     // ---------------------------------------------------------- capabilities
 
@@ -90,7 +76,7 @@ class GlassOsCommands(private val client: GlassOsClient) {
     fun canWriteFan(): Boolean? = availability("FanStateService")
 
     /** Whether this machine can match fan speed to effort by itself. */
-    fun autoFanSupported(): Boolean? =
+    override fun autoFanSupported(): Boolean? =
         client.postRaw("FanStateService", "IsAutoFanStateSupported", GlassOsWire.EMPTY_FRAME)
             ?.let { GlassOsWire.parse(it).bool(1) }
 
@@ -99,7 +85,7 @@ class GlassOsCommands(private val client: GlassOsClient) {
             ?.let { GlassOsWire.parse(it).enum(1) }
 
     /** Set the console fan. Comfort, not motion — but it still goes through the coordinator's queue. */
-    fun setFanState(state: Int): Ack =
+    override fun setFanState(state: Int): MachineAck =
         acknowledged("FanStateService", "SetFanState", GlassOsWire.encodeVarintField(1, state))
 
     /**
@@ -109,10 +95,10 @@ class GlassOsCommands(private val client: GlassOsClient) {
      * acknowledgement. Running these through the `WorkoutResult` reader would work by accident
      * today and break the moment that reader gets stricter about empty messages.
      */
-    private fun acknowledged(service: String, method: String, message: ByteArray): Ack {
+    private fun acknowledged(service: String, method: String, message: ByteArray): MachineAck {
         client.postRaw(service, method, GlassOsWire.frame(message), COMMAND_TIMEOUT_S)
-            ?: return Ack.NoAnswer("$service/$method: no reply")
-        return Ack.Ok
+            ?: return MachineAck.NoAnswer("$service/$method: no reply")
+        return MachineAck.Ok
     }
 
     private fun availability(service: String): Boolean? =
@@ -127,9 +113,9 @@ class GlassOsCommands(private val client: GlassOsClient) {
      * these RPCs legitimately return on success. Treating an empty reply as failure would make
      * every successful stop look like a refusal, so absence is only an error when field 1 is there.
      */
-    private fun command(service: String, method: String, message: ByteArray): Ack {
+    private fun command(service: String, method: String, message: ByteArray): MachineAck {
         val raw = client.postRaw(service, method, GlassOsWire.frame(message), COMMAND_TIMEOUT_S)
-            ?: return Ack.NoAnswer("$service/$method: no reply")
+            ?: return MachineAck.NoAnswer("$service/$method: no reply")
         return interpretWorkoutResult(service, method, GlassOsWire.parse(raw), raw)
     }
 
@@ -139,16 +125,18 @@ class GlassOsCommands(private val client: GlassOsClient) {
         method: String,
         result: GlassOsWire.Fields,
         raw: ByteArray,
-    ): Ack {
-        result.bool(2)?.let { return if (it) Ack.Ok else Ack.Refused("$service/$method: success=false") }
+    ): MachineAck {
+        result.bool(2)?.let {
+            return if (it) MachineAck.Ok else MachineAck.Refused("$service/$method: success=false")
+        }
         if (result.hasField(1)) {
             // The decoded detail is best-effort, so the raw reply is logged alongside it. A
             // refusal we cannot explain is a refusal we cannot fix, and this is the only place the
             // bytes still exist.
             Log.w(TAG, "$service/$method refused, raw=${raw.joinToString(" ") { b -> "%02x".format(b) }}")
-            return Ack.Refused("$service/$method: ${result.errorDetail()}")
+            return MachineAck.Refused("$service/$method: ${result.errorDetail()}")
         }
-        return Ack.Ok
+        return MachineAck.Ok
     }
 
     /**
@@ -169,7 +157,7 @@ class GlassOsCommands(private val client: GlassOsClient) {
      * Returns the `ConsoleState` from the reply, or null if the call itself failed. Safe to call
      * repeatedly: an already-connected console just answers with its current state.
      */
-    fun connect(): Int? =
+    override fun connect(): Int? =
         client.postRaw("ConsoleService", "Connect", GlassOsWire.EMPTY_FRAME, COMMAND_TIMEOUT_S)
             ?.let { raw ->
                 val fields = GlassOsWire.parse(raw)
@@ -184,7 +172,32 @@ class GlassOsCommands(private val client: GlassOsClient) {
      * command was refused: `StartNewWorkout` is only valid from some states, and knowing which one
      * the machine is actually in turns "refused" into something a rider can act on.
      */
-    fun workoutState(): Int? =
+    /**
+     * The speed quick-picks the console publishes, converted to mph.
+     *
+     * Null on transport failure so the caller retries; an empty list is a real answer meaning this
+     * machine publishes none. `ControlType.MPS` filters out entries of other kinds that share the
+     * list — the console mixes them.
+     */
+    override fun speedPresetsMph(): List<Double>? =
+        client.controls("SpeedService")
+            ?.let { shapePresets(it, GlassOsClient.ControlType.MPS) { v -> v * MachineLink.MPS_TO_MPH } }
+
+    override fun inclinePresets(): List<Double>? =
+        client.controls("InclineService")
+            ?.let { shapePresets(it, GlassOsClient.ControlType.INCLINE) { v -> v } }
+
+    /**
+     * Always null: GlassOS has no call that reports the machine's own range.
+     *
+     * Not an omission to be fixed later by guessing from the preset list. The presets are the
+     * buttons the console chose to show, not the limits it will accept, and treating the largest
+     * button as a ceiling would silently narrow what a rider can ask for. Null here means Stride's
+     * own fixed ceiling stands alone, which is the honest answer.
+     */
+    override fun limits(): MachineLimits? = null
+
+    override fun workoutState(): Int? =
         client.postRaw("WorkoutService", "GetWorkoutState", GlassOsWire.EMPTY_FRAME)
             ?.let { GlassOsWire.parse(it).enum(1) }
 

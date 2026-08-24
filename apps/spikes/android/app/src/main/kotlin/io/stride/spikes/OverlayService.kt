@@ -373,6 +373,9 @@ class OverlayService : Service() {
     private var topMetricsView: View? = null
     private var leftInclineView: View? = null
     private var rightSpeedView: View? = null
+    /** Which [MachineLink.presetsGeneration] the rails on screen were built from. */
+    private var appliedPresetsGeneration: Int = -1
+
     private var inclineRail: RailBinding? = null
     private var speedRail: RailBinding? = null
     private var bottomBarView: View? = null
@@ -476,6 +479,17 @@ class OverlayService : Service() {
     }
 
     private fun updateMachineMetrics() {
+        // The rails are built before any machine has been asked what it offers, so the first build
+        // always uses the fallback ladder. When the real answer lands the pills themselves have to
+        // change — not just their highlight — and that means adding and removing views, which only
+        // a rebuild does. Gated on the generation so this happens once or twice a session rather
+        // than every tick; we are on the main handler here, so a rebuild is safe.
+        val presets = MachineLink.presetsGeneration.get()
+        if (presets != appliedPresetsGeneration) {
+            appliedPresetsGeneration = presets
+            rebuildChromeViews()
+            return
+        }
         syncRailHighlights()
         machineCells.forEach { entry ->
             val view = entry.root.findViewWithTag<TextView>("value") ?: return@forEach
@@ -1618,14 +1632,32 @@ class OverlayService : Service() {
     }
 
     /**
-     * Preset columns come from the machine when it has told us what it supports
-     * (SpeedService/GetControls and InclineService/GetControls), and fall back to the
-     * documented range for this equipment class only until that read lands.
+     * Format a preset for a pill.
+     *
+     * Not [roundToInt]: the direct path builds its ladder from the machine's own `MIN_KPH`/`MAX_KPH`
+     * and `MIN_GRADE`/`MAX_GRADE`, which on plenty of treadmills step in halves. Rounding turned
+     * 0.5 and 1.0 into two pills both reading "1" — two buttons, same label, different commands.
+     * Whole numbers still render without a trailing ".0".
+     */
+    private fun formatPreset(value: Double): String =
+        if (value == value.roundToInt().toDouble()) value.roundToInt().toString() else "%.1f".format(value)
+
+    /**
+     * Preset columns come from the machine when it has told us what it supports — GlassOS answers
+     * from its published control list, the direct path from the machine's own limit registers.
+     *
+     * The fallback ladder is used only until that answer lands, and is intersected with whatever
+     * limits we do know: offering a 12% incline on a machine that tops out at 10% is a button that
+     * can only be refused, and on the direct path we usually know the real ceiling from the probe
+     * before the preset read completes.
      */
     private fun addInclineRail() {
+        val limits = MachineCoordinator.machineLimits
         val presets = MachineLink.inclinePresets
-            ?.map { it.roundToInt().toString() }
-            ?: listOf("12", "10", "8", "6", "5", "4", "3", "2", "1", "0", "-1", "-2", "-3")
+            ?.map(::formatPreset)
+            ?: listOf(12.0, 10.0, 8.0, 6.0, 5.0, 4.0, 3.0, 2.0, 1.0, 0.0, -1.0, -2.0, -3.0)
+                .filter { limits == null || (it <= limits.maxInclinePercent && it >= limits.minInclinePercent) }
+                .map(::formatPreset)
         val binding = addRail(
             accent = amber,
             entries = presets,
@@ -1645,9 +1677,12 @@ class OverlayService : Service() {
     }
 
     private fun addSpeedRail() {
+        val limits = MachineCoordinator.machineLimits
         val presets = MachineLink.speedPresets
-            ?.map { it.roundToInt().toString() }
-            ?: listOf("12", "10", "9", "8", "7", "6", "5", "4", "3", "2", "1")
+            ?.map(::formatPreset)
+            ?: listOf(12.0, 10.0, 9.0, 8.0, 7.0, 6.0, 5.0, 4.0, 3.0, 2.0, 1.0)
+                .filter { limits == null || (it <= limits.maxSpeedMph && it >= limits.minSpeedMph) }
+                .map(::formatPreset)
         val binding = addRail(
             accent = cyan,
             entries = presets,
