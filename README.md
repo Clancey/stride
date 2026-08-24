@@ -57,6 +57,9 @@ operate.
 | [`docs/SPIKES.md`](docs/SPIKES.md) | The Phase 0 checklist, filled in on the hardware. |
 | [`docs/APPSTORE.md`](docs/APPSTORE.md) | How Stride and third-party apps get updated on a console with no Play Store. |
 | [`CHANGELOG.md`](CHANGELOG.md) | Every released version. Generated from tags by `tools/changelog.sh` (see APPSTORE §12). |
+| [`CONTRIBUTING.md`](CONTRIBUTING.md) | How to build and test, the safety invariants, and why you must not paste GPL code. |
+| [`SECURITY.md`](SECURITY.md) | Reporting safety and security defects privately, and what is deliberately out of scope. |
+| [`NOTICE`](NOTICE) | Third-party material carried here, and the prior art it is checked against. |
 
 Updates are served from a separate public repo — **[`Clancey/stride-catalog`](https://github.com/Clancey/stride-catalog)** —
 which holds the APKs and the catalog JSON and is read directly as raw files. Its README is the
@@ -153,13 +156,27 @@ answers **nothing** about GlassOS, certificates, the motor, or the safety key.
 
 ## Credentials
 
-**Stride ships no certificates and never will.**
+**Stride bundles the GlassOS client credentials, deliberately.**
 
-The GlassOS service on the console requires mutual TLS. Those credentials live inside the console's
-own iFit package, and Stride extracts them on-device, at your explicit request, into app-private
-storage. They are never bundled into a build, never written to `/sdcard`, and never logged. See
-`docs/PLAN.md` §2.2 for why this design is correct regardless of whether the credentials turn out
-to be per-device or shared, and §9 for the risks that this reduces but does not eliminate.
+The GlassOS service on the console requires mutual TLS. That credential set is not a per-device
+identity: the CA is `CN=testca` carrying OpenSSL's stock defaults, and the client is
+`CN=com.ifit.eriador`. It is one fixed keypair, generated once by iFit and shipped to every console
+of this generation. It unlocks a **loopback-only** service (`127.0.0.1:54321`) on a treadmill you
+already own, grants access to no remote account, and already ships inside several publicly
+distributed apps.
+
+Earlier revisions extracted it on-device instead. That rule was dropped because it was ceremony to
+arrive at a constant, and because it blocked the point of the project: release builds are not
+debuggable, so a tester had no route to get credentials onto their own console. The three PEMs now
+ship in `assets/glassos/` and are committed here on purpose — see the exception at the end of
+`.gitignore`.
+
+A console with its own credentials still wins: `filesDir/glassos/` is read first, and a complete
+set there overrides the bundle. The two sources are never mixed. Builds with the assets stripped
+are a supported configuration and simply stay disconnected.
+
+See `docs/PLAN.md` §2.2 for the full reasoning and §9 for the risk this reduces but does not
+eliminate.
 
 ---
 
@@ -183,14 +200,17 @@ navigation, profiles, and the companion HealthKit story — none of which those 
 
 ## Licensing
 
-Split deliberately, because one license does not fit the whole repository
-(`docs/PLAN.md` §2.3):
+**[Apache-2.0](LICENSE)** across the whole repository.
 
-| Component | License |
-|---|---|
-| Launcher, overlay, device drivers, GlassOS client | **GPL-3.0** ([`LICENSE`](LICENSE)) |
-| Sync protocol and companion apps | **Apache-2.0** ([`LICENSE-APACHE`](LICENSE-APACHE)) |
+Earlier revisions split the tree — GPL-3.0 for the launcher and drivers, Apache-2.0 for the
+protocol and companion apps — to hedge against derivative-work risk from reading GPL-3 prior art.
+That hedge proved unnecessary. No third-party source is vendored anywhere in this repo: the
+protocol definitions were extracted from the console's own firmware rather than copied from anyone
+else's repository (`protocol/glassos/README.md`), and the device drivers were written from the
+Bluetooth SIG specification — cross-checked against prior art, not derived from it.
 
-The two halves communicate over a documented network protocol rather than a linked library. That
-process boundary is what keeps the iOS companion distributable through the App Store, which GPL-3
-would otherwise make impractical.
+One permissive license also does the other half of the split's job, keeping the companion app
+distributable through the App Store.
+
+Third-party material carried in this repository, and the prior art it is checked against, are
+itemised in [`NOTICE`](NOTICE).

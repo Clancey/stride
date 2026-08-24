@@ -10,14 +10,14 @@ This is the "emulator-first" tool from `docs/PLAN.md` section 7.
 
 ## The schema is a labelled guess, not the real protocol
 
-We do **not** know the real GlassOS protobuf schema. The published `.proto` files
-live in a GPL-3 repo we are deliberately not copying, and the true field numbers
-can only be confirmed by running `apps/spikes/android/app/src/main/kotlin/io/stride/spikes/GlassOsClient.kt` against real
-hardware. So this mock defines its own *plausible* schema in
-`lib/src/messages.dart` and hand-encodes it with a tiny wire-format codec
-(`lib/src/proto_codec.dart`) that is the inverse of the client's schema-free
-decoder. When real field numbers arrive, `lib/src/messages.dart` is the only file
-that should need to change.
+This mock defines its own *plausible* schema in `lib/src/messages.dart` and
+hand-encodes it with a tiny wire-format codec (`lib/src/proto_codec.dart`) that is
+the inverse of the client's schema-free decoder.
+
+The real definitions **are** in this repo now, under `protocol/glassos/`,
+extracted verbatim from the console's firmware. This mock has not been
+regenerated against them, so its field numbers remain a guess. When it is
+reconciled, `lib/src/messages.dart` is the only file that should need to change.
 
 Method paths served (documented GlassOS surface):
 
@@ -51,10 +51,11 @@ cryptic verification error.
 
 ## 2. Run the server
 
-Uses the repo's Flutter-bundled Dart:
+Needs a Dart SDK on `PATH` — either standalone, or the one bundled with Flutter
+at `<flutter>/bin/dart`:
 
 ```
-/Users/clancey/Projects/flutter/bin/dart run bin/glassos_mock.dart
+dart run bin/glassos_mock.dart
 ```
 
 Flags:
@@ -137,8 +138,8 @@ GLASSOS_DROP_ACKS=1 dart run bin/glassos_mock.dart --no-repl
 ## 5. Tests
 
 ```
-/Users/clancey/Projects/flutter/bin/dart analyze
-/Users/clancey/Projects/flutter/bin/dart test
+dart analyze
+dart test
 ```
 
 `test/smoke_test.dart` starts the server in-process over real mTLS and makes
