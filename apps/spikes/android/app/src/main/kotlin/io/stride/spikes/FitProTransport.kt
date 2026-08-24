@@ -244,6 +244,21 @@ class UsbSerialTransport private constructor(
     }
 
     @Synchronized
+    /**
+     * ## A known limitation, written down rather than left to be discovered
+     *
+     * `claimInterface(iface, force = true)` asks the kernel to detach whatever driver holds the
+     * interface, which on a HID-class board is `usbhid`. Android implements that with
+     * `USBDEVFS_DISCONNECT`, and neither `releaseInterface` nor `close` issues the matching
+     * `USBDEVFS_CONNECT` — so the kernel driver stays detached after Stride lets go.
+     *
+     * That is very likely harmless here: iFit drives this board through its own USB code rather than
+     * through `usbhid`, and Stride's reason for touching it at all is that iFit is not running. But
+     * it is unverified on hardware, and the only real fix if a console did depend on the kernel
+     * driver is a native `USBDEVFS_CONNECT` helper — a much larger change than a suspicion warrants.
+     * Recorded so that "iFit stopped working after I tried direct access" is recognised straight
+     * away instead of investigated from nothing.
+     */
     override fun close() {
         if (closed) return
         closed = true
@@ -270,22 +285,48 @@ class UsbSerialTransport private constructor(
             type == UsbConstants.USB_ENDPOINT_XFER_BULK ||
                 type == UsbConstants.USB_ENDPOINT_XFER_INT
 
-        /** A short description of a device's usable pipes, or null when it has none. */
+        /**
+         * Set when the last open failed at [android.hardware.usb.UsbDeviceConnection.claimInterface].
+         *
+         * Reported rather than only logged, because a rider cannot read logcat and this failure
+         * looks exactly like every other one from the outside: device present, permission granted,
+         * pipes correct, still no connection.
+         */
+        @Volatile private var claimFailed = false
+
+        /** The read and write pipes of the interface [open] would choose, or null if there is none. */
+        internal fun dataInterface(device: UsbDevice): Triple<UsbInterface, UsbEndpoint, UsbEndpoint>? {
+            for (index in 0 until device.interfaceCount) {
+                val candidate = device.getInterface(index)
+                val usable = (0 until candidate.endpointCount)
+                    .map { candidate.getEndpoint(it) }
+                    .filter { it.isBulkOrInterrupt }
+                val read = usable.firstOrNull { it.direction == UsbConstants.USB_DIR_IN }
+                val write = usable.firstOrNull { it.direction == UsbConstants.USB_DIR_OUT }
+                if (read != null && write != null) return Triple(candidate, read, write)
+            }
+            return null
+        }
+
+        /**
+         * A short description of the pipes [open] would actually use, or null when there are none.
+         *
+         * Deliberately built from [dataInterface] rather than from every endpoint on the device.
+         * Listing pipes that `open` would never select is how a diagnostic ends up describing a
+         * console as perfectly fine while the code refuses it — which is the exact failure mode this
+         * whole line of reporting exists to prevent.
+         */
         private fun usableEndpoints(device: UsbDevice): String? {
-            val described = (0 until device.interfaceCount)
-                .map { device.getInterface(it) }
-                .flatMap { iface -> (0 until iface.endpointCount).map { iface.getEndpoint(it) } }
-                .filter { it.isBulkOrInterrupt }
-                .map { endpoint ->
-                    val kind = if (endpoint.type == UsbConstants.USB_ENDPOINT_XFER_INT) {
-                        "interrupt"
-                    } else {
-                        "bulk"
-                    }
-                    val way = if (endpoint.direction == UsbConstants.USB_DIR_IN) "in" else "out"
-                    "$kind $way"
+            val (_, read, write) = dataInterface(device) ?: return null
+            return listOf(read, write).joinToString(", ") { endpoint ->
+                val kind = if (endpoint.type == UsbConstants.USB_ENDPOINT_XFER_INT) {
+                    "interrupt"
+                } else {
+                    "bulk"
                 }
-            return described.takeIf { it.isNotEmpty() }?.joinToString(", ")
+                val way = if (endpoint.direction == UsbConstants.USB_DIR_IN) "in" else "out"
+                "$kind $way"
+            }
         }
 
         /** One request message, padded. See [FitProCodec.chunkMessages]. */
@@ -372,10 +413,14 @@ class UsbSerialTransport private constructor(
                 // stops before the endpoints cannot tell a board Stride can drive from one it is
                 // about to reject.
                 val pipes = usableEndpoints(console)
-                val suffix = if (pipes == null) {
-                    " Stride found no usable data pipe on it, so it cannot be opened."
-                } else {
-                    " Data pipes: $pipes."
+                val suffix = when {
+                    pipes == null ->
+                        " Stride found no interface on it with a usable pipe each way, so it " +
+                            "cannot be opened."
+                    claimFailed ->
+                        " Data pipes: $pipes, but Android would not let Stride claim the " +
+                            "interface — something else on the console may still hold it."
+                    else -> " Data pipes: $pipes."
                 }
                 return if (granted) {
                     "An iFit ${variant?.name} console is on USB and Stride may use it.$suffix"
@@ -430,34 +475,37 @@ class UsbSerialTransport private constructor(
             // `USBDEVFS_BULK` ioctl, which the kernel accepts for both bulk and interrupt endpoints —
             // this is the same trick vendor-HID "generic report pipe" USB devices are commonly driven
             // with elsewhere, not something specific to this console.
-            val iface = (0 until device.interfaceCount)
-                .map { device.getInterface(it) }
-                .firstOrNull { candidate ->
-                    // One usable pipe each way, rather than any two usable pipes. An interface
-                    // offering two INs and no OUT satisfies a count of two and then fails the
-                    // direction lookups below, and because the search has already committed to it
-                    // there is no second candidate considered — a console whose data interface is
-                    // not its first would be unreachable for a reason nothing logs.
-                    val usable = (0 until candidate.endpointCount)
-                        .map { candidate.getEndpoint(it) }
-                        .filter { it.isBulkOrInterrupt }
-                    usable.any { it.direction == UsbConstants.USB_DIR_IN } &&
-                        usable.any { it.direction == UsbConstants.USB_DIR_OUT }
-                } ?: return null
-
-            val endpoints = (0 until iface.endpointCount).map { iface.getEndpoint(it) }
-            val read = endpoints.firstOrNull {
-                it.isBulkOrInterrupt && it.direction == UsbConstants.USB_DIR_IN
-            } ?: return null
-            val write = endpoints.firstOrNull {
-                it.isBulkOrInterrupt && it.direction == UsbConstants.USB_DIR_OUT
-            } ?: return null
+            // One usable pipe each way, from [dataInterface] — the same function the diagnostics
+            // describe, so what the settings screen reports is by construction what `open` would
+            // choose rather than a second implementation that can drift away from it.
+            val selected = dataInterface(device)
+            if (selected == null) {
+                Log.w(
+                    FitProTransport.TAG,
+                    "usb: ${device.deviceName} has no interface with a usable pipe each way",
+                )
+                return null
+            }
+            val (iface, read, write) = selected
 
             val connection = manager.openDevice(device) ?: return null
             if (!connection.claimInterface(iface, true)) {
+                // Worth its own line. `force = true` asks the kernel to detach whatever driver holds
+                // the interface — `usbhid` on a HID-class board — and that is best-effort rather
+                // than guaranteed on an OEM kernel. Without this the failure was indistinguishable
+                // from every other null return, so a console that was present, permitted and had
+                // exactly the right pipes would still report "no direct connection" with nothing to
+                // say which of the two had happened.
+                Log.w(
+                    FitProTransport.TAG,
+                    "usb: could not claim interface on ${device.deviceName}; " +
+                        "another driver may still hold it",
+                )
+                claimFailed = true
                 connection.close()
                 return null
             }
+            claimFailed = false
             Log.i(FitProTransport.TAG, "usb open: ${device.deviceName} as $variant")
             return UsbSerialTransport(manager, device, connection, iface, read, write, variant)
         }
