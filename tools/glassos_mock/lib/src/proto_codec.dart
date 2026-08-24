@@ -1,9 +1,9 @@
 /// Minimal protobuf wire-format encoder and decoder.
 ///
-/// We deliberately do NOT use generated protobuf stubs. The real GlassOS schema
-/// is unknown (its `.proto` files live in a GPL-3 repo we are not copying, and
-/// the true field numbers can only be confirmed by running the probe on real
-/// hardware). So the mock hand-encodes messages with this tiny codec.
+/// We deliberately do NOT use generated protobuf stubs. The mock's schema
+/// (`lib/src/messages.dart`) is still a guess rather than a reconciliation of the
+/// real definitions now in `protocol/glassos/`, so hand-encoding with this tiny
+/// codec keeps the mock independent of any generated code.
 ///
 /// The wire format is self-describing: every field is `(field_number << 3) |
 /// wire_type` followed by the payload. That is exactly what the generic decoder

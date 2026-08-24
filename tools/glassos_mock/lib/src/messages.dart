@@ -1,18 +1,18 @@
 /// PLAUSIBLE, NOT MEASURED, GlassOS message schema.
 ///
 /// ================== READ THIS BEFORE TRUSTING ANY FIELD NUMBER ==================
-/// None of the field numbers below are confirmed against real hardware. The real
-/// GlassOS `.proto` files are published in a GPL-3 repo we are deliberately not
-/// copying, and the only honest way to learn the true field numbers is to run
-/// apps/spikes/android/app/src/main/kotlin/io/stride/spikes/GlassOsClient.kt against an actual console and read the wire
-/// dump (see docs/PLAN.md section 2.2 and section 7).
+/// None of the field numbers below are confirmed. This file predates the
+/// extraction of the real definitions and has not been reconciled with them.
 ///
-/// So this file is a self-consistent GUESS chosen to be:
+/// The authoritative schema now lives in `protocol/glassos/`, pulled verbatim
+/// from GlassOS 6.14.6 off a real console (see `protocol/glassos/README.md`).
+/// Until this file is regenerated from those definitions, everything below is a
+/// self-consistent GUESS chosen to be:
 ///   - shaped like the documented messages (ConsoleInfo, SpeedService, etc.),
 ///   - decodable by the schema-free client,
-///   - and isolated: when the real schema arrives, THIS FILE is the only thing
-///     that should need to change. The server, physics, and fault code below all
-///     go through these classes.
+///   - and isolated: THIS FILE is the only thing that should need to change when
+///     the mock is reconciled. The server, physics, and fault code below all go
+///     through these classes.
 ///
 /// Field numbers start at 1 and ascend in declaration order, which is the most
 /// common protoc authoring pattern, but that is an assumption too.

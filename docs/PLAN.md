@@ -223,30 +223,39 @@ part is unverified. Downgraded to a Phase 0 question (S7). It also matters much 
 proves the direct gRPC path works. If needed, the real alternatives are: fork the sidecar to expose
 localhost IPC, run it on a separate device, or — the primary plan — own the GlassOS client directly.
 
-### 2.3 Licensing — and why one license doesn't fit the whole repo
+### 2.3 Licensing — one permissive license, repo-wide
 
-qdomyos-zwift, NordicFTMS, and tHUD are **all GPL-3**.
+**Resolved: Apache-2.0 across the entire repository.** Revisions 1–3 proposed a split — GPL-3 for
+the launcher and drivers, permissive for the protocol and companion. That split has been dropped.
 
+The reasoning that produced it still stands as a description of the *risk*:
+
+- qdomyos-zwift, NordicFTMS, and tHUD are **all GPL-3**.
 - Protocol *knowledge* (GATT UUIDs, JSON keys, byte layouts) is not copyrightable.
-- Reading their C++/Java and writing Dart is a derivative-work grey zone.
+- Reading their C++/Java and writing Kotlin/Dart is a derivative-work grey zone.
 - **The `.proto` files in the NordicFTMS repo are a sharper case.** They describe an interface, but
-  they are also concrete files under GPL-3. Safest path: generate Dart stubs from protos we obtain
-  ourselves from the iFit APK, and treat NordicFTMS's copies as documentation for cross-checking.
+  they are also concrete files under GPL-3. Safest path: obtain protos ourselves from the iFit APK,
+  and treat NordicFTMS's copies as documentation for cross-checking.
 - **GPL-3 conflicts with normal Apple App Store distribution.** If GPL device/core code links into
   the iOS companion, shipping that companion through the App Store becomes impractical.
 
-**Proposed split:**
+**What changed: the risk never materialised.** The hedge was designed when the code did not exist
+yet. It exists now, and none of it is derived:
 
-| Component | License | Rationale |
-|---|---|---|
-| Launcher app, device drivers, GlassOS client | **GPL-3** | Where derivative-work risk from reading qz/NordicFTMS actually lives |
-| Sync protocol spec + companion apps | **Permissive (Apache-2.0)**, independently authored | Keeps the iOS companion App-Store-distributable |
+- The protos were extracted from the console's own firmware — GlassOS 6.14.6, pulled from
+  `/system/app/glassos/glassos.apk` — not copied from NordicFTMS. The "safest path" above is the
+  one actually taken (`protocol/glassos/README.md`).
+- The FTMS drivers were written from the Bluetooth SIG specification. qz is cross-checked against,
+  never copied (§2.5).
+- No third-party source is vendored anywhere in the tree. Only the three PEM files are reused, and
+  those are iFit's own material, so no upstream project's licence attaches to them (§2.2).
 
-The two halves talk over a **documented network protocol**, not a linked library — a clean process
-boundary that makes the split defensible. Upstream notices and provenance preserved in the GPL half.
+With nothing GPL-derived to quarantine, the split bought nothing and cost two things: the App Store
+path for the companion, and the standing confusion of two LICENSE files in the root. Third-party
+material and prior-art citations are itemised in `NOTICE`.
 
-**FFI reuse of qz is rejected** — its device classes are welded to Qt (`QObject`, `QLowEnergy*`,
-`QTimer`). Clean Dart drivers instead.
+**FFI reuse of qz remains rejected** — its device classes are welded to Qt (`QObject`,
+`QLowEnergy*`, `QTimer`). Clean drivers instead.
 
 ### 2.4 Device model to port
 
@@ -278,7 +287,7 @@ Two caveats worth keeping honest:
   few treadmills.
 - **qz is GPL-3.** Protocol facts — UUIDs, byte layouts, flag semantics — are not copyrightable and
   are taken here from the Bluetooth SIG specification. qz's *expression* is, and none of it is
-  copied. §2.3's split already anticipates this.
+  copied. That separation is what lets §2.3 license the whole repo permissively.
 
 All four machine-data characteristics are implemented, not just the treadmill's: Indoor Bike
 (`0x2AD2`), Cross Trainer (`0x2ACE`) and Rower (`0x2AD1`) alongside Treadmill (`0x2ACD`). Indoor Bike
@@ -593,8 +602,8 @@ BLE peripheral behavior.
 stride/
 ├─ apps/launcher/           # Android HOME launcher, overlay, coordinator service (Kotlin + Flutter)
 ├─ packages/stride_control/ # coordinator, safety, GlassOS client, workout session
-├─ apps/companion/          # Flutter iOS/Android phone app         (permissive license)
-├─ packages/stride_sync/    # sync protocol, shared with companion  (permissive license)
+├─ apps/companion/          # Flutter iOS/Android phone app
+├─ packages/stride_sync/    # sync protocol, shared with companion
 └─ tools/glassos_mock/      # local gRPC server replaying recorded traces
 ```
 
@@ -913,8 +922,10 @@ gate Phase 0 — it gates shipping any control code, and it belongs behind the C
 ## 8. Open questions
 
 1. **Name.** Stride, Cadence, Treadhead, Overdrive, or something else?
-2. **License split** — GPL-3 launcher/drivers + permissive companion/protocol (§2.3), or a single
-   license accepting the App Store consequences?
+2. ~~**License split** — GPL-3 launcher/drivers + permissive companion/protocol (§2.3), or a single
+   license accepting the App Store consequences?~~ **Answered: a single license, Apache-2.0,
+   repo-wide.** Nothing in the tree turned out to be GPL-derived, so the split had nothing to
+   quarantine and only cost the App Store path (§2.3).
 3. **Public or private repo?** Public taps the existing NordicUnchained community; it also raises the
    profile of the certificate question.
 4. **Console firmware / iFit build** on your 1750 — determines Tier A vs. B and whether privileged
@@ -925,8 +936,8 @@ gate Phase 0 — it gates shipping any control code, and it belongs behind the C
    from the grid — hidden, not uninstalled. The real recovery path is S1's documented procedure.
 6. **Non-treadmill hardware** for testing bike/rower paths, or simulator-only for now?
 7. **Relationship to tHUD** (`a-vikulin/thud`) — it already replaces the iFit player over GlassOS
-   gRPC under GPL-3. Build Stride independently, borrow from it, or contribute the launcher/overlay
-   layer upstream to it?
+   gRPC under GPL-3. Build Stride independently, or contribute the launcher/overlay layer upstream
+   to it? (Borrowing its code is ruled out by §2.3's Apache-2.0 decision.)
 8. **Edge-swipe layout** — which edges (left/right only, or bottom too), full-length or partial span,
    and should Back/Home *also* live permanently on the HUD strip as a gesture-free fallback?
 
@@ -939,7 +950,9 @@ gate Phase 0 — it gates shipping any control code, and it belongs behind the C
   structured workouts, FIT export, and a DIRCON server already. Stride's differentiators are the
   *launcher* role, the app-pinning + media coupling, system navigation, profiles, and the companion
   HealthKit story — none of which tHUD does. Worth deciding deliberately whether to build alongside
-  it, borrow from it under GPL-3, or contribute the launcher layer to it (§8 Q7).
+  it or contribute the launcher layer to it (§8 Q7). Note that borrowing *code* from it is no longer
+  a free option: Stride is Apache-2.0 repo-wide (§2.3), so pulling GPL-3 source in would force a
+  relicense of the whole tree.
 - **Certificates.** User-supplied / self-extracted certs reduce but do not eliminate
   anti-circumvention, contract, and contributory-risk exposure. Note that Stride's on-device
   extraction is *more* automated than tHUD's PC-side script, which cuts both ways: better UX, more
