@@ -144,6 +144,9 @@ class _SettingsScreenState extends State<SettingsScreen>
                     heartRateStrapBattery:
                         _settings['heartRateStrapBattery'] as int?,
                     onHeartRateStrap: _setHeartRateStrap,
+                    transportAutomatic:
+                        _settings['transportAutomatic'] as bool? ?? true,
+                    transportDetail: _settings['transportDetail'] as String?,
                   ),
                 ],
               ),
@@ -163,11 +166,20 @@ class _SettingsScreenState extends State<SettingsScreen>
 
   Future<void> _setTransport(String transport) async {
     final current = _settings['transport'] as String? ?? 'glassos';
-    if (transport == current) return;
-    // Only leaving iFit needs a warning. Coming back to it is the recovery
+    final automatic = _settings['transportAutomatic'] as bool? ?? true;
+    // Tapping the row that is already in use is a no-op only when it is already
+    // the rider's own choice. While the transport is automatic that same tap is
+    // the rider *pinning* it, which has to be written down -- otherwise the
+    // selection silently stays automatic and can change under them on the next
+    // restart. Someone deliberately holding a console on iFit is exactly the
+    // person that would surprise.
+    if (transport == current && !automatic) return;
+    // Only *leaving* iFit needs a warning. Coming back to it is the recovery
     // path, and putting a confirmation in front of the way out of a broken
     // link is how a rider ends up stuck on a transport that does not answer.
-    if (transport != 'glassos') {
+    // Pinning the transport already in use is not leaving anything, so it does
+    // not warn either -- the machine is already running on it.
+    if (transport != 'glassos' && transport != current) {
       final confirmed = await _confirmLeavingIfit(transport);
       if (confirmed != true) return;
     }
@@ -516,6 +528,8 @@ class _AdvancedSection extends StatelessWidget {
     this.heartRateStrapName,
     this.heartRateStrapBattery,
     required this.onHeartRateStrap,
+    this.transportAutomatic = true,
+    this.transportDetail,
   });
 
   final bool open;
@@ -546,6 +560,12 @@ class _AdvancedSection extends StatelessWidget {
   final String? heartRateStrapName;
   final int? heartRateStrapBattery;
   final ValueChanged<bool> onHeartRateStrap;
+
+  /// Whether the connection in use was detected rather than chosen by the rider.
+  final bool transportAutomatic;
+
+  /// What the detection probe actually found, written for a rider.
+  final String? transportDetail;
 
   /// The transports a rider can pick, in the order they are offered.
   ///
@@ -636,6 +656,21 @@ class _AdvancedSection extends StatelessWidget {
                 'directly, the other drives separate Bluetooth equipment.',
             child: Column(
               children: [
+                if (transportDetail != null) ...[
+                  // What the probe found, and whether Stride is acting on it.
+                  // A rider on a console where the automatic choice is wrong
+                  // can see that in one line instead of guessing.
+                  Padding(
+                    padding: const EdgeInsets.only(bottom: StrideSpace.xs),
+                    child: Text(
+                      transportAutomatic
+                          ? '$transportDetail Chosen automatically — pick one '
+                                'below to override.'
+                          : '$transportDetail You picked this one.',
+                      style: Theme.of(context).textTheme.bodySmall,
+                    ),
+                  ),
+                ],
                 for (final option in _options) ...[
                   if (option != _options.first)
                     const SizedBox(height: StrideSpace.xs),

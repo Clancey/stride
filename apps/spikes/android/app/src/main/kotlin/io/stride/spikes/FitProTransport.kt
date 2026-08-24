@@ -61,22 +61,37 @@ interface FitProTransport : Closeable {
     val connected: Boolean
 
     /**
+     * Which protocol generation the console on the other end speaks.
+     *
+     * Read from the hardware rather than assumed — see [FitProCodec.Variant]. The two generations
+     * frame their requests differently enough that speaking the wrong one gets no reply at all.
+     */
+    val variant: FitProCodec.Variant
+
+    /**
      * Send [frame] and wait for the machine's reply.
      *
      * Returns null on timeout or any transport failure, which callers must read as "we do not
      * know", never as "the machine refused" — the difference matters because a command whose reply
      * was lost may still have landed.
      */
-    fun exchange(frame: ByteArray, timeoutMs: Long = RESPONSE_TIMEOUT_MS): ByteArray?
+    fun exchange(
+        frame: ByteArray,
+        command: FitProCodec.Command = FitProCodec.Command.READ_WRITE_DATA,
+    ): ByteArray?
+
+    /** True when this link is a radio, which the vendor gives an extra second on every command. */
+    val isRadio: Boolean get() = false
 
     companion object {
         /**
-         * The FitPro2 response timeout, from `th/q.java`.
-         *
-         * Short because this is a wired link to a microcontroller, not a network. A transport that
-         * waited seconds would stall the overlay on a console with no physical Back button.
+         * Deadlines and read delays live on [FitProCodec.Command], because the vendor sets them per
+         * command rather than per transport: a telemetry read and a serial-number query differ by
+         * nearly two seconds. A single constant here is what this replaced, and it was 400 ms —
+         * shorter than the vendor's read *delay* for most commands, so a console answering exactly
+         * as designed was being written off as absent.
          */
-        const val RESPONSE_TIMEOUT_MS = 400L
+        const val TAG_TIMEOUTS = "see FitProCodec.Command.timeoutMs"
 
         const val TAG = "FitProTransport"
 
@@ -106,10 +121,11 @@ class UsbSerialTransport private constructor(
     private val iface: UsbInterface,
     private val readEndpoint: UsbEndpoint,
     private val writeEndpoint: UsbEndpoint,
+    override val variant: FitProCodec.Variant,
 ) : FitProTransport {
 
     override val name: String
-        get() = "USB ${device.deviceName} (vendor ${device.vendorId})"
+        get() = "USB ${device.deviceName} (${variant.name.lowercase()})"
 
     @Volatile private var closed = false
 
@@ -135,25 +151,43 @@ class UsbSerialTransport private constructor(
      * which on a register protocol means attributing one register's value to another.
      */
     @Synchronized
-    override fun exchange(frame: ByteArray, timeoutMs: Long): ByteArray? {
+    override fun exchange(frame: ByteArray, command: FitProCodec.Command): ByteArray? {
         if (closed) return null
-        // No FitPro2 envelope and no chunking here: GlassOS applies both only when the link format
-        // is 2 (`th/q` wraps and `th/o` splits under the same condition), which is the BLE link.
-        // A serial console is written the bare frame.
+        val timeoutMs = command.timeoutMs(onBle = false)
+        // The bare frame, on both generations. Neither chunks over USB, and the difference in how
+        // they get there is worth stating because it is easy to conclude otherwise from a partial
+        // read of iFit's code: FitPro1's *shared* `CommAdapter.SendBytes` does chunk — it walks
+        // `commGroup.RequestBytes` — but `FitProUsbConsoleCommunicationAdapter` overrides it to send
+        // `commGroup.OriginalBytes`, which is the unchunked frame. Only the BLE adapter inherits the
+        // chunking base. FitPro2 does not chunk anywhere.
         return try {
-            val wrote = connection.bulkTransfer(writeEndpoint, frame, frame.size, timeoutMs.toInt())
-            // A short write is not a slow write. The console would be left holding a truncated
-            // frame, and the next thing it received would be read as that frame's tail — which on a
-            // register protocol is how a speed byte becomes a command byte.
-            if (wrote != frame.size) {
-                Log.w(FitProTransport.TAG, "usb write incomplete ($wrote of ${frame.size})")
-                return null
-            }
+            if (!write(frame)) return null
+            // iFit pauses between writing and reading rather than reading straight away
+            // (`SendBytesWithReadDelay`, `CommandBase.ReadDelayMs`). Cheap to honour and it stops
+            // the first read racing a console that has not begun answering.
+            val delay = command.readDelayMs
+            if (delay > 0) Thread.sleep(delay)
             readFrame(timeoutMs)
         } catch (t: Throwable) {
             Log.w(FitProTransport.TAG, "usb exchange failed", t)
             null
         }
+    }
+
+    /**
+     * Put one buffer on the wire, whole.
+     *
+     * A short write is not a slow write. The console would be left holding a truncated frame, and
+     * the next thing it received would be read as that frame's tail — which on a register protocol
+     * is how a speed byte becomes a command byte.
+     */
+    private fun write(bytes: ByteArray): Boolean {
+        val wrote = connection.bulkTransfer(writeEndpoint, bytes, bytes.size, WRITE_TIMEOUT_MS)
+        if (wrote != bytes.size) {
+            Log.w(FitProTransport.TAG, "usb write incomplete ($wrote of ${bytes.size})")
+            return false
+        }
+        return true
     }
 
     /**
@@ -214,6 +248,38 @@ class UsbSerialTransport private constructor(
         /** ICON Health & Fitness. The only vendor this protocol is documented against. */
         const val VENDOR_ICON = 8508
 
+        /** One request message, padded. See [FitProCodec.chunkMessages]. */
+        private const val MESSAGE_SIZE = 20
+
+        /**
+         * How long one bulk write may take.
+         *
+         * Separate from the reply deadline, and much shorter, because a chunked request is several
+         * writes and giving each of them the whole reply budget would let a single stalled transfer
+         * consume the time meant for the answer.
+         */
+        private const val WRITE_TIMEOUT_MS = 500
+
+
+        /**
+         * The console this device is, or null when it is not one we can speak to.
+         *
+         * Matching the vendor alone was enough while there was one generation to talk to. It is not
+         * now: the product id is how a console says which protocol it speaks (2 = FitPro1,
+         * 3 = FitPro2), and the two are framed differently enough that guessing wrong is silence.
+         */
+        internal fun variantOf(device: UsbDevice): FitProCodec.Variant? =
+            if (device.vendorId != VENDOR_ICON) null
+            else FitProCodec.Variant.fromUsbProductId(device.productId)
+
+        /** The attached console, whichever generation, or null. */
+        internal fun consoleDevice(manager: UsbManager): UsbDevice? = try {
+            manager.deviceList.values.firstOrNull { variantOf(it) != null }
+        } catch (t: Throwable) {
+            Log.w(FitProTransport.TAG, "could not enumerate USB devices", t)
+            null
+        }
+
         private const val ACTION_PERMISSION = "io.stride.spikes.USB_PERMISSION"
 
         /**
@@ -226,8 +292,8 @@ class UsbSerialTransport private constructor(
          */
         fun open(context: Context): UsbSerialTransport? {
             val manager = context.getSystemService(Context.USB_SERVICE) as? UsbManager ?: return null
-            val device = manager.deviceList.values.firstOrNull { it.vendorId == VENDOR_ICON }
-                ?: return null
+            val device = consoleDevice(manager) ?: return null
+            val variant = variantOf(device) ?: return null
             if (!manager.hasPermission(device)) {
                 Log.i(FitProTransport.TAG, "no USB permission for ${device.deviceName}")
                 return null
@@ -256,8 +322,8 @@ class UsbSerialTransport private constructor(
                 connection.close()
                 return null
             }
-            Log.i(FitProTransport.TAG, "usb open: ${device.deviceName}")
-            return UsbSerialTransport(manager, device, connection, iface, read, write)
+            Log.i(FitProTransport.TAG, "usb open: ${device.deviceName} as $variant")
+            return UsbSerialTransport(manager, device, connection, iface, read, write, variant)
         }
 
         /**
@@ -268,8 +334,7 @@ class UsbSerialTransport private constructor(
          */
         fun requestPermission(context: Context): Boolean {
             val manager = context.getSystemService(Context.USB_SERVICE) as? UsbManager ?: return false
-            val device = manager.deviceList.values.firstOrNull { it.vendorId == VENDOR_ICON }
-                ?: return false
+            val device = consoleDevice(manager) ?: return false
             if (manager.hasPermission(device)) return true
             // FLAG_IMMUTABLE is required from API 31 and harmless below it; the intent carries no
             // extras we would ever want a recipient to fill in.
@@ -319,6 +384,19 @@ class BleTransport private constructor(
     private val write: BluetoothGattCharacteristic,
 ) : FitProTransport {
 
+    /**
+     * BLE cannot say which generation it is.
+     *
+     * A USB console declares itself in its product id; a BLE peripheral exposes the same FitPro
+     * service either way and offers nothing to tell them apart. [FitProCodec.Variant.FITPRO1] is
+     * named because its BLE behaviour is the half that is verified — `FitProBleConsoleCommunication`
+     * inherits the chunking `SendBytes`, and the `[0x02,0x04,0x02,len]` envelope survives because
+     * the `Format` setter only strips it for non-BLE links. Whether a product-3 board over BLE is
+     * framed identically is **not** established by anything read so far, and is written down as
+     * unknown rather than assumed.
+     */
+    override val variant: FitProCodec.Variant get() = FitProCodec.Variant.FITPRO1
+
     override val name: String get() = "BLE ${gatt.device?.address ?: "?"}"
 
     @Volatile private var closed = false
@@ -345,11 +423,14 @@ class BleTransport private constructor(
     /** Signals completion of one GATT characteristic write. */
     private val writeAcks = ArrayBlockingQueue<Boolean>(1)
 
-    private val assembler = FitProCodec.BleReassembler { frame -> replies.offer(frame) }
+    private val assembler = FitProCodec.MessageReassembler { frame -> replies.offer(frame) }
+
+    override val isRadio: Boolean get() = true
 
     @Synchronized
-    override fun exchange(frame: ByteArray, timeoutMs: Long): ByteArray? {
+    override fun exchange(frame: ByteArray, command: FitProCodec.Command): ByteArray? {
         if (!connected) return null
+        val timeoutMs = command.timeoutMs(onBle = true)
         replies.clear()
         assembler.reset()
         return try {
@@ -357,7 +438,7 @@ class BleTransport private constructor(
             // what is being carried, and what the console expects to be carried is the enveloped
             // frame, not the bare one (`th/q`, then `th/o`).
             val payload = FitProCodec.fitPro2Envelope(frame)
-            for (packet in FitProCodec.chunkForBle(payload)) {
+            for (packet in FitProCodec.chunkMessages(payload)) {
                 if (!writeAndWait(packet, timeoutMs)) return null
             }
             replies.poll(timeoutMs, TimeUnit.MILLISECONDS)

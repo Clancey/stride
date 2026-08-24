@@ -632,6 +632,11 @@ class SpikeBridge(private val context: Context) : MethodChannel.MethodCallHandle
             "heartRateStrapLinked" to MachineLink.heartRateStrapLinked,
             "heartRateStrapName" to MachineLink.heartRateStrapName,
             "heartRateStrapBattery" to MachineLink.heartRateStrapBattery,
+            // Whether the transport in use was detected or chosen, and what the probe actually
+            // found. Shown rather than only acted on: a rider whose console was detected as one
+            // thing and behaves like another learns more from this line than from any retry.
+            "transportAutomatic" to StrideSettings.transportIsAutomatic,
+            "transportDetail" to TransportDetector.describe(),
         )
     }
 
