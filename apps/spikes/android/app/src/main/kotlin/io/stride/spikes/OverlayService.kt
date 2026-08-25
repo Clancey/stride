@@ -173,6 +173,19 @@ class OverlayService : Service() {
         private const val RAIL_WIDTH_DP = 132f
 
         /**
+         * The quick picks shown when the machine has not published its own.
+         *
+         * Whole steps over the range a NordicTrack treadmill covers, highest first to match the
+         * order GlassOS publishes and the order the column is laid out in. These are a fallback for
+         * display, not a claim about the machine: every value picked from them still goes through
+         * [MachineCoordinator]'s clamp before it reaches the belt.
+         */
+        private val INCLINE_LADDER =
+            listOf(12.0, 10.0, 8.0, 6.0, 5.0, 4.0, 3.0, 2.0, 1.0, 0.0, -1.0, -2.0, -3.0)
+
+        private val SPEED_LADDER = listOf(12.0, 10.0, 9.0, 8.0, 7.0, 6.0, 5.0, 4.0, 3.0, 2.0, 1.0)
+
+        /**
          * How far past the end rungs a value may sit and still mark that rung.
          *
          * Small on purpose. Its whole job is to absorb rounding, not to pull a stopped belt onto
@@ -1659,8 +1672,7 @@ class OverlayService : Service() {
      * 0.5 and 1.0 into two pills both reading "1" — two buttons, same label, different commands.
      * Whole numbers still render without a trailing ".0".
      */
-    private fun formatPreset(value: Double): String =
-        if (value == value.roundToInt().toDouble()) value.roundToInt().toString() else "%.1f".format(value)
+    private fun formatPreset(value: Double): String = formatRailPreset(value)
 
     /**
      * Preset columns come from the machine when it has told us what it supports — GlassOS answers
@@ -1673,11 +1685,12 @@ class OverlayService : Service() {
      */
     private fun addInclineRail() {
         val limits = MachineCoordinator.machineLimits
-        val presets = MachineLink.inclinePresets
-            ?.map(::formatPreset)
-            ?: listOf(12.0, 10.0, 8.0, 6.0, 5.0, 4.0, 3.0, 2.0, 1.0, 0.0, -1.0, -2.0, -3.0)
-                .filter { limits == null || (it <= limits.maxInclinePercent && it >= limits.minInclinePercent) }
-                .map(::formatPreset)
+        val presets = railEntries(
+            published = MachineLink.inclinePresets,
+            ladder = INCLINE_LADDER,
+            floor = limits?.minInclinePercent,
+            ceiling = limits?.maxInclinePercent,
+        )
         val binding = addRail(
             accent = amber,
             entries = presets,
@@ -1696,13 +1709,42 @@ class OverlayService : Service() {
         leftInclineView = binding?.scroll
     }
 
+    /**
+     * Which entries a rail should actually show.
+     *
+     * Three rules, in order, and the first two are the ones that were missing.
+     *
+     * A rail with no pills in it is never the right answer. The column is still a live control —
+     * Stride can command speed and incline whether or not the console publishes buttons for them —
+     * so an empty column is a toggle that opens onto nothing, which is precisely what the rider
+     * reported: the corner button lights up, the rail window is created at full size, and there is
+     * nothing inside it. A machine that publishes no presets gets the derived ladder instead.
+     *
+     * That case is not hypothetical or a decoding fault. GlassOS answers `GetControls` from the
+     * *current workout*, so a console sitting idle returns a `ControlList` with no controls at all —
+     * a well-formed, successful, empty answer. Treating it as the machine's final word left both
+     * rails permanently blank on a console that was working perfectly.
+     *
+     * Finally, an intersection that empties the ladder is discarded rather than shown. Limits come
+     * off a wire and a nonsensical pair — a zeroed struct, an unfinished probe — must not be able to
+     * filter every button away. A ladder slightly outside the machine's range gets clamped by
+     * [MachineCoordinator]; a column with nothing in it cannot be clamped back into usefulness.
+     */
+    private fun railEntries(
+        published: List<Double>?,
+        ladder: List<Double>,
+        floor: Double?,
+        ceiling: Double?,
+    ): List<String> = railPresetEntries(published, ladder, floor, ceiling)
+
     private fun addSpeedRail() {
         val limits = MachineCoordinator.machineLimits
-        val presets = MachineLink.speedPresets
-            ?.map(::formatPreset)
-            ?: listOf(12.0, 10.0, 9.0, 8.0, 7.0, 6.0, 5.0, 4.0, 3.0, 2.0, 1.0)
-                .filter { limits == null || (it <= limits.maxSpeedMph && it >= limits.minSpeedMph) }
-                .map(::formatPreset)
+        val presets = railEntries(
+            published = MachineLink.speedPresets,
+            ladder = SPEED_LADDER,
+            floor = limits?.minSpeedMph,
+            ceiling = limits?.maxSpeedMph,
+        )
         val binding = addRail(
             accent = cyan,
             entries = presets,
@@ -2877,4 +2919,55 @@ class OverlayService : Service() {
     }
 
 
+}
+
+/**
+ * Format one quick-pick value for its pill.
+ *
+ * Not `roundToInt`: the direct path builds its ladder from the machine's own `MIN_KPH`/`MAX_KPH` and
+ * `MIN_GRADE`/`MAX_GRADE`, which on plenty of treadmills step in halves. Rounding turned 0.5 and 1.0
+ * into two pills both reading "1" — two buttons, same label, different commands. Whole numbers still
+ * render without a trailing ".0".
+ *
+ * Top-level so it can be tested without a Service; [OverlayService] delegates to it.
+ */
+internal fun formatRailPreset(value: Double): String =
+    if (value == kotlin.math.round(value) && kotlin.math.abs(value) < Int.MAX_VALUE) {
+        value.toInt().toString()
+    } else {
+        "%.1f".format(value)
+    }
+
+/**
+ * Which entries a quick-pick rail should show, given what the machine published and what it can do.
+ *
+ * Three rules, in order, and the first two are the ones that were missing.
+ *
+ * A rail with no pills in it is never the right answer. The column is still a live control — Stride
+ * commands speed and incline whether or not the console publishes buttons for them — so an empty
+ * column is a toggle that opens onto nothing. That is exactly what was reported: the corner button
+ * lights up, the rail window is created at its full 132×722, and there is nothing inside it.
+ *
+ * That case is neither hypothetical nor a decoding fault. GlassOS answers `GetControls` out of the
+ * *current workout*, so a console sitting idle returns a well-formed, successful, **empty**
+ * `ControlList`. Treating that as the machine's final word left both rails permanently blank on a
+ * console that was working perfectly.
+ *
+ * Finally, an intersection that empties the ladder is discarded rather than shown. Limits come off a
+ * wire, and a nonsensical pair — a zeroed struct, an unfinished probe — must not be able to filter
+ * every button away. A ladder reaching slightly outside the machine's range is clamped by
+ * [MachineCoordinator] on the way to the belt; a column with nothing in it cannot be clamped back
+ * into usefulness.
+ */
+internal fun railPresetEntries(
+    published: List<Double>?,
+    ladder: List<Double>,
+    floor: Double?,
+    ceiling: Double?,
+): List<String> {
+    published?.takeIf { it.isNotEmpty() }?.let { return it.map(::formatRailPreset) }
+    val within = ladder.filter {
+        (floor == null || it >= floor) && (ceiling == null || it <= ceiling)
+    }
+    return (within.takeIf { it.isNotEmpty() } ?: ladder).map(::formatRailPreset)
 }

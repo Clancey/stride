@@ -19,13 +19,16 @@ import android.hardware.usb.UsbDeviceConnection
 import android.hardware.usb.UsbEndpoint
 import android.hardware.usb.UsbInterface
 import android.hardware.usb.UsbManager
+import android.hardware.usb.UsbRequest
 import android.os.Build
 import android.util.Log
 import java.io.Closeable
+import java.nio.ByteBuffer
 import java.util.UUID
 import java.util.concurrent.ArrayBlockingQueue
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
+import java.util.concurrent.TimeoutException
 import java.util.concurrent.atomic.AtomicBoolean
 
 /**
@@ -141,6 +144,23 @@ class UsbSerialTransport private constructor(
     @Volatile private var closed = false
 
     /**
+     * Which transfer mechanism this board answers on, or null until one has worked.
+     *
+     * Latched on the first success so the fallback in [transfer] is a one-time probe rather than a
+     * doubled attempt on every frame. Only ever touched from `exchange`, which is `@Synchronized`.
+     */
+    private var useRequests: Boolean? = null
+
+    /** How many more times [transfer] may try the mechanism it has not settled on. */
+    private var probesLeft: Int = MECHANISM_PROBES
+
+    /** Whether this link has ever had a transfer accepted. See [stalled]. */
+    private var everMoved = false
+
+    private var writeRequest: UsbRequest? = null
+    private var readRequest: UsbRequest? = null
+
+    /**
      * Whether the link still exists, as opposed to "we have not closed it".
      *
      * Checked against the live device list, because a cable pulled mid-session leaves this object
@@ -193,7 +213,7 @@ class UsbSerialTransport private constructor(
      * is how a speed byte becomes a command byte.
      */
     private fun write(bytes: ByteArray): Boolean {
-        val wrote = connection.bulkTransfer(writeEndpoint, bytes, bytes.size, WRITE_TIMEOUT_MS)
+        val wrote = transfer(writeEndpoint, bytes, bytes.size, WRITE_TIMEOUT_MS)
         if (wrote != bytes.size) {
             Log.w(FitProTransport.TAG, "usb write incomplete ($wrote of ${bytes.size})")
             return false
@@ -202,9 +222,141 @@ class UsbSerialTransport private constructor(
     }
 
     /**
+     * Move one transfer's worth of bytes, by whichever mechanism this board actually answers on.
+     *
+     * ## Why there are two
+     *
+     * `bulkTransfer` is the proven path and stays the one tried first, including on the interrupt
+     * endpoints this console enumerates (`vendor 8508 / product 3`, vendor class 255, an interrupt
+     * pipe each way). It works there because it lands on usbfs's `USBDEVFS_BULK`, which the kernel
+     * turns into an interrupt URB for an interrupt endpoint — verified on the hardware, not assumed.
+     *
+     * `UsbRequest` is the rescue path, and it is the one Android actually documents for interrupt
+     * endpoints. It exists here because the bulk ioctl's support for interrupt endpoints is a kernel
+     * behaviour rather than a platform guarantee, and a console where it is missing would otherwise
+     * open, claim, and then refuse every byte with nothing to say why.
+     *
+     * Whichever succeeds first is remembered for the rest of the session, so this costs one extra
+     * attempt on one transfer rather than a doubled attempt on every frame.
+     *
+     * Only a hard failure falls through. A short transfer moved bytes, and re-sending after one
+     * would put part of a frame on the wire twice — which on a register protocol is how a speed byte
+     * becomes a command byte.
+     *
+     * [probesLeft] bounds the search. A link that is failing for a reason neither mechanism can fix
+     * — most often another app on the console holding the interface — must not spend the rest of its
+     * life trying both every time.
+     */
+    private fun transfer(
+        endpoint: UsbEndpoint,
+        buffer: ByteArray,
+        length: Int,
+        timeoutMs: Int,
+    ): Int {
+        val settled = useRequests
+        val first = attempt(settled ?: false, endpoint, buffer, length, timeoutMs)
+        if (first >= 0) return moved(first, viaRequest = settled ?: false, settle = settled == null)
+        if (settled != null || probesLeft <= 0) return stalled(first)
+        probesLeft--
+
+        val second = attempt(true, endpoint, buffer, length, timeoutMs)
+        if (second < 0) return stalled(second)
+        Log.i(FitProTransport.TAG, "usb: this board answers UsbRequest but not bulkTransfer")
+        return moved(second, viaRequest = true, settle = true)
+    }
+
+    /** Record a transfer that the kernel accepted, and latch the mechanism that carried it. */
+    private fun moved(result: Int, viaRequest: Boolean, settle: Boolean): Int {
+        if (settle) useRequests = viaRequest
+        everMoved = true
+        blocked = false
+        return result
+    }
+
+    /**
+     * Record a transfer the kernel refused.
+     *
+     * Only a link that has **never** moved anything is reported as blocked. A -1 on its own means
+     * very little: `readFrame` asks for bytes that may not be coming and a read that times out is a
+     * normal, expected -1 on every idle poll. Reporting on that would tell a rider their console was
+     * being held hostage by another app every time the treadmill had nothing to say.
+     */
+    private fun stalled(result: Int): Int {
+        if (!everMoved) blocked = true
+        return result
+    }
+
+    private fun attempt(
+        viaRequest: Boolean,
+        endpoint: UsbEndpoint,
+        buffer: ByteArray,
+        length: Int,
+        timeoutMs: Int,
+    ): Int = if (viaRequest) {
+        queuedTransfer(endpoint, buffer, length, timeoutMs)
+    } else {
+        connection.bulkTransfer(endpoint, buffer, length, timeoutMs)
+    }
+
+    /**
+     * One transfer through `UsbRequest`, the path Android documents for interrupt endpoints.
+     *
+     * The request objects are kept per endpoint rather than made per transfer. `requestWait` hands
+     * back whichever request completed, so a request abandoned by one call can be collected by the
+     * next; keeping them means that is at worst a stale object rather than a native handle that has
+     * already been freed.
+     *
+     * On a timeout the URB is still with the kernel, so it is cancelled and its completion reaped
+     * before returning. Skipping that is how a reply gets attributed to the following command.
+     */
+    private fun queuedTransfer(
+        endpoint: UsbEndpoint,
+        buffer: ByteArray,
+        length: Int,
+        timeoutMs: Int,
+    ): Int {
+        val request = requestFor(endpoint) ?: return -1
+        val payload = ByteBuffer.wrap(buffer, 0, length)
+        if (!request.queue(payload)) {
+            Log.w(FitProTransport.TAG, "usb: could not queue a ${length}-byte request")
+            return -1
+        }
+        val completed = try {
+            connection.requestWait(timeoutMs.coerceAtLeast(1).toLong())
+        } catch (_: TimeoutException) {
+            null
+        } catch (t: Throwable) {
+            Log.w(FitProTransport.TAG, "usb request wait failed", t)
+            null
+        }
+        if (completed == null) {
+            request.cancel()
+            // Best effort, and deliberately unchecked: this is only here to drain the cancellation
+            // so the next transfer's wait cannot collect it.
+            runCatching { connection.requestWait(CANCEL_REAP_MS) }
+            return -1
+        }
+        return payload.position()
+    }
+
+    /** The long-lived request for one endpoint, made on first use. */
+    private fun requestFor(endpoint: UsbEndpoint): UsbRequest? {
+        val cached = if (endpoint === writeEndpoint) writeRequest else readRequest
+        if (cached != null) return cached
+        val created = UsbRequest()
+        if (!created.initialize(connection, endpoint)) {
+            Log.w(FitProTransport.TAG, "usb: could not initialise a request for ${endpoint.address}")
+            created.close()
+            return null
+        }
+        if (endpoint === writeEndpoint) writeRequest = created else readRequest = created
+        return created
+    }
+
+    /**
      * Read one whole frame, however many transfers that takes.
      *
-     * `bulkTransfer` returns whatever has arrived, not what was asked for, so a frame can be split
+     * A transfer returns whatever has arrived, not what was asked for, so a frame can be split
      * across reads. Byte 1 of a FitPro frame is its total length, which is what makes reassembly
      * possible at all — this reads the header, then keeps going until the declared length is
      * satisfied or the deadline passes. Returning the first partial read instead, which is what this
@@ -224,7 +376,7 @@ class UsbSerialTransport private constructor(
                 }
                 return null
             }
-            val read = connection.bulkTransfer(readEndpoint, chunk, chunk.size, remainingMs.toInt())
+            val read = transfer(readEndpoint, chunk, chunk.size, remainingMs.toInt())
             if (read < 0) return null
             if (read == 0) continue
             frame += chunk.copyOfRange(0, read)
@@ -245,23 +397,40 @@ class UsbSerialTransport private constructor(
 
     @Synchronized
     /**
-     * ## A known limitation, written down rather than left to be discovered
+     * ## A limitation that is no longer only suspected
      *
      * `claimInterface(iface, force = true)` asks the kernel to detach whatever driver holds the
-     * interface, which on a HID-class board is `usbhid`. Android implements that with
-     * `USBDEVFS_DISCONNECT`, and neither `releaseInterface` nor `close` issues the matching
-     * `USBDEVFS_CONNECT` — so the kernel driver stays detached after Stride lets go.
+     * interface. Android implements that with `USBDEVFS_DISCONNECT`, and neither `releaseInterface`
+     * nor `close` issues the matching `USBDEVFS_CONNECT` — so whatever was detached stays detached
+     * after Stride lets go.
      *
-     * That is very likely harmless here: iFit drives this board through its own USB code rather than
-     * through `usbhid`, and Stride's reason for touching it at all is that iFit is not running. But
-     * it is unverified on hardware, and the only real fix if a console did depend on the kernel
-     * driver is a native `USBDEVFS_CONNECT` helper — a much larger change than a suspicion warrants.
-     * Recorded so that "iFit stopped working after I tried direct access" is recognised straight
-     * away instead of investigated from nothing.
+     * This was recorded here as "very likely harmless, but unverified". It has since been verified,
+     * and it is not harmless. On a Commercial 1750 with `com.ifit.glassos_service` running, taking
+     * the interface left GlassOS reporting that the console had lost its connection to the treadmill,
+     * and restarting the service did not bring it back; the console had to be rebooted. That is
+     * exactly the "iFit stopped working after I tried direct access" report this note was written to
+     * make recognisable, and it is now the expected outcome rather than a possibility.
+     *
+     * Two things follow, both done rather than left as notes. [open] claims plainly first and only
+     * forces if that fails, so a board nothing else is driving is never detached at all. And the
+     * rider's opt-in says outright that iFit may need a reboot afterwards, because a warning nobody
+     * was given is the part of this that was actually broken.
+     *
+     * The only real repair for the forced case is a native `USBDEVFS_CONNECT` helper, which is a
+     * much larger change than this file should grow on its own.
      */
     override fun close() {
         if (closed) return
         closed = true
+        // Before the connection they were initialised against. A request outliving its connection
+        // is a native handle pointing at freed state, and closing it afterwards is worse than
+        // leaking it.
+        listOfNotNull(writeRequest, readRequest).forEach { request ->
+            runCatching { request.cancel() }
+            runCatching { request.close() }
+        }
+        writeRequest = null
+        readRequest = null
         try {
             connection.releaseInterface(iface)
             connection.close()
@@ -293,6 +462,31 @@ class UsbSerialTransport private constructor(
          * pipes correct, still no connection.
          */
         @Volatile private var claimFailed = false
+
+        /**
+         * Set when a link that opened cleanly could not move a single byte.
+         *
+         * A third distinct failure, and the one seen on this hardware: the device is present, the
+         * permission is granted, the pipes are right, `claimInterface` returns true — and every
+         * transfer comes straight back having moved nothing. What that means in practice is that
+         * something else on the console owns the interface. iFit's own `glassos_service` claims it
+         * at boot and holds it, and `claimInterface(force = true)` only detaches *kernel* drivers;
+         * there is no way to take a usbfs claim off another app, and Stride must not try.
+         *
+         * Reported rather than only logged, because from the rider's side this is indistinguishable
+         * from every other "no direct connection" — and unlike the others it has an obvious cure
+         * (stop using iFit's console app, or reboot with direct access already selected) that nobody
+         * would guess from the generic sentence.
+         */
+        @Volatile internal var blocked = false
+
+        /**
+         * How many transfers may try both mechanisms before the search is given up.
+         *
+         * Small: whichever one works, works on the first frame. This is only here so a link that is
+         * failing for a reason neither can fix does not double its own traffic forever.
+         */
+        private const val MECHANISM_PROBES = 3
 
         /** The read and write pipes of the interface [open] would choose, or null if there is none. */
         internal fun dataInterface(device: UsbDevice): Triple<UsbInterface, UsbEndpoint, UsbEndpoint>? {
@@ -340,6 +534,15 @@ class UsbSerialTransport private constructor(
          * consume the time meant for the answer.
          */
         private const val WRITE_TIMEOUT_MS = 500
+
+        /**
+         * How long to wait for a cancelled request to come back before giving up on reaping it.
+         *
+         * Short because the URB is already cancelled and the kernel completes it promptly; the wait
+         * exists so the *next* transfer's `requestWait` cannot be handed this one's completion, not
+         * to find out anything about it.
+         */
+        private const val CANCEL_REAP_MS = 50L
 
 
         /**
@@ -420,6 +623,12 @@ class UsbSerialTransport private constructor(
                     claimFailed ->
                         " Data pipes: $pipes, but Android would not let Stride claim the " +
                             "interface — something else on the console may still hold it."
+                    blocked ->
+                        " Data pipes: $pipes, and Stride opened it but could not move a single " +
+                            "byte. Another app on the console is holding the treadmill's USB " +
+                            "connection — iFit's own console software does this from boot, and " +
+                            "Android gives no way to take it back. Rebooting with direct access " +
+                            "already selected is what usually clears it."
                     else -> " Data pipes: $pipes."
                 }
                 return if (granted) {
@@ -489,9 +698,23 @@ class UsbSerialTransport private constructor(
             val (iface, read, write) = selected
 
             val connection = manager.openDevice(device) ?: return null
-            if (!connection.claimInterface(iface, true)) {
-                // Worth its own line. `force = true` asks the kernel to detach whatever driver holds
-                // the interface — `usbhid` on a HID-class board — and that is best-effort rather
+            // Plainly first, forcibly only if that fails.
+            //
+            // `force = true` asks Android to issue `USBDEVFS_DISCONNECT`, which detaches whatever
+            // driver holds the interface — and neither `releaseInterface` nor `close` ever issues
+            // the matching `USBDEVFS_CONNECT`, so that detach outlives Stride's session. On this
+            // hardware that is not the theoretical risk it was recorded as: taking the interface
+            // from a running `glassos_service` left the console reporting DISCONNECTED from its own
+            // belt, and it did not recover until the machine was restarted.
+            //
+            // So the destructive call is now the fallback rather than the opening move. On a
+            // console where nothing else holds the interface — a board iFit is not driving, which
+            // is the case direct access is actually for — a plain claim succeeds and nothing is
+            // ever detached.
+            val claimed = connection.claimInterface(iface, false) ||
+                connection.claimInterface(iface, true)
+            if (!claimed) {
+                // Worth its own line. Detaching whatever holds the interface is best-effort rather
                 // than guaranteed on an OEM kernel. Without this the failure was indistinguishable
                 // from every other null return, so a console that was present, permitted and had
                 // exactly the right pipes would still report "no direct connection" with nothing to
@@ -506,6 +729,9 @@ class UsbSerialTransport private constructor(
                 return null
             }
             claimFailed = false
+            // A fresh link has not failed to move anything yet. Left set, a previous session's
+            // failure would be reported against a console that is working.
+            blocked = false
             Log.i(FitProTransport.TAG, "usb open: ${device.deviceName} as $variant")
             return UsbSerialTransport(manager, device, connection, iface, read, write, variant)
         }

@@ -340,7 +340,7 @@ class DirectMachineSession(
             deviceInfo = null,
             supportedCommands = emptySet(),
             probe = FitProProbe.Result(FitProProbe.Stage.UNCONFIRMED, "no device answered"),
-            detail = "No FitPro device answered on ${transport.name}.",
+            detail = handshakeFailureDetail(),
         ).also { lastConnect = it }
 
         deviceInfo = info
@@ -423,19 +423,32 @@ class DirectMachineSession(
      * controller rather than through the console, where MAIN may be nobody.
      */
     private fun handshake(): FitProCodec.DeviceInfo? {
+        val refusals = linkedMapOf<Int, FitProCodec.Status?>()
         for (candidate in listOf(FitProCodec.ADDRESS_MAIN, FitProCodec.ADDRESS_TREADMILL)) {
             val reply = runCatching {
                 transport.exchange(
                     FitProCodec.commandFrame(FitProCodec.Command.DEVICE_INFO, candidate),
                     FitProCodec.Command.DEVICE_INFO,
                 )
-            }.getOrNull() ?: continue
-
-            if (FitProCodec.statusOf(reply) != FitProCodec.Status.DONE) {
-                Log.i(TAG, "address $candidate answered ${FitProCodec.statusOf(reply)} to DEVICE_INFO")
+            }.getOrNull()
+            if (reply == null) {
+                refusals[candidate] = null
                 continue
             }
-            val parsed = FitProCodec.parseDeviceInfo(reply) ?: continue
+
+            val status = FitProCodec.statusOf(reply)
+            if (status != FitProCodec.Status.DONE) {
+                Log.i(TAG, "address $candidate answered $status to DEVICE_INFO")
+                refusals[candidate] = status
+                continue
+            }
+            val parsed = FitProCodec.parseDeviceInfo(reply)
+            if (parsed == null) {
+                // Answered DONE and then said something unparseable. Recorded as its own outcome so
+                // the failure report can tell it from silence.
+                refusals[candidate] = FitProCodec.Status.DONE
+                continue
+            }
             // The address we asked, not the one in the reply, for outgoing frames: see [address].
             // The reply's own address is kept separately, in [replyAddress], for validating the
             // replies that come back to those frames: see its note for why the two can differ.
@@ -448,10 +461,53 @@ class DirectMachineSession(
                     "${info.supportedFieldIds.size} registers" +
                     if (info.requiresSecurity) " (software > ${FitProCodec.SECURITY_REQUIRED_ABOVE}: may demand VERIFY_SECURITY)" else "",
             )
+            lastRefusals = emptyMap()
             return info
         }
+        lastRefusals = refusals
         return null
     }
+
+    /**
+     * Why the last [handshake] gave up, in a sentence a rider can read back to us.
+     *
+     * "No FitPro device answered" used to cover both of these, and they are opposite problems. A
+     * console that says nothing is a wiring or ownership question — wrong pipe, wrong cable, another
+     * app holding the interface. A console that answers `CMD_NOT_SUPPORTED` is talking to us
+     * perfectly and telling us we are speaking the wrong protocol at it, which no amount of
+     * re-cabling will fix and which the generic sentence actively pointed away from.
+     *
+     * The second case is the live one on a product-3 board. This codec is the register protocol a
+     * console speaks *down to its motor board*; a FitPro2 console presenting itself over USB is the
+     * app-facing link, which is a different wire entirely — see [FitProCodec.Variant.FITPRO2], where
+     * this was recorded as unconfirmed rather than known. Naming the refusal is what turns that
+     * caveat into something a rider's report can confirm.
+     */
+    private fun handshakeFailureDetail(): String {
+        val refusals = lastRefusals
+        val answered = refusals.filterValues { it != null }
+        if (answered.isEmpty()) {
+            return "Nothing answered on ${transport.name}. Stride sent the treadmill's own " +
+                "identify command to every address it knows and got no reply at all."
+        }
+        val said = answered.entries.joinToString(", ") { (address, status) ->
+            "address ${address} said ${status?.name?.lowercase()?.replace('_', ' ')}"
+        }
+        return "The console on ${transport.name} is answering, but it refuses the command Stride " +
+            "uses to identify a treadmill ($said). That means it speaks a different protocol to " +
+            "the one direct access implements, so there is nothing to switch on here. iFit " +
+            "(GlassOS) is the connection that works on this machine."
+    }
+
+    /**
+     * What each address said to the last unsuccessful [handshake]: a status, or null for silence.
+     *
+     * Held rather than passed back so [handshake] keeps its single, obvious return value, and
+     * cleared on success so a later failure report can never be built from an older attempt's
+     * answers.
+     */
+    @Volatile
+    private var lastRefusals: Map<Int, FitProCodec.Status?> = emptyMap()
 
     private fun describe(info: FitProCodec.DeviceInfo, probeResult: FitProProbe.Result): String {
         val brand = info.brand.name.lowercase().replace('_', ' ')

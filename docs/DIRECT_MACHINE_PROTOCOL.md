@@ -464,6 +464,9 @@ that look alike" above rather than here, because the trap is that it looks wrong
   `DEVICE_INFO`, `SYSTEM_INFO`, `VERSION_INFO`, `SUPPORTED_COMMANDS`, `VERIFY_SECURITY`, and every
   register read confirmed working end to end after the addressing fix above. The remaining open item
   is starting a workout — see below.
+- **A Commercial 1750 (FitPro2, USB product 3) is a different story**, and the two should not be read
+  as one result. It answers frames but has never completed `DEVICE_INFO`; see "Run against real
+  hardware" below for what it does instead and for the sync sequence it expects first.
 - Distance and elapsed-time units are inferred (above).
 - `SUPPORTED_DEVICES` is never requested — `connect` sends `SUPPORTED_COMMANDS` and then only
   `SYSTEM_INFO`, `VERSION_INFO` and `SERIAL_NUMBER`, and `parseSupportedDevices` has no callers — so
@@ -511,3 +514,49 @@ that look alike" above rather than here, because the trap is that it looks wrong
 - The preset **ladder step** (1.0) is invented. No preset register exists in FitPro, so the direct
   path must synthesise the quick picks; the endpoints come from the machine's own MIN/MAX registers,
   but nothing corroborates the spacing between them.
+
+## Run against real hardware — a Commercial 1750 (FITPRO2, USB product 3)
+
+The first readback against a live console. Three things were settled, and none of them is the wire
+format: the format was never reached.
+
+**The board.** `vendor 8508 / product 3`, `iFIT-LargeX`, one interface of class 255 (vendor
+specific) carrying an **interrupt** pipe each way, both 64-byte, `bInterval 1`. No bulk endpoints at
+all — so [`isDataPipeType`] accepting interrupt endpoints is what makes this device reachable, not a
+FitPro1-only allowance.
+
+**`bulkTransfer` drives those interrupt endpoints.** Measured, not assumed: once the interface was
+genuinely Stride's, ordinary `bulkTransfer` moved frames both ways and the console answered. This is
+`USBDEVFS_BULK` being turned into an interrupt URB by `usb_bulk_msg`, which is what the code claimed
+and is now confirmed on this kernel. A `UsbRequest` path exists behind it as a fallback for a kernel
+where that does not hold; on this console it is never reached.
+
+**The interface is the whole fight, and iFit wins it by default.** `com.ifit.glassos_service` holds
+the console's USB interface from boot. While it does:
+
+- `openDevice` succeeds, `claimInterface(force = true)` returns true, and then **every transfer
+  fails instantly** — not a timeout, an immediate refusal, on both `bulkTransfer` and `UsbRequest`.
+  From the rider's side this is indistinguishable from an absent treadmill, which is why
+  `describeBus` now reports "opened it but could not move a single byte" as its own case.
+- Forcing the claim **breaks iFit until the console is rebooted.** Android's `force` issues
+  `USBDEVFS_DISCONNECT` and nothing ever issues `USBDEVFS_CONNECT`, so GlassOS lost its link to the
+  lower board and reported `DISCONNECTED` from then on. Restarting `glassos_service` did not recover
+  it; a reboot did. `FitProTransport.close` carried this as a suspicion marked "very likely
+  harmless". It is neither.
+
+  Hence: claim plainly first and force only as a fallback, and say so in the opt-in.
+
+**And then the console refuses the protocol.** With the link genuinely working, `DEVICE_INFO`
+returns `CMD_NOT_SUPPORTED` from `ADDRESS_MAIN` and `ADDRESS_TREADMILL` alike. The console is
+answering well-formed frames and declining the command.
+
+That is the outcome [`Variant.FITPRO2`] already warned about in writing: this codec is the console
+talking **down to its motor board**, and a FitPro2 console presenting itself on USB is the
+app-facing link — `Sindarin.FitPro2.Core`'s `[communicationType][device|command][payloadLength]
+[payload]`, a different wire with no checksum. Selecting the register codec for product id 3 was
+recorded as unconfirmed; it is now confirmed **wrong** for this direction of the link.
+
+So direct access is not usable on a 1750 as things stand, and the handshake failure now says which
+of the two possible reasons it hit rather than the single sentence "No FitPro device answered" that
+covered both. Driving a product-3 board directly means implementing the app-to-console protocol,
+which this file does not describe.

@@ -138,6 +138,16 @@ object MachineLink {
         REOPEN_INTERVAL_MS shl failures.coerceIn(0, MAX_REOPEN_FAILURES)
 
     /**
+     * How long an axis that published no presets stands before it is asked again.
+     *
+     * Two extra RPCs on a ten-second cadence, against a poll that already makes eight every two
+     * seconds, so the cost is noise. It is deliberately not "every poll": the answer only changes
+     * when the console starts or ends a workout, and there is nothing to be gained by asking
+     * between those.
+     */
+    private const val EMPTY_PRESET_RETRY_MS = 10_000L
+
+    /**
      * How often the poll retries a heart rate strap that is enabled but not connected.
      *
      * Longer than [REOPEN_INTERVAL_MS] because the failure is far more likely to be permanent — most
@@ -331,6 +341,21 @@ object MachineLink {
     // Distinct from the caches being null: null there means "no presets", this means "not asked".
     @Volatile private var inclinePresetsFetched: Boolean = false
     @Volatile private var speedPresetsFetched: Boolean = false
+
+    /**
+     * When an axis that answered "I have no presets" may be asked again.
+     *
+     * An empty answer is real, but on GlassOS it is not *final*: `GetControls` is answered from the
+     * live workout, so an idle console returns an empty `ControlList` and starts publishing its
+     * real buttons only once a workout is running. Latching that first empty answer for the life of
+     * the link is what left both quick-pick columns blank on a perfectly healthy console.
+     *
+     * So an empty answer is cached — callers still get to tell "none" from "not asked" — but it is
+     * re-asked on this interval instead of being believed forever. A non-empty answer still latches:
+     * presets do not change under a running link once the machine has actually published them.
+     */
+    @Volatile private var nextInclinePresetAskAt: Long = 0L
+    @Volatile private var nextSpeedPresetAskAt: Long = 0L
 
     /**
      * Bumped whenever a preset answer lands. The overlay builds its rails once, before any machine
@@ -933,6 +958,8 @@ object MachineLink {
         speedPresetsCache = null
         inclinePresetsFetched = false
         speedPresetsFetched = false
+        nextInclinePresetAskAt = 0L
+        nextSpeedPresetAskAt = 0L
         if (hadPresets) presetsGeneration.incrementAndGet()
         nextReopenAt = 0L
         // Deliberately NOT clearing reopenFailures here. This method is called *inside* every retry,
@@ -967,11 +994,18 @@ object MachineLink {
                 // but the settings screen went on claiming there was no GlassOS service while
                 // GlassOS was plainly working.
                 StrideSettings.resolveTransportFromReading()
+                // The console is not only a thing Stride commands; it has its own Stop button under
+                // the rider's hand. This is where pressing it reaches the overlay.
+                WorkoutMachineCoupling.observeConsole(read.consoleState)
                 // Presets are static for the machine, so fetch them once on the same background
                 // thread as the poll rather than inventing a second worker. A read having just
                 // succeeded means the link is up, so this is the cheapest moment to try.
                 fetchPresetsOnce()
             } else {
+                // Nothing came back, so nothing is known about the belt. Dropping the remembered
+                // reading stops a link that recovers minutes later from delivering a stale edge
+                // built out of two readings with a gap between them.
+                WorkoutMachineCoupling.forgetConsole()
                 reopenIfDropped()
             }
             // Outside the read check on purpose: a strap is not part of the machine link, so its
@@ -1227,28 +1261,43 @@ object MachineLink {
      * but not incline — a flat treadmill, or a console whose incline control list is missing — must
      * still get its speed rail, and coupling them meant one null answer suppressed both.
      *
-     * An empty list is a real answer and is kept as one. It means "this machine offers no presets on
-     * this axis", which is not the same as "we have not asked yet", and collapsing the two is what
-     * let the overlay fall back to a hardcoded ladder for a machine that had positively said it had
-     * nothing to offer.
+     * An empty list is a real answer and is cached as one, so callers can still tell "this machine
+     * publishes none" from "we have not asked". It is **not** treated as the machine's last word,
+     * which is the fix for a rider looking at two empty quick-pick columns: GlassOS answers
+     * `GetControls` out of the live workout, so an idle console returns an empty `ControlList` and
+     * only starts publishing its real buttons once something is running. Latching the first empty
+     * answer meant the rails could never fill in, for the whole life of the link.
      *
-     * [presetsGeneration] is bumped whenever an answer lands so the overlay can rebuild rails that
-     * were built before the machine had told us anything.
+     * [presetsGeneration] is bumped only when the answer actually differs from the one already held.
+     * A re-ask that returns the same empty list changes nothing on screen, and bumping the
+     * generation for it would rebuild the entire overlay chrome on a timer — the flashing that
+     * [closeTransport] had to be taught not to cause.
      */
     private fun fetchPresetsOnce() {
         if (inclinePresetsFetched && speedPresetsFetched) return
-        if (!inclinePresetsFetched) {
-            MachineCoordinator.ask { it.inclinePresets() }?.let {
-                inclinePresetsCache = it
-                inclinePresetsFetched = true
-                presetsGeneration.incrementAndGet()
+        val now = SystemClock.elapsedRealtime()
+        if (!inclinePresetsFetched && now >= nextInclinePresetAskAt) {
+            MachineCoordinator.ask { it.inclinePresets() }?.let { answer ->
+                val changed = answer != inclinePresetsCache
+                inclinePresetsCache = answer
+                if (answer.isEmpty()) {
+                    nextInclinePresetAskAt = now + EMPTY_PRESET_RETRY_MS
+                } else {
+                    inclinePresetsFetched = true
+                }
+                if (changed) presetsGeneration.incrementAndGet()
             }
         }
-        if (!speedPresetsFetched) {
-            MachineCoordinator.ask { it.speedPresetsMph() }?.let {
-                speedPresetsCache = it
-                speedPresetsFetched = true
-                presetsGeneration.incrementAndGet()
+        if (!speedPresetsFetched && now >= nextSpeedPresetAskAt) {
+            MachineCoordinator.ask { it.speedPresetsMph() }?.let { answer ->
+                val changed = answer != speedPresetsCache
+                speedPresetsCache = answer
+                if (answer.isEmpty()) {
+                    nextSpeedPresetAskAt = now + EMPTY_PRESET_RETRY_MS
+                } else {
+                    speedPresetsFetched = true
+                }
+                if (changed) presetsGeneration.incrementAndGet()
             }
         }
     }

@@ -53,6 +53,33 @@ object WorkoutMachineCoupling {
     private var lastState = WorkoutSession.state
 
     /**
+     * The last definite answer the console gave about its own belt, or null when it has not given
+     * one this session.
+     *
+     * Kept so [observeConsole] can work on *edges* rather than levels. That distinction is the whole
+     * safety argument for this feature: a level test ("the console says it is not moving, so pause")
+     * fires during the gap between Stride confirming a start and the console actually reaching
+     * WORKOUT, and would pause every workout a second after it began. An edge only fires when the
+     * console has told us it was moving and has since told us it is not, which is exactly what
+     * pressing Stop on the machine looks like from here.
+     */
+    private var beltMoving: Boolean? = null
+
+    /**
+     * Set while a transition is being made to *follow* the machine rather than drive it.
+     *
+     * Without it, adopting the console's own pause would send a pause command straight back to the
+     * console that just paused itself. Safe on this machine and pointless on any — but it also
+     * inverts the meaning of the coupling, which exists to make Stride's controls move the belt, not
+     * to re-issue the belt's own decisions at it.
+     *
+     * A plain flag is enough because [WorkoutSession.transition] notifies listeners under its own
+     * lock, so [onTransition] cannot be running for two transitions at once.
+     */
+    @Volatile
+    private var adopting = false
+
+    /**
      * Which start attempt is current.
      *
      * A start is answered asynchronously, and by the time the answer lands the rider may have
@@ -77,8 +104,75 @@ object WorkoutMachineCoupling {
     fun attach() {
         if (attached) return
         lastState = WorkoutSession.state
+        beltMoving = null
         WorkoutSession.addListener(::onTransition)
         attached = true
+    }
+
+    /**
+     * Follow the console when the rider drives it from the machine's own buttons.
+     *
+     * Stride is not the only thing that can stop this belt. The console has a Stop button under the
+     * rider's hand, and until now pressing it left the overlay counting a workout that had visibly
+     * ended — "Pause workout" over a stationary belt, which is the same wrong screen the start
+     * handshake was reworked to get rid of, arrived at from the other direction.
+     *
+     * Called from the machine poll with whatever the console last reported, so it sees every state
+     * change within a poll interval. [GlassOsClient.ConsoleState.beltMayBeMoving] is the authority
+     * on what a state name means, and its **null** — a state this build does not recognise, or none
+     * reported at all — is ignored rather than folded into either answer. Guessing there would
+     * either pause a running workout or claim a stopped one is still going.
+     *
+     * Deliberately does not start a session that Stride never began. Adopting a workout the rider
+     * started on the console is a larger question — whose goal, whose clock, whose media — and
+     * quietly beginning one from a poll is not the way to answer it.
+     */
+    fun observeConsole(consoleState: String?) {
+        if (!attached) return
+        val moving = GlassOsClient.ConsoleState.beltMayBeMoving(consoleState) ?: return
+        val previous = synchronized(this) {
+            val was = beltMoving
+            beltMoving = moving
+            was
+        }
+        try {
+            when (consoleFollowUp(previous, moving, WorkoutSession.state)) {
+                ConsoleFollowUp.NOTHING -> return
+
+                ConsoleFollowUp.PAUSE -> {
+                    Log.i(TAG, "console stopped the belt; pausing the session to match")
+                    adopt { WorkoutSession.pause() }
+                }
+
+                ConsoleFollowUp.RESUME -> {
+                    Log.i(TAG, "console restarted the belt; resuming the session to match")
+                    adopt { WorkoutSession.resume() }
+                }
+            }
+        } catch (t: Throwable) {
+            Log.w(TAG, "Could not follow the console's own workout state.", t)
+        }
+    }
+
+    /** Forget what the console was doing, so the next reading starts a fresh edge. */
+    fun forgetConsole() {
+        synchronized(this) { beltMoving = null }
+    }
+
+    /**
+     * Make a transition that follows the machine, without sending it back at the machine.
+     *
+     * The flag is cleared in a `finally` because a listener throwing on the way through would
+     * otherwise leave every later pause and stop silently uncommanded — a coupling that has stopped
+     * commanding the belt is the one failure here that matters.
+     */
+    private fun adopt(change: () -> Unit) {
+        adopting = true
+        try {
+            change()
+        } finally {
+            adopting = false
+        }
     }
 
     /**
@@ -184,6 +278,15 @@ object WorkoutMachineCoupling {
             lastState = next
             state
         }
+        // A session ending is the end of what the console was doing too, whoever ended it. Leaving
+        // the old reading in place would let the *next* workout inherit this one's edge and pause
+        // itself the first time the console reported anything.
+        if (next == WorkoutSession.State.IDLE) forgetConsole()
+        // Following the machine, not driving it. The pause below would otherwise be sent to the
+        // console that has just paused itself. The stop on the way to IDLE is deliberately *not*
+        // suppressed — nothing here adopts an end, so any IDLE transition is the rider's, and a
+        // belt that might be moving is always told to stop.
+        if (adopting && next != WorkoutSession.State.IDLE) return
         try {
             when {
                 // Stop first and unconditionally. If the rider ends a workout we do not care what
@@ -269,5 +372,57 @@ internal fun startSettlement(
         // not move the session — and STARTING is the one state with no way out of its own accord,
         // so it must be resolved rather than merely stopped watching.
         else -> StartSettlement.ABANDON
+    }
+}
+
+/** What Stride should do about a change in what the console says its own belt is doing. */
+internal enum class ConsoleFollowUp {
+    /** Leave the session exactly as it is. */
+    NOTHING,
+
+    /** The console stopped a belt Stride was counting a workout against. */
+    PAUSE,
+
+    /** The console restarted a belt Stride was holding paused. */
+    RESUME,
+}
+
+/**
+ * Decide whether the console's own reading should move Stride's session, from an edge rather than a
+ * level.
+ *
+ * Pulled out as a pure function for the same reason [startSettlement] is: this decides whether the
+ * app pauses a workout underneath a rider, and every branch of it has to be checkable without a
+ * treadmill.
+ *
+ * ## Why an edge and not a level
+ *
+ * The obvious rule — "the console says it is not moving, so pause" — pauses every workout about a
+ * second after it starts. Stride confirms a start the moment the machine accepts the command, and
+ * the console spends the next poll or two still reporting IDLE while the belt spins up. A level test
+ * fires in that gap, every single time.
+ *
+ * An edge only fires when the console has told us it was moving and has since told us it is not,
+ * which is what pressing Stop on the machine looks like from here and is not what a start looks
+ * like. [previous] being null — nothing known yet, or the link dropped and cleared it — is therefore
+ * never an edge.
+ *
+ * ## What is deliberately not here
+ *
+ * A console that starts moving while Stride is IDLE does not begin a session. Adopting a workout the
+ * rider started on the machine raises questions this cannot answer on its own — whose goal, whose
+ * clock, whether the media should start — and quietly starting one from a poll is not the way to
+ * settle them. Only a session Stride is already holding is followed.
+ */
+internal fun consoleFollowUp(
+    previous: Boolean?,
+    moving: Boolean,
+    state: WorkoutSession.State,
+): ConsoleFollowUp {
+    if (previous == null || previous == moving) return ConsoleFollowUp.NOTHING
+    return when {
+        !moving && state == WorkoutSession.State.RUNNING -> ConsoleFollowUp.PAUSE
+        moving && state == WorkoutSession.State.PAUSED -> ConsoleFollowUp.RESUME
+        else -> ConsoleFollowUp.NOTHING
     }
 }
