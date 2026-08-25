@@ -923,6 +923,11 @@ object MachineLink {
 
     private fun closeTransport() {
         MachineCoordinator.rebind(null)
+        // A reading taken through the old transport says nothing about the new one, and the belt
+        // edge is built from exactly two readings. Carried across a switch, GlassOS reporting
+        // WORKOUT and a freshly opened direct link reporting anything else is a manufactured
+        // "the rider pressed Stop" — from two different wires, seconds apart.
+        WorkoutMachineCoupling.forgetConsole()
         direct = null
         directSession?.let { runCatching { it.close() } }
         directSession = null
@@ -1272,11 +1277,18 @@ object MachineLink {
      * A re-ask that returns the same empty list changes nothing on screen, and bumping the
      * generation for it would rebuild the entire overlay chrome on a timer — the flashing that
      * [closeTransport] had to be taught not to cause.
+     *
+     * A console that has lost its own treadmill is asked once and then left alone. It has nothing to
+     * publish and every RPC to it can block for the full read timeout; re-asking on a timer would
+     * spend the poll thread — the thread every metric on screen depends on — waiting for two answers
+     * that cannot exist yet. The first ask still happens, because "never asked" has to become
+     * "asked" for the rails to know which they are looking at.
      */
     private fun fetchPresetsOnce() {
         if (inclinePresetsFetched && speedPresetsFetched) return
         val now = SystemClock.elapsedRealtime()
-        if (!inclinePresetsFetched && now >= nextInclinePresetAskAt) {
+        val detached = consoleDetached
+        if (!inclinePresetsFetched && mayAskPresets(inclinePresetsCache, nextInclinePresetAskAt, now, detached)) {
             MachineCoordinator.ask { it.inclinePresets() }?.let { answer ->
                 val changed = answer != inclinePresetsCache
                 inclinePresetsCache = answer
@@ -1288,7 +1300,7 @@ object MachineLink {
                 if (changed) presetsGeneration.incrementAndGet()
             }
         }
-        if (!speedPresetsFetched && now >= nextSpeedPresetAskAt) {
+        if (!speedPresetsFetched && mayAskPresets(speedPresetsCache, nextSpeedPresetAskAt, now, detached)) {
             MachineCoordinator.ask { it.speedPresetsMph() }?.let { answer ->
                 val changed = answer != speedPresetsCache
                 speedPresetsCache = answer
@@ -1300,6 +1312,30 @@ object MachineLink {
                 if (changed) presetsGeneration.incrementAndGet()
             }
         }
+    }
+
+    /**
+     * Whether one preset axis may be asked on this pass.
+     *
+     * Pulled out as a pure function because it is the guard between "the rails fill in as soon as
+     * the machine has something to publish" and "the poll thread spends its life waiting on a
+     * console that has nothing to say", and those pull in opposite directions.
+     *
+     * A [cache] of null has never been answered, so it is always asked: the rails need "asked, and
+     * the answer was none" to be distinguishable from "not asked yet", and only an ask produces
+     * that. Past the first answer the clock applies — and on a [detached] console it never comes
+     * round again, because a head unit that has lost its treadmill cannot start publishing quick
+     * picks for it, and every RPC to it can block for the full read timeout.
+     */
+    internal fun mayAskPresets(
+        cache: List<Double>?,
+        nextAskAt: Long,
+        nowMs: Long,
+        detached: Boolean,
+    ): Boolean = when {
+        cache == null -> true
+        detached -> false
+        else -> nowMs >= nextAskAt
     }
 
     /**
