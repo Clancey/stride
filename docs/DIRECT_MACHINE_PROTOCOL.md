@@ -560,3 +560,39 @@ So direct access is not usable on a 1750 as things stand, and the handshake fail
 of the two possible reasons it hit rather than the single sentence "No FitPro device answered" that
 covered both. Driving a product-3 board directly means implementing the app-to-console protocol,
 which this file does not describe.
+
+### Confirmed: forcing the claim takes the belt away, and only a replug gives it back
+
+The consequence above was measured end to end on the 1750, in both directions.
+
+Switching to direct access with the USB permission granted severed the console from its treadmill.
+GlassOS reported `DISCONNECTED` from then on, and it did **not** come back from restarting
+`glassos_service`, from restarting Stride, or from `adb reboot`. Checked at the kernel afterwards,
+the board was not merely unclaimed — it was **gone from the bus**: `num_connects=0`,
+`/sys/bus/usb/devices/` holding nothing but the four root hubs, and no `/dev/bus/usb/003/002`. A
+device that is not enumerated cannot be recovered by anything in userspace, which is why every
+restart failed and why the rider-facing copy says *power-cycled at the wall*. Unplugging the
+console's USB lead and plugging it back in re-enumerated it (`3-1 213c iFIT-LargeX`) and GlassOS
+attached again immediately.
+
+With the refusal in place the same sequence is now harmless. Selecting direct access, granting the
+USB dialog, and switching back to iFit leaves the link untouched:
+
+```
+I MachineLink:     usb permission broadcast: claimed=true, actually granted=true
+W FitProTransport: usb: /dev/bus/usb/003/002 is held by another process and GlassOS is
+                   running; refusing to force the claim
+I MachineLink:     console Connect -> Attached(state=2)
+```
+
+`Attached(state=2)` is `IDLE` — the console still has its treadmill, during and after the attempt.
+
+One more thing this run settled, which is easy to mistake for a dead link: with GlassOS attached and
+the machine idle, `SetIncline` comes back
+
+```
+WorkoutState IDLE is not valid for this operation, expected one of [[RUNNING]]
+```
+
+That is a healthy console decoding the command and declining it. Speed and incline only move once a
+workout is running, so a refusal in that shape is evidence the link works, not that it does not.
