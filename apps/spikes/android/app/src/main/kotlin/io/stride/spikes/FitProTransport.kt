@@ -550,6 +550,16 @@ class UsbSerialTransport private constructor(
         @Volatile internal var blocked = false
 
         /**
+         * Set when the interface was held and Stride declined to take it by force.
+         *
+         * The one refusal in this file that is a *choice* rather than a failure, so it says so.
+         * Reported ahead of every other case because it is the only one where the rider's treadmill
+         * is still working and the honest answer is "direct access cannot have this console" rather
+         * than "something went wrong".
+         */
+        @Volatile internal var heldByGlassOs = false
+
+        /**
          * How many transfers may try both mechanisms before the search is given up.
          *
          * Small: whichever one works, works on the first frame. This is only here so a link that is
@@ -689,6 +699,12 @@ class UsbSerialTransport private constructor(
                     pipes == null ->
                         " Stride found no interface on it with a usable pipe each way, so it " +
                             "cannot be opened."
+                    heldByGlassOs ->
+                        " Data pipes: $pipes, but iFit's own service is running and holds the " +
+                            "connection to the treadmill. Stride will not take it: doing that cuts " +
+                            "iFit off from the belt until the machine is power-cycled at the wall, " +
+                            "and this console doesn't answer the direct protocol anyway. Stay on " +
+                            "iFit (GlassOS) — it is the connection that works on this machine."
                     claimFailed ->
                         " Data pipes: $pipes, but Android would not let Stride claim the " +
                             "interface — something else on the console may still hold it."
@@ -767,36 +783,56 @@ class UsbSerialTransport private constructor(
             val (iface, read, write) = selected
 
             val connection = manager.openDevice(device) ?: return null
-            // Plainly first, forcibly only if that fails.
+            // Plainly first, and forcibly only when there is nothing to break.
             //
             // `force = true` asks Android to issue `USBDEVFS_DISCONNECT`, which detaches whatever
-            // driver holds the interface — and neither `releaseInterface` nor `close` ever issues
-            // the matching `USBDEVFS_CONNECT`, so that detach outlives Stride's session. On this
-            // hardware that is not the theoretical risk it was recorded as: taking the interface
-            // from a running `glassos_service` left the console reporting DISCONNECTED from its own
-            // belt, and it did not recover until the machine was restarted.
+            // holds the interface — and neither `releaseInterface` nor `close` ever issues the
+            // matching `USBDEVFS_CONNECT`, so the detach outlives Stride's session. On this hardware
+            // that is not a theoretical risk: taking the interface from a running `glassos_service`
+            // left the console reporting DISCONNECTED from its own belt, and it stayed that way
+            // through a service restart and an Android reboot.
             //
-            // So the destructive call is now the fallback rather than the opening move. On a
-            // console where nothing else holds the interface — a board iFit is not driving, which
-            // is the case direct access is actually for — a plain claim succeeds and nothing is
-            // ever detached.
-            val claimed = connection.claimInterface(iface, false) ||
+            // So when the plain claim fails *and the GlassOS daemon is answering*, this refuses
+            // rather than forces. Two reasons, and either alone would be enough. The daemon holding
+            // the interface is the working path to the belt, and cutting it leaves the rider with a
+            // treadmill nothing can drive until it is power-cycled at the wall. And there is nothing
+            // to win: a GlassOS-era console answers this codec's `DEVICE_INFO` with
+            // `CMD_NOT_SUPPORTED` — see `Variant.FITPRO2` — so the interface would be taken, the
+            // machine broken, and the handshake would fail anyway.
+            //
+            // Forcing is kept for the case direct access actually exists for: a console with no
+            // GlassOS daemon at all, where whatever holds the interface is a kernel driver and there
+            // is no working path to destroy.
+            val claimed = connection.claimInterface(iface, false) || run {
+                if (TransportDetector.glassOsListening()) {
+                    Log.w(
+                        FitProTransport.TAG,
+                        "usb: ${device.deviceName} is held by another process and GlassOS is " +
+                            "running; refusing to force the claim",
+                    )
+                    heldByGlassOs = true
+                    return@run false
+                }
                 connection.claimInterface(iface, true)
+            }
             if (!claimed) {
                 // Worth its own line. Detaching whatever holds the interface is best-effort rather
                 // than guaranteed on an OEM kernel. Without this the failure was indistinguishable
                 // from every other null return, so a console that was present, permitted and had
                 // exactly the right pipes would still report "no direct connection" with nothing to
                 // say which of the two had happened.
-                Log.w(
-                    FitProTransport.TAG,
-                    "usb: could not claim interface on ${device.deviceName}; " +
-                        "another driver may still hold it",
-                )
-                claimFailed = true
+                if (!heldByGlassOs) {
+                    Log.w(
+                        FitProTransport.TAG,
+                        "usb: could not claim interface on ${device.deviceName}; " +
+                            "another driver may still hold it",
+                    )
+                    claimFailed = true
+                }
                 connection.close()
                 return null
             }
+            heldByGlassOs = false
             claimFailed = false
             // A fresh link has not failed to move anything yet. Left set, a previous session's
             // failure would be reported against a console that is working.
