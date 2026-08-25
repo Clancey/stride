@@ -66,18 +66,26 @@ object WorkoutMachineCoupling {
     private var beltMoving: Boolean? = null
 
     /**
-     * Set while a transition is being made to *follow* the machine rather than drive it.
+     * Set while *this thread* is making a transition that follows the machine rather than driving
+     * it.
      *
      * Without it, adopting the console's own pause would send a pause command straight back to the
      * console that just paused itself. Safe on this machine and pointless on any — but it also
      * inverts the meaning of the coupling, which exists to make Stride's controls move the belt, not
      * to re-issue the belt's own decisions at it.
      *
-     * A plain flag is enough because [WorkoutSession.transition] notifies listeners under its own
-     * lock, so [onTransition] cannot be running for two transitions at once.
+     * Thread-local, and that is load-bearing rather than tidy. A plain flag was wrong the moment
+     * this class started making transitions from the machine poll thread: [adopt] must set the flag
+     * before `WorkoutSession.pause()` can take WorkoutSession's monitor, so a rider tapping Pause on
+     * the main thread at the same instant would run *their* listeners while the poll thread sat on
+     * that monitor with the flag raised — and [onTransition] would read it and quietly drop the
+     * command that stops the belt. The same race against `IDLE → STARTING` would skip both the start
+     * and its watchdog, wedging the session in "Starting…" with nothing left to release it.
+     *
+     * `WorkoutSession.transition` notifies listeners synchronously on the calling thread, so a
+     * thread-confined flag suppresses exactly the adopting thread's own transition and no other.
      */
-    @Volatile
-    private var adopting = false
+    private val adopting = ThreadLocal.withInitial { false }
 
     /**
      * Which start attempt is current.
@@ -129,6 +137,24 @@ object WorkoutMachineCoupling {
      */
     fun observeConsole(consoleState: String?) {
         if (!attached) return
+        // DISCONNECTED is not "the belt is stopped" — it is "the head unit cannot see the lower
+        // board", which is a statement about the link and not about the machine. It arrives on a
+        // *successful* read (proto3 omits the zero, so GlassOsClient.read substitutes it), and it
+        // comes and goes under a live session: MachineLink's own poll treats it as transient and
+        // fires a reconnect on it.
+        //
+        // Read as an edge it would be the worst possible false positive. A console that blinked
+        // would pause the rider's workout and their media, stop the clock, and — because an adopted
+        // transition is deliberately not sent back to the machine — do all of that over a belt
+        // nothing has told to stop, under a button now reading "Resume workout". That is the exact
+        // screen this whole feature exists to prevent, reached from a third direction.
+        //
+        // So it is grouped with the states we cannot read: forget what was known, and let the next
+        // reading start a fresh edge rather than manufacture one across a gap we could not see.
+        if (consoleState == GlassOsClient.ConsoleState.DISCONNECTED_NAME) {
+            forgetConsole()
+            return
+        }
         val moving = GlassOsClient.ConsoleState.beltMayBeMoving(consoleState) ?: return
         val previous = synchronized(this) {
             val was = beltMoving
@@ -167,11 +193,11 @@ object WorkoutMachineCoupling {
      * commanding the belt is the one failure here that matters.
      */
     private fun adopt(change: () -> Unit) {
-        adopting = true
+        adopting.set(true)
         try {
             change()
         } finally {
-            adopting = false
+            adopting.set(false)
         }
     }
 
@@ -286,7 +312,7 @@ object WorkoutMachineCoupling {
         // console that has just paused itself. The stop on the way to IDLE is deliberately *not*
         // suppressed — nothing here adopts an end, so any IDLE transition is the rider's, and a
         // belt that might be moving is always told to stop.
-        if (adopting && next != WorkoutSession.State.IDLE) return
+        if (adopting.get() && next != WorkoutSession.State.IDLE) return
         try {
             when {
                 // Stop first and unconditionally. If the rider ends a workout we do not care what

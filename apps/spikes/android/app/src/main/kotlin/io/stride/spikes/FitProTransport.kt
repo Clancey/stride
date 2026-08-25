@@ -157,8 +157,8 @@ class UsbSerialTransport private constructor(
     /** Whether this link has ever had a transfer accepted. See [stalled]. */
     private var everMoved = false
 
-    private var writeRequest: UsbRequest? = null
-    private var readRequest: UsbRequest? = null
+    private var writePipe: Pipe? = null
+    private var readPipe: Pipe? = null
 
     /**
      * Whether the link still exists, as opposed to "we have not closed it".
@@ -301,13 +301,24 @@ class UsbSerialTransport private constructor(
     /**
      * One transfer through `UsbRequest`, the path Android documents for interrupt endpoints.
      *
-     * The request objects are kept per endpoint rather than made per transfer. `requestWait` hands
-     * back whichever request completed, so a request abandoned by one call can be collected by the
-     * next; keeping them means that is at worst a stale object rather than a native handle that has
-     * already been freed.
+     * ## Why this is more than queue-then-wait
      *
-     * On a timeout the URB is still with the kernel, so it is cancelled and its completion reaped
-     * before returning. Skipping that is how a reply gets attributed to the following command.
+     * `requestWait` returns **whichever** request completed on this connection, not the one just
+     * queued. This transport keeps one per endpoint, so a foreign or abandoned completion is a
+     * routine possibility rather than a corner case, and taking it as our own is not a near miss:
+     * the buffer of an uncompleted request holds nothing meaningful, so it reads as a successful
+     * zero-byte transfer, which latches the mechanism and marks the link healthy. Our own request
+     * meanwhile stays queued in the kernel — and AOSP *throws* rather than returning false when a
+     * still-queued request is re-queued, so the next transfer raises `IllegalStateException` and
+     * every one after it does the same. A link that reports itself healthy and can never move
+     * another byte.
+     *
+     * So completions are matched by identity, foreign ones are recorded against whichever pipe owns
+     * them and waited past, and a request the kernel never gives back is left marked outstanding
+     * rather than re-queued.
+     *
+     * On a timeout the URB is still with the kernel, so it is cancelled and reaped. Skipping that is
+     * how one command's reply gets attributed to the next.
      */
     private fun queuedTransfer(
         endpoint: UsbEndpoint,
@@ -315,33 +326,78 @@ class UsbSerialTransport private constructor(
         length: Int,
         timeoutMs: Int,
     ): Int {
-        val request = requestFor(endpoint) ?: return -1
+        val pipe = pipeFor(endpoint) ?: return -1
+        // Never re-queue a request the kernel still holds. One last attempt to get it back, then
+        // refuse the transfer rather than throw.
+        if (pipe.outstanding && !reap(pipe, CANCEL_REAP_MS)) {
+            Log.w(FitProTransport.TAG, "usb: the request for ${endpoint.address} is still out")
+            return -1
+        }
+
         val payload = ByteBuffer.wrap(buffer, 0, length)
-        if (!request.queue(payload)) {
+        val queued = try {
+            pipe.request.queue(payload)
+        } catch (t: Throwable) {
+            Log.w(FitProTransport.TAG, "usb: could not queue a ${length}-byte request", t)
+            return -1
+        }
+        if (!queued) {
             Log.w(FitProTransport.TAG, "usb: could not queue a ${length}-byte request")
             return -1
         }
-        val completed = try {
-            connection.requestWait(timeoutMs.coerceAtLeast(1).toLong())
-        } catch (_: TimeoutException) {
-            null
-        } catch (t: Throwable) {
-            Log.w(FitProTransport.TAG, "usb request wait failed", t)
-            null
+        pipe.outstanding = true
+
+        val deadline = System.nanoTime() + timeoutMs.coerceAtLeast(1) * 1_000_000L
+        while (true) {
+            val remainingMs = (deadline - System.nanoTime()) / 1_000_000L
+            if (remainingMs <= 0) break
+            val completed = awaitRequest(remainingMs) ?: break
+            settle(completed)
+            // Only our own completion says anything about our buffer.
+            if (completed === pipe.request) return payload.position()
         }
-        if (completed == null) {
-            request.cancel()
-            // Best effort, and deliberately unchecked: this is only here to drain the cancellation
-            // so the next transfer's wait cannot collect it.
-            runCatching { connection.requestWait(CANCEL_REAP_MS) }
-            return -1
+        pipe.request.cancel()
+        reap(pipe, CANCEL_REAP_MS)
+        return -1
+    }
+
+    /** Whichever request the kernel hands back next, or null on a timeout or failure. */
+    private fun awaitRequest(timeoutMs: Long): UsbRequest? = try {
+        connection.requestWait(timeoutMs.coerceAtLeast(1))
+    } catch (_: TimeoutException) {
+        null
+    } catch (t: Throwable) {
+        Log.w(FitProTransport.TAG, "usb request wait failed", t)
+        null
+    }
+
+    /** Record that the kernel has given [request] back, whichever pipe it belongs to. */
+    private fun settle(request: UsbRequest) {
+        listOfNotNull(writePipe, readPipe).forEach {
+            if (it.request === request) it.outstanding = false
         }
-        return payload.position()
+    }
+
+    /**
+     * Try to get [pipe]'s request back, for up to [budgetMs]. True once it is reusable.
+     *
+     * Completions for the *other* pipe are collected on the way past rather than discarded, because
+     * the alternative is leaving them to be mistaken for the next transfer's answer.
+     */
+    private fun reap(pipe: Pipe, budgetMs: Long): Boolean {
+        val deadline = System.nanoTime() + budgetMs * 1_000_000L
+        while (pipe.outstanding) {
+            val remainingMs = (deadline - System.nanoTime()) / 1_000_000L
+            if (remainingMs <= 0) break
+            val completed = awaitRequest(remainingMs) ?: break
+            settle(completed)
+        }
+        return !pipe.outstanding
     }
 
     /** The long-lived request for one endpoint, made on first use. */
-    private fun requestFor(endpoint: UsbEndpoint): UsbRequest? {
-        val cached = if (endpoint === writeEndpoint) writeRequest else readRequest
+    private fun pipeFor(endpoint: UsbEndpoint): Pipe? {
+        val cached = if (endpoint === writeEndpoint) writePipe else readPipe
         if (cached != null) return cached
         val created = UsbRequest()
         if (!created.initialize(connection, endpoint)) {
@@ -349,8 +405,20 @@ class UsbSerialTransport private constructor(
             created.close()
             return null
         }
-        if (endpoint === writeEndpoint) writeRequest = created else readRequest = created
-        return created
+        val pipe = Pipe(created)
+        if (endpoint === writeEndpoint) writePipe = pipe else readPipe = pipe
+        return pipe
+    }
+
+    /**
+     * One endpoint's reusable request, and whether the kernel still has it.
+     *
+     * [outstanding] is the whole point. A `UsbRequest` may not be re-queued while it is out, and
+     * asking whether it is out is not something the platform object will answer — so it is tracked
+     * here, against every path that could return it.
+     */
+    private class Pipe(val request: UsbRequest) {
+        var outstanding = false
     }
 
     /**
@@ -422,15 +490,16 @@ class UsbSerialTransport private constructor(
     override fun close() {
         if (closed) return
         closed = true
-        // Before the connection they were initialised against. A request outliving its connection
-        // is a native handle pointing at freed state, and closing it afterwards is worse than
-        // leaking it.
-        listOfNotNull(writeRequest, readRequest).forEach { request ->
-            runCatching { request.cancel() }
-            runCatching { request.close() }
+        // Cancelled and reaped before they are freed, and freed before the connection they were
+        // initialised against. A request outliving its connection is a native handle pointing at
+        // released state; one freed while the kernel still holds its buffer is worse.
+        listOfNotNull(writePipe, readPipe).forEach { pipe ->
+            runCatching { pipe.request.cancel() }
+            runCatching { reap(pipe, CANCEL_REAP_MS) }
+            runCatching { pipe.request.close() }
         }
-        writeRequest = null
-        readRequest = null
+        writePipe = null
+        readPipe = null
         try {
             connection.releaseInterface(iface)
             connection.close()

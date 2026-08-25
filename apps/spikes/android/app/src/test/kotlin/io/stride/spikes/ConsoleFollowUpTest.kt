@@ -117,4 +117,37 @@ class ConsoleFollowUpTest {
         assertEquals(null, GlassOsClient.ConsoleState.beltMayBeMoving("CONSOLE_STATE_UNKNOWN"))
         assertEquals(null, GlassOsClient.ConsoleState.beltMayBeMoving(null))
     }
+
+    /**
+     * DISCONNECTED reads as "not moving", and must never reach the edge logic as one.
+     *
+     * This is the trap in wiring the two halves together, and it is worth pinning as a test rather
+     * than as a comment. `beltMayBeMoving` answers **false** for DISCONNECTED, deliberately and
+     * correctly for its own question — "is there a workout here to worry about". For *this*
+     * question it is the worst possible answer: DISCONNECTED means the head unit has lost sight of
+     * the lower board, not that the belt has stopped, and it arrives on a perfectly successful read
+     * that MachineLink's poll goes on to treat as transient and recoverable.
+     *
+     * Taken as an edge it would pause the rider's workout and their media, stop the clock, and —
+     * since an adopted transition is deliberately not commanded back at the machine — do it over a
+     * belt nothing has told to stop, under a button reading "Resume workout".
+     *
+     * `observeConsole` therefore filters it before the mapping. The assertion here is the
+     * *precondition* for that filter: if DISCONNECTED ever stopped answering false, the filter would
+     * be dead code and this test is what says so.
+     */
+    @Test
+    fun `a disconnected console still reads as not moving, which is why it is filtered first`() {
+        assertEquals(
+            false,
+            GlassOsClient.ConsoleState.beltMayBeMoving(
+                GlassOsClient.ConsoleState.DISCONNECTED_NAME,
+            ),
+        )
+        // And what it would do if it were let through, so the cost of removing the filter is stated.
+        assertEquals(
+            ConsoleFollowUp.PAUSE,
+            consoleFollowUp(previous = true, moving = false, state = WorkoutSession.State.RUNNING),
+        )
+    }
 }
