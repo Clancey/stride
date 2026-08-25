@@ -77,6 +77,19 @@ object FitProCodec {
      */
     const val SECURITY_REQUIRED_ABOVE: Int = 75
 
+    /** Length of the security hash `VERIFY_SECURITY` carries. VERIFIED (`EquipmentUtil.CalculateSecurityHash`). */
+    const val SECURITY_HASH_LENGTH: Int = 32
+
+    /**
+     * The constant the master library version is multiplied by to make the secret key. VERIFIED
+     * (`VerifySecurityCmd`: `secretKey = 8 * masterLibraryVersion`, where 8 is the class's
+     * `MinorVersion` constant).
+     */
+    const val SECURITY_KEY_MULTIPLIER: Int = 8
+
+    /** `VERIFY_SECURITY`'s body: the 32-byte hash then the 4-byte key. VERIFIED (`ContentLength => 36`). */
+    const val SECURITY_CONTENT_LENGTH: Int = SECURITY_HASH_LENGTH + 4
+
     /**
      * Offset of the first read value in a response.
      *
@@ -106,6 +119,37 @@ object FitProCodec {
         VERIFY_SECURITY(-112),
         SERIAL_NUMBER(-107),
         ;
+
+        /**
+         * How many bytes of body this command's request carries.
+         *
+         * Not every handshake command is bodiless, which this codec previously assumed. FitPro1
+         * declares a `ContentLength` per command and `SYSTEM_INFO` and `VERSION_INFO` both declare
+         * **2** — a pair of flag bytes asking whether to also return the MCU name and the console
+         * name (`SystemInfoCmd`/`VersionInfoCmd.RequestContentBytes`). Everything else in our
+         * handshake genuinely is zero: `DEVICE_INFO`, `SERIAL_NUMBER`, `SUPPORTED_COMMANDS` and
+         * `SUPPORTED_DEVICES` all declare 0.
+         *
+         * This is not cosmetic. A console reading a declared length that disagrees with the bytes
+         * that follow does not answer. In the field report that prompted this, `DEVICE_INFO`
+         * (length 0, which we got right) succeeded and `SYSTEM_INFO` — the first command we
+         * under-filled — got nothing back, as did everything after it.
+         *
+         * The silence of the *later*, correctly-framed commands is not explained by the malformed
+         * frame alone: this link is a USB HID interrupt endpoint, where each report is its own
+         * framed transfer, so there is no shared byte stream for a bad length to desync. The likely
+         * explanation is that the malformed frame wedges the console's command processor until the
+         * link is re-established, but that mechanism is inferred, not confirmed. What is confirmed
+         * is that iFit sends two bytes here and we sent none.
+         *
+         * Zero-filled is the right content: both flags mean "no, don't also send me the name".
+         */
+        val requestContentLength: Int
+            get() = when (this) {
+                SYSTEM_INFO, VERSION_INFO -> 2
+                VERIFY_SECURITY -> SECURITY_CONTENT_LENGTH
+                else -> 0
+            }
 
         /**
          * How long to wait after writing this command before reading its reply, in milliseconds.
@@ -818,11 +862,131 @@ object FitProCodec {
     // ---- handshake --------------------------------------------------------------------------------
 
     /**
-     * A frame for a command that carries no body — every handshake command except the register
-     * read/write. VERIFIED (`vh/d.e` with `b() == 0`, e.g. `vh/e`, `vh/j`, `vh/g`).
+     * A frame for a handshake command, carrying the zero-filled body its
+     * [Command.requestContentLength] declares.
+     *
+     * The body used to be unconditionally empty, which is right for most of these commands and
+     * wrong for `SYSTEM_INFO` and `VERSION_INFO` — see [Command.requestContentLength].
+     *
+     * `VERIFY_SECURITY` is refused rather than zero-filled: a hash of 32 zero bytes is a
+     * well-formed frame carrying the wrong answer, so the console would reject the handshake
+     * instead of rejecting the frame, and the failure would look like a machine that refuses to
+     * unlock rather than like a caller that forgot to compute the hash.
      */
-    fun commandFrame(command: Command, address: Int): ByteArray =
-        frame(body = ByteArray(0), address = address, command = command)
+    fun commandFrame(command: Command, address: Int): ByteArray {
+        require(command != Command.VERIFY_SECURITY) {
+            "VERIFY_SECURITY carries a computed hash; build it with verifySecurityFrame"
+        }
+        return frame(
+            body = ByteArray(command.requestContentLength),
+            address = address,
+            command = command,
+        )
+    }
+
+    /**
+     * The 32-byte security hash a console above [SECURITY_REQUIRED_ABOVE] demands before it will
+     * accept writes. VERIFIED — transcribed statement for statement from
+     * `EquipmentUtil.CalculateSecurityHash(serialNumber, partNumber, modelNumber)`.
+     *
+     * Each byte starts as its own one-based index, then the corresponding bit of the serial number
+     * chooses how it is mixed: a set bit folds in the part number, a clear bit folds in the seed
+     * scaled by the model number. The part number is pre-rotated by 16 for the low half and used
+     * as-is for the high half, so that both halves of a 32-bit part number reach the output.
+     *
+     * Three details are load-bearing and easy to get wrong:
+     *  - the shifts are **arithmetic**, as C#'s `>>` on `int` is, so a part number with its top bit
+     *    set sign-extends. Kotlin's `shr` matches; `ushr` would not.
+     *  - the multiply in the clear-bit branch uses the *seed*, `b + 1`, not a running value.
+     *  - the multiply is allowed to overflow. Both languages wrap, and the result is truncated to
+     *    a byte anyway.
+     */
+    fun calculateSecurityHash(serialNumber: Int, partNumber: Int, modelNumber: Int): ByteArray {
+        val out = ByteArray(SECURITY_HASH_LENGTH)
+        for (index in 0 until SECURITY_HASH_LENGTH) {
+            val seed = index + 1
+            val mixed = if ((serialNumber shr index) and 1 == 1) {
+                if (index < 16) ((partNumber shl 16) or (partNumber shr 16)) shr index
+                else partNumber shr index
+            } else {
+                seed * (index + modelNumber)
+            }
+            out[index] = (seed xor mixed).toByte()
+        }
+        return out
+    }
+
+    /**
+     * Builds the `VERIFY_SECURITY` frame: the 32-byte hash followed by the secret key, which is
+     * [SECURITY_KEY_MULTIPLIER] times the console's own master library version, little-endian.
+     * VERIFIED (`VerifySecurityCmd.RequestContentBytes`; `BinaryWriter.Write(int)` is little-endian).
+     *
+     * The console is being asked to confirm a number derived from facts it already told us about
+     * itself, which is why every input here comes from a preceding handshake reply and none of it
+     * can be guessed.
+     */
+    fun verifySecurityFrame(address: Int, securityHash: ByteArray, masterLibraryVersion: Int): ByteArray {
+        require(securityHash.size == SECURITY_HASH_LENGTH) {
+            "security hash must be $SECURITY_HASH_LENGTH bytes, got ${securityHash.size}"
+        }
+        val body = ByteArray(SECURITY_CONTENT_LENGTH)
+        securityHash.copyInto(body, 0)
+        intToLe(SECURITY_KEY_MULTIPLIER * masterLibraryVersion, 4).copyInto(body, SECURITY_HASH_LENGTH)
+        return frame(body = body, address = address, command = Command.VERIFY_SECURITY)
+    }
+
+    /** What a console answered to `VERIFY_SECURITY`. */
+    data class SecurityInfo(val unlocked: Boolean, val unlockedKey: Int, val status: Status?)
+
+    /**
+     * Parses a `VERIFY_SECURITY` reply. VERIFIED (`VerifySecurityCmd.SetResponseBytes`: skip the
+     * 4-byte header, read one key byte; unlocked is `Status == Done`).
+     */
+    fun parseSecurityInfo(bytes: ByteArray): SecurityInfo? {
+        if (bytes.size <= RESPONSE_VALUE_OFFSET) return null
+        val status = statusOf(bytes)
+        return SecurityInfo(
+            unlocked = status == Status.DONE,
+            unlockedKey = bytes[RESPONSE_VALUE_OFFSET].toInt() and 0xFF,
+            status = status,
+        )
+    }
+
+    /**
+     * The part of a `SYSTEM_INFO` reply the security hash needs. VERIFIED
+     * (`SystemInfoCmd.SetResponseBytes`).
+     *
+     * Layout after the 4-byte header: a 2-byte config size, a configuration byte, then the model
+     * and part numbers as 4-byte little-endian values in that order. The reply carries more after
+     * this — CPU use, task counts, timings — that nothing here needs.
+     */
+    data class SystemInfo(val model: Int, val partNumber: Int)
+
+    fun parseSystemInfo(bytes: ByteArray): SystemInfo? {
+        if (bytes.size < 15) return null
+        val model = leToInt(bytes.copyOfRange(7, 11), 4)
+        val partNumber = leToInt(bytes.copyOfRange(11, 15), 4)
+        return SystemInfo(
+            model = model,
+            // One console reports a part number its own firmware then corrects. VERIFIED
+            // (`SystemInfoCmd.SetResponseBytes`, last statement before the return). This looks like
+            // a fudge worth skipping until you notice *where* it sits: iFit applies it while
+            // parsing, so `Unlock()` reads the corrected value and hashes it. Leaving it out would
+            // hash the raw number on that one model and get a SECURITY_BLOCK indistinguishable
+            // from a genuine rejection.
+            partNumber = if (partNumber == 370357 && model == 39915) 374677 else partNumber,
+        )
+    }
+
+    /**
+     * The master library version from a `VERSION_INFO` reply — a **single byte** after the 4-byte
+     * header, not the 2-byte build number that follows it. VERIFIED
+     * (`VersionInfoCmd.SetResponseBytes`: `ReadByte()` then `ReadUInt16()`).
+     */
+    fun parseMasterLibraryVersion(bytes: ByteArray): Int? {
+        if (bytes.size <= RESPONSE_VALUE_OFFSET) return null
+        return bytes[RESPONSE_VALUE_OFFSET].toInt() and 0xFF
+    }
 
     /** The machine's brand, from the `DEVICE_INFO` reply. VERIFIED (`hj/s.java`). */
     enum class Brand(val value: Int) {
@@ -872,12 +1036,12 @@ object FitProCodec {
         fun supports(register: Register): Boolean = register.fieldId in supportedFieldIds
 
         /**
-         * Whether this console would demand `VERIFY_SECURITY` before honouring writes. VERIFIED
-         * (`xh/n0.smali` ~line 610: `if-le softwareVersion, 0x4b` skips the security call).
+         * Whether this console demands `VERIFY_SECURITY` before honouring writes. VERIFIED twice
+         * over: `xh/n0.smali` ~line 610 skips the security call for `softwareVersion <= 0x4b`, and
+         * FitPro1's own `Connect` reads `if (PrimaryDevice.SoftwareVersion > 75) await Unlock()`.
          *
-         * Stride cannot satisfy that exchange, so this is not a gate we can pass — it is a flag that
-         * tells us *why* a machine might accept the handshake and then refuse every write, which is
-         * otherwise an almost undiagnosable symptom.
+         * Stride now satisfies that exchange — see [DirectMachineSession.unlock]. This used to say
+         * it could not, which was true only for as long as the hash algorithm was unknown.
          */
         val requiresSecurity: Boolean get() = softwareVersion > SECURITY_REQUIRED_ABOVE
     }

@@ -161,10 +161,38 @@ labels them "Fake field, exist only in values array". Connecting is a handshake,
 1. Start the send loop.
 2. `DEVICE_INFO` to **MAIN (2)**.
 3. Reuse the device record that came back — including its address (see below).
-4. Batch `SYSTEM_INFO`, `VERSION_INFO`, `SERIAL_NUMBER`.
-5. `SUPPORTED_DEVICES`, `SUPPORTED_COMMANDS`.
+4. `SUPPORTED_DEVICES`, `SUPPORTED_COMMANDS`.
+5. `SYSTEM_INFO`, `VERSION_INFO`, `SERIAL_NUMBER` — **each only if step 4 advertised it**.
 6. `VERIFY_SECURITY`, if the device asked for it.
 7. Poll `READ_WRITE_DATA` every 100 ms.
+
+Steps 4 and 5 were previously documented the other way round. FitPro1's `Connect` fetches the device
+tree immediately after `DEVICE_INFO` and then loops the interrogation commands under
+`if (PrimaryDevice.SupportedCommands.Contains(item.Key))`, so the order is load-bearing: the console
+is never asked for something it has just said it does not implement.
+
+### Command request bodies — not all of them are empty
+
+Every command declares a `ContentLength`, and Stride assumed for a long time that the handshake
+commands were all zero. Two are not:
+
+| Command | Content length | Body |
+|---------|---------------|------|
+| `DEVICE_INFO`, `SERIAL_NUMBER`, `SUPPORTED_COMMANDS`, `SUPPORTED_DEVICES` | 0 | — |
+| `SYSTEM_INFO` | 2 | `[fetchMcuName, 0]` |
+| `VERSION_INFO` | 2 | `[fetchMcuName, fetchConsoleName]` |
+| `VERIFY_SECURITY` | 36 | 32-byte hash ++ 4-byte LE key |
+
+iFit constructs both info commands with the flags defaulted to false, so the correct body is two
+zero bytes — "do not also send me the name".
+
+This was not cosmetic. A NordicTrack X22i in the field completed `DEVICE_INFO` (which we framed
+correctly) and then went silent for the rest of the session, starting with `SYSTEM_INFO` — the first
+command we under-filled. Note that the silence of the *later*, correctly-framed commands is not
+explained by the bad frame on its own: this is a USB HID interrupt endpoint, where every report is
+its own framed transfer, so there is no shared byte stream to desync. The likely explanation is that
+the malformed frame wedges the console's command processor until the link is re-established, but
+that mechanism is inferred rather than confirmed.
 
 ### DEVICE_INFO reply layout
 
@@ -193,11 +221,10 @@ against `sh.a.D`, which is the field id. This is what makes it safe to use the m
 lists, which the direct path must do — values are packed contiguously with no per-value tags, so a
 single unsupported register in a read list makes the whole response unparseable.
 
-### VERIFY_SECURITY — the one thing the direct path cannot do
+### VERIFY_SECURITY
 
-GlassOS sends `VERIFY_SECURITY` (command `0x90`, a 36-byte body: a 32-byte blob plus a 4-byte LE bit
-count) **only when the console's software version is above 75**. The guard is explicit in
-`xh/n0.smali`:
+A console whose software version is **above 75** will not accept writes until it has been shown a
+32-byte hash. The guard is explicit in `xh/n0.smali`:
 
 ```
 iget v5, v0, Lyh/b;->b:I    # softwareVersion
@@ -205,11 +232,40 @@ const/16 v13, 0x4b          # 75
 if-le v5, v13, :cond_c      # <= 75 skips the security branch entirely
 ```
 
-The blob is built by an XOR loop over a seed rather than by real cryptography, but it is still a
-secret Stride has no legitimate way to hold. So this is not a gate the direct path can pass — it is
-recorded as `DeviceInfo.requiresSecurity` purely so that a console which completes the handshake and
-then refuses every write has a visible explanation, instead of presenting as an inexplicably dead
-link. Machines at or below software 75 are unaffected, which is why direct control works at all.
+and stated again in FitPro1's own source as `if (PrimaryDevice.SoftwareVersion > 75) await Unlock()`.
+
+This document used to call it "the one thing the direct path cannot do", on the reasoning that the
+blob was a secret Stride had no way to hold. That was wrong, and only looked right for as long as
+the algorithm was unknown. It is not a secret at all: it is a pure function of three numbers the
+console itself reports during the handshake.
+
+```
+hash[b] = b + 1                                     for b in 0..31
+if bit b of serialNumber is set:
+    hash[b] ^= (byte)( (b < 16 ? rotate(partNumber) : partNumber) >> b )
+else:
+    hash[b] ^= (byte)( (b + 1) * (b + modelNumber) )
+
+where rotate(p) = (p << 16) | (p >> 16)
+```
+
+Every shift is **arithmetic** (C# `>>` on `int`), the multiply is allowed to overflow, and each
+result is truncated to a byte. The inputs are the serial number from `DEVICE_INFO` and the part and
+model numbers from `SYSTEM_INFO`.
+
+The body is that hash followed by a 4-byte little-endian key, which is `8 × masterLibraryVersion`
+from `VERSION_INFO` — a number the console also told us. The reply is a status plus one key byte;
+only status `DONE` means unlocked.
+
+Two details are easy to miss and both break the handshake silently:
+
+- `SYSTEM_INFO`'s parser rewrites one console's part number
+  (`if (partNumber == 370357 && model == 39915) partNumber = 374677`) **before** the hash reads it.
+- The master library version is a **single byte**; the two bytes after it are the build number.
+
+A console can also drop its unlock mid-session. iFit handles a `SECURITY_BLOCK` status on any
+command by unlocking again and reissuing it, and so does Stride — once, since the commands that flow
+through that path are absolute setpoints and are safe to repeat.
 
 ### Addressing
 

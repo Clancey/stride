@@ -124,6 +124,87 @@ class DirectMachineSession(
     }
 
     /**
+     * Whether this session has cleared the console's security gate.
+     *
+     * [Unavailable] is deliberately distinct from [Refused]: the first means we never got the
+     * inputs to compute the hash, the second means the console looked at our answer and said no.
+     * They call for different responses from a human, and collapsing them into "locked" would
+     * throw away the only clue about which one happened.
+     */
+    sealed interface SecurityState {
+        /** Software version at or below [FitProCodec.SECURITY_REQUIRED_ABOVE]; no gate to clear. */
+        data object NotRequired : SecurityState
+
+        data object Unlocked : SecurityState
+
+        /** The console demanded security and refused the answer we computed. */
+        data class Refused(val reason: String) : SecurityState
+
+        /** The console demanded security and we could not assemble the request. */
+        data class Unavailable(val reason: String) : SecurityState
+    }
+
+    /** The security outcome of the most recent [connect]. */
+    @Volatile
+    var security: SecurityState = SecurityState.NotRequired
+        private set
+
+    @Volatile
+    private var systemInfo: FitProCodec.SystemInfo? = null
+
+    @Volatile
+    private var masterLibraryVersion: Int? = null
+
+    /**
+     * Clear the console's security gate.
+     *
+     * Consoles above [FitProCodec.SECURITY_REQUIRED_ABOVE] will not accept writes until they have
+     * been shown a hash derived from three numbers they already reported — the serial number from
+     * `DEVICE_INFO`, and the part and model numbers from `SYSTEM_INFO` — together with a key
+     * derived from the master library version from `VERSION_INFO`. This mirrors FitPro1's own
+     * `Unlock()`, which computes exactly this and enqueues exactly this command.
+     *
+     * All the inputs come from replies already in hand, so this cannot be attempted when any of
+     * those replies is missing; that is [SecurityState.Unavailable] rather than a failure, because
+     * the console is not at fault and a retry of the *handshake* is what would help.
+     *
+     * Caller must hold [wire].
+     */
+    private fun unlock(): SecurityState {
+        val info = deviceInfo ?: return SecurityState.Unavailable("no device info")
+        val system = systemInfo
+            ?: return SecurityState.Unavailable("the machine didn't answer SYSTEM_INFO")
+        val library = masterLibraryVersion
+            ?: return SecurityState.Unavailable("the machine didn't answer VERSION_INFO")
+
+        val hash = FitProCodec.calculateSecurityHash(
+            serialNumber = info.serialNumber,
+            partNumber = system.partNumber,
+            modelNumber = system.model,
+        )
+        val reply = try {
+            transport.exchange(
+                FitProCodec.verifySecurityFrame(address, hash, library),
+                FitProCodec.Command.VERIFY_SECURITY,
+            )
+        } catch (t: Throwable) {
+            Log.w(TAG, "VERIFY_SECURITY failed", t)
+            return SecurityState.Unavailable("the security exchange failed: ${t.message}")
+        } ?: return SecurityState.Unavailable("the machine didn't answer VERIFY_SECURITY")
+
+        val parsed = FitProCodec.parseSecurityInfo(reply)
+            ?: return SecurityState.Unavailable("the VERIFY_SECURITY reply was malformed")
+        return if (parsed.unlocked) {
+            Log.i(TAG, "console unlocked (key ${parsed.unlockedKey})")
+            SecurityState.Unlocked
+        } else {
+            val reason = parsed.status?.name?.lowercase()?.replace('_', ' ') ?: "no status"
+            Log.w(TAG, "console refused VERIFY_SECURITY: $reason")
+            SecurityState.Refused(reason)
+        }
+    }
+
+    /**
      * Run one read/write exchange. Returns null when the machine said nothing usable.
      *
      * Blocking; call off the main thread.
@@ -173,27 +254,44 @@ class DirectMachineSession(
         }
         if (writes.isEmpty()) return MachineAck.Refused("nothing to write for $label")
 
-        val reply = try {
-            val body = FitProCodec.readWriteBody(writes, emptyList())
-            transport.exchange(FitProCodec.frame(body, address = address))
-        } catch (t: Throwable) {
-            return MachineAck.NoAnswer("$label failed: ${t.message}")
-        } ?: return MachineAck.NoAnswer("the machine didn't answer the $label command")
+        val body = FitProCodec.readWriteBody(writes, emptyList())
+        val frame = FitProCodec.frame(body, address = address)
 
-        val response = FitProCodec.parseResponse(reply, emptyList(), expectAddress = address)
-            ?: return MachineAck.NoAnswer("the $label reply was malformed")
+        fun send(): MachineAck {
+            val reply = try {
+                transport.exchange(frame)
+            } catch (t: Throwable) {
+                return MachineAck.NoAnswer("$label failed: ${t.message}")
+            } ?: return MachineAck.NoAnswer("the machine didn't answer the $label command")
 
-        // Telemetry tolerates a bad checksum because GlassOS does and a wrong number is visibly
-        // wrong. An acknowledgement is different: it is the evidence that a command that moves a
-        // belt landed, and a corrupted frame is not evidence of anything.
-        if (!response.checksumValid) {
-            return MachineAck.NoAnswer("the $label reply failed its checksum")
+            val response = FitProCodec.parseResponse(reply, emptyList(), expectAddress = address)
+                ?: return MachineAck.NoAnswer("the $label reply was malformed")
+
+            // Telemetry tolerates a bad checksum because GlassOS does and a wrong number is visibly
+            // wrong. An acknowledgement is different: it is the evidence that a command that moves a
+            // belt landed, and a corrupted frame is not evidence of anything.
+            if (!response.checksumValid) {
+                return MachineAck.NoAnswer("the $label reply failed its checksum")
+            }
+            return if (response.accepted) {
+                MachineAck.Ok
+            } else {
+                MachineAck.Refused(response.status.name.lowercase().replace('_', ' '))
+            }
         }
-        return if (response.accepted) {
-            MachineAck.Ok
-        } else {
-            MachineAck.Refused(response.status.name.lowercase().replace('_', ' '))
+
+        val first = send()
+        // A console can drop its unlock mid-session — a power blip on the controller, or simply
+        // more time than it keeps the grant for. iFit handles that by unlocking again and reissuing
+        // the command rather than surfacing the refusal, and so does this. Retried exactly once:
+        // if the second attempt is blocked too, the answer is not going to change by asking harder,
+        // and this runs on the thread that moves the belt.
+        if (first is MachineAck.Refused && first.detail == SECURITY_BLOCK_REASON) {
+            Log.i(TAG, "$label was security-blocked; unlocking again")
+            security = unlock()
+            if (security is SecurityState.Unlocked) return send()
         }
+        return first
     }
 
     /**
@@ -216,6 +314,7 @@ class DirectMachineSession(
         supportedCommands = emptySet()
         fanRegister = null
         probe.reset()
+        forgetSecurity()
 
         val info = handshake() ?: return ConnectResult(
             deviceInfo = null,
@@ -228,17 +327,11 @@ class DirectMachineSession(
         address = info.address
         fanRegister = FAN_REGISTERS.firstOrNull { info.supports(it) }
 
-        // Informational, and deliberately unchecked: a console that declines to introduce itself is
-        // still a console we can read registers from.
-        for (command in listOf(
-            FitProCodec.Command.SYSTEM_INFO,
-            FitProCodec.Command.VERSION_INFO,
-            FitProCodec.Command.SERIAL_NUMBER,
-        )) {
-            runCatching { transport.exchange(FitProCodec.commandFrame(command, address), command) }
-                .onFailure { Log.w(TAG, "${command.name} failed", it) }
-        }
-
+        // SUPPORTED_COMMANDS comes first because iFit fetches the device tree immediately after
+        // DEVICE_INFO and then sends each interrogation command only if the console advertised it
+        // (`foreach … if (PrimaryDevice.SupportedCommands.Contains(item.Key))`). Asking a console
+        // for something it just said it does not implement is exactly the kind of frame that gets
+        // no reply.
         supportedCommands = runCatching {
             transport.exchange(
                 FitProCodec.commandFrame(FitProCodec.Command.SUPPORTED_COMMANDS, address),
@@ -247,6 +340,36 @@ class DirectMachineSession(
                 ?.let(FitProCodec::parseSupportedCommands)
                 .orEmpty()
         }.getOrDefault(emptySet())
+
+        // Informational for the most part, but two of these carry the inputs the security handshake
+        // is computed from, so their replies are kept rather than discarded. A console that
+        // declines to introduce itself is still a console we can read registers from — unless it
+        // also demands security, which is handled below.
+        val replies = mutableMapOf<FitProCodec.Command, ByteArray>()
+        for (command in listOf(
+            FitProCodec.Command.SYSTEM_INFO,
+            FitProCodec.Command.VERSION_INFO,
+            FitProCodec.Command.SERIAL_NUMBER,
+        )) {
+            // An empty set means the console never told us, not that it supports nothing — gating
+            // strictly on that would skip SYSTEM_INFO and so make the unlock below impossible.
+            if (supportedCommands.isNotEmpty() && command !in supportedCommands) {
+                Log.i(TAG, "${command.name} not advertised; skipping")
+                continue
+            }
+            runCatching { transport.exchange(FitProCodec.commandFrame(command, address), command) }
+                .onFailure { Log.w(TAG, "${command.name} failed", it) }
+                .getOrNull()
+                ?.let { replies[command] = it }
+        }
+        systemInfo = replies[FitProCodec.Command.SYSTEM_INFO]?.let(FitProCodec::parseSystemInfo)
+        masterLibraryVersion = replies[FitProCodec.Command.VERSION_INFO]
+            ?.let(FitProCodec::parseMasterLibraryVersion)
+
+        // Order matters: unlock before the probe. The probe writes, and on a console that demands
+        // security an unauthorised write is refused rather than ignored — so probing first would
+        // diagnose a locked console as an unsupported one.
+        security = if (info.requiresSecurity) unlock() else SecurityState.NotRequired
 
         // The probe reads registers too, so it needs the same supported-register filter — see
         // FitProProbe.attempt. deviceInfo is set above, so `supports` can answer by now.
@@ -313,15 +436,24 @@ class DirectMachineSession(
             missing.isEmpty() -> ""
             else -> " It doesn't offer ${missing.joinToString(" or ") { it.name.lowercase() }}."
         }
-        // Only worth saying when the probe could not get a write accepted: on a console that took
-        // our writes, the security version is trivia, but on one that refused them it is the answer.
-        val security = when {
-            info.requiresSecurity && probeResult.stage == FitProProbe.Stage.UNCONFIRMED ->
-                " Its software version (${info.softwareVersion}) is one that asks for a security" +
-                    " handshake Stride can't perform, which may be why."
-            else -> ""
+        // Only worth saying when something went wrong: on a console that took our writes, the
+        // security state is trivia; on one that refused them it is very often the answer.
+        val securityNote = when (val state = security) {
+            is SecurityState.Refused ->
+                " Its software version (${info.softwareVersion}) demands a security handshake," +
+                    " and the machine rejected Stride's answer (${state.reason})."
+            is SecurityState.Unavailable ->
+                " Its software version (${info.softwareVersion}) demands a security handshake" +
+                    " Stride couldn't complete: ${state.reason}."
+            SecurityState.Unlocked ->
+                if (probeResult.stage == FitProProbe.Stage.UNCONFIRMED) {
+                    " It did accept Stride's security handshake, so the refusal is something else."
+                } else {
+                    ""
+                }
+            SecurityState.NotRequired -> ""
         }
-        return "Found a $brand machine on ${transport.name}. ${probeResult.detail}.$caveat$security"
+        return "Found a $brand machine on ${transport.name}. ${probeResult.detail}.$caveat$securityNote"
     }
 
     /**
@@ -386,6 +518,7 @@ class DirectMachineSession(
             supportedCommands = emptySet()
             fanRegister = null
             address = FitProCodec.ADDRESS_MAIN
+            forgetSecurity()
         }
     }
 
@@ -397,9 +530,27 @@ class DirectMachineSession(
             supportedCommands = emptySet()
             fanRegister = null
             address = FitProCodec.ADDRESS_MAIN
+            forgetSecurity()
             runCatching { transport.close() }
                 .onFailure { Log.w(TAG, "closing direct transport failed", it) }
         }
+    }
+
+    /**
+     * Drop everything learned about this console's security gate.
+     *
+     * Kept as one call rather than three assignments because these three fields are only ever
+     * meaningful together, and because every reset path in this class has at some point been the
+     * place a field was forgotten. `security` in particular is public and drives what the settings
+     * screen tells the rider — leaving it reading "unlocked" after the link dropped would make the
+     * one diagnostic this change exists to provide say the opposite of the truth.
+     *
+     * Caller must hold [wire].
+     */
+    private fun forgetSecurity() {
+        security = SecurityState.NotRequired
+        systemInfo = null
+        masterLibraryVersion = null
     }
 
     /** What [connect] found, for diagnostics and for the settings screen's copy. */
@@ -420,6 +571,15 @@ class DirectMachineSession(
 
         /** Registers a treadmill must implement for Stride to drive it. */
         val REQUIRED_FOR_CONTROL = listOf(FitProCodec.Register.KPH, FitProCodec.Register.GRADE)
+
+        /**
+         * How [MachineAck.Refused] spells `SECURITY_BLOCK`.
+         *
+         * Derived from the enum rather than written out, so that renaming the status cannot leave
+         * the retry silently matching nothing.
+         */
+        val SECURITY_BLOCK_REASON: String =
+            FitProCodec.Status.SECURITY_BLOCK.name.lowercase().replace('_', ' ')
     }
 }
 
