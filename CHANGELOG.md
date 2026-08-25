@@ -7,6 +7,30 @@ what shipped rather than what was intended. Notes for a version come from
 `docs/release-notes/<version>.md` when that file exists, and from the commit subjects since the previous
 tag when it does not.
 
+## 1.2.3 — versionCode 17 — 2026-08-24
+
+**Stride now speaks the rest of the X22i's handshake.** The last release got the console's USB pipe open. This one fixes what Stride said once it was.
+
+Two separate things were wrong, and either alone was enough to stop it.
+
+**Stride was sending malformed commands.** Every command in this protocol declares how many bytes of body it carries, and Stride sent all of them empty. Two of them are not empty — the two that ask the console to describe itself. So the very first command after the successful one was invalid, and the console stopped answering, for that command and for everything after it. That matched the field report exactly: the handshake got one good reply, reported the machine's address, software and register count, and then went quiet forever.
+
+**And Stride could not unlock the console.** Consoles above a certain software version refuse to accept any command that moves the belt until they have been shown a 32-byte answer to a challenge. Stride had no way to produce it, and this project's own notes said so — that it was a gate the direct connection could never pass. That turned out to be wrong. The answer is not a secret; it is computed from three numbers the console itself reports during the handshake. Stride now computes it and sends it, and re-sends it if a console drops its unlock mid-workout.
+
+The X22i in the field reports software version 83. The threshold is 75.
+
+**Settings will now tell you which of those happened.** If a console demands the unlock and rejects Stride's answer, it says so. If it demands one and Stride could not assemble it, it says which piece was missing. Previously all of this arrived as a machine that connected and then ignored you.
+
+Everything here was checked line by line against iFit's own implementation of this protocol rather than inferred from behaviour, including one console-specific correction their code applies to its own numbers before computing the challenge — omitting it would have failed the unlock on that model only, and looked identical to being refused.
+
+**Still unconfirmed on an X22i.** No X22i has yet driven a belt under Stride, and this release is the first that could. The two fixes are independent, so it is possible for one to work and the other not to. If it still does not connect, the settings line is more specific than it was and is the thing to send.
+
+**The safety key is still the only emergency stop**, on every connection. Nothing here changes what protects you.
+
+Installs as an update over 1.2.2.
+
+Tested on a NordicTrack Commercial 1750. The protocol work is verified against iFit's own code; the X22i path is not yet verified on hardware.
+
 ## 1.2.2 — versionCode 16 — 2026-08-24
 
 **Direct hardware access can now actually open an X22i's console.** This is the fix the last two releases were reaching for and missing.
