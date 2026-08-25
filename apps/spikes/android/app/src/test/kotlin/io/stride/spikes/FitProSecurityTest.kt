@@ -145,19 +145,31 @@ class FitProSecurityTest {
     // ---- request bodies -------------------------------------------------------------------------
 
     /**
-     * The regression this whole change turns on: these two declare a two-byte body, and sending
-     * them empty is what made the X22i fall silent after `DEVICE_INFO`.
+     * The bodies these two declare, taken from GlassOS rather than inferred.
+     *
+     * Sending them empty is what made an X22i fall silent after `DEVICE_INFO`, and the first fix
+     * gave both a two-byte body. That was right about `VERSION_INFO` and wrong about `SYSTEM_INFO`:
+     * `vh/j.java` declares 2 and sends `{false, false}`, but `vh/e.java`'s no-arg constructor —
+     * the `SYSTEM_INFO` one — sets `f16662i = 3` and its `g()` returns `new byte[]{0, 0, 0}`.
+     *
+     * The failure mode of getting it wrong is a frame whose declared length disagrees with the
+     * bytes after it, which is exactly the kind of frame a console answers by saying nothing.
      */
     @Test
-    fun `system and version info carry a two-byte body`() {
-        for (command in listOf(FitProCodec.Command.SYSTEM_INFO, FitProCodec.Command.VERSION_INFO)) {
+    fun `system info carries a three-byte body and version info a two-byte one`() {
+        val expected = mapOf(
+            FitProCodec.Command.SYSTEM_INFO to 3,
+            FitProCodec.Command.VERSION_INFO to 2,
+        )
+        for ((command, length) in expected) {
             val frame = FitProCodec.commandFrame(command, address = 2)
-            assertEquals("$command length", 2, command.requestContentLength)
-            assertEquals("$command frame", FitProCodec.FRAME_OVERHEAD + 2, frame.size)
+            assertEquals("$command length", length, command.requestContentLength)
+            assertEquals("$command frame", FitProCodec.FRAME_OVERHEAD + length, frame.size)
             assertEquals("$command declared length", frame.size, frame[1].toInt() and 0xFF)
-            // Both flags mean "don't also send me the name".
-            assertEquals("$command flag 0", 0, frame[3].toInt())
-            assertEquals("$command flag 1", 0, frame[4].toInt())
+            // Every flag byte is zero in both: "answer, but don't also send me the names".
+            for (i in 0 until length) {
+                assertEquals("$command body byte $i", 0, frame[3 + i].toInt())
+            }
             assertEquals(
                 "$command checksum",
                 FitProCodec.checksum(frame, frame.size - 1),

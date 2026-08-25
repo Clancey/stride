@@ -422,16 +422,32 @@ class DirectMachineSession(
      * second for the case this codebase cannot rule out: a link wired straight to the motor
      * controller rather than through the console, where MAIN may be nobody.
      */
+    /** Bytes as lowercase hex, for a log line that can be read back against the protocol notes. */
+    private fun hex(bytes: ByteArray): String =
+        bytes.joinToString(" ") { "%02x".format(it) }
+
     private fun handshake(): FitProCodec.DeviceInfo? {
         val refusals = linkedMapOf<Int, FitProCodec.Status?>()
         for (candidate in listOf(FitProCodec.ADDRESS_MAIN, FitProCodec.ADDRESS_TREADMILL)) {
+            val request = FitProCodec.commandFrame(FitProCodec.Command.DEVICE_INFO, candidate)
             val reply = runCatching {
-                transport.exchange(
-                    FitProCodec.commandFrame(FitProCodec.Command.DEVICE_INFO, candidate),
-                    FitProCodec.Command.DEVICE_INFO,
-                )
+                transport.exchange(request, FitProCodec.Command.DEVICE_INFO)
             }.getOrNull()
+            // Logged as bytes, both ways, because every conclusion drawn from this exchange so far
+            // has been drawn from a decoded status with nothing to check it against. A refusal and a
+            // misread buffer are the same three words in a log line and completely different bugs.
+            Log.i(
+                TAG,
+                "DEVICE_INFO @$candidate -> ${hex(request)} <- ${reply?.let(::hex) ?: "(nothing)"}",
+            )
             if (reply == null) {
+                refusals[candidate] = null
+                continue
+            }
+            // Checked before the status is believed. See FitProCodec.replyMatches: without this, a
+            // stale frame or an unwritten buffer reads as a plausible refusal from the console.
+            if (!FitProCodec.replyMatches(reply, FitProCodec.Command.DEVICE_INFO, candidate)) {
+                Log.w(TAG, "address $candidate answered something that was not a DEVICE_INFO reply")
                 refusals[candidate] = null
                 continue
             }

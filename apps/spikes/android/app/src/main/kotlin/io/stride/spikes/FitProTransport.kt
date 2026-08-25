@@ -198,10 +198,98 @@ class UsbSerialTransport private constructor(
             // the first read racing a console that has not begun answering.
             val delay = command.readDelayMs
             if (delay > 0) Thread.sleep(delay)
-            readFrame(timeoutMs)
+            readAnswer(frame, timeoutMs)
         } catch (t: Throwable) {
             Log.w(FitProTransport.TAG, "usb exchange failed", t)
             null
+        }
+    }
+
+    /**
+     * Bring the console's framer into step before any command is sent.
+     *
+     * Transcribed from GlassOS's own USB open routine (`wh/c.X`), which is unambiguous about what it
+     * is doing because it logs every step: *"Discarding buffer from console"*, *"Sending buffer full
+     * of 0xFF"*, *"0xFF send successfully. Now reading"*, and then either *"Read the response but it
+     * was not what was expected"* or *"Read the response and it was equal to the expected response.
+     * Incrementing consecutiveBuffers"*. It requires **two consecutive** good buffers and gives up
+     * after ten failures of either kind.
+     *
+     * The expected answer is the pattern itself: 64 bytes of `0xFF`, with index 3 a wildcard. That
+     * is `ai.b.f824b` — the same constant the normal read path uses to *reject* a frame, because
+     * during traffic an all-`0xFF` buffer is not data and during sync it is the whole point.
+     *
+     * ## Why this is the missing piece
+     *
+     * Without it the console answers, but out of step. Measured here: `DEVICE_INFO` sent as
+     * `04 04 81 89` came back as `00 04 04 81` — a padding byte, then the request repeated rather
+     * than answered. A frame like that passes every structural check, so it decodes as a plausible
+     * refusal, and the console looks like it does not implement the protocol. It does. It had simply
+     * never been synchronised.
+     */
+    private fun synchronise(): Boolean {
+        val pattern = ByteArray(SYNC_BUFFER_BYTES) { 0xFF.toByte() }
+        val buffer = ByteArray(SYNC_BUFFER_BYTES)
+        var consecutive = 0
+        var writeFailures = 0
+        var readFailures = 0
+
+        while (consecutive < SYNC_CONSECUTIVE && writeFailures < SYNC_MAX_FAILURES &&
+            readFailures < SYNC_MAX_FAILURES
+        ) {
+            // Whatever the console was part-way through saying is not an answer to anything we are
+            // about to ask. Deliberately unchecked: an empty pipe is the normal case here.
+            transfer(readEndpoint, buffer, buffer.size, SYNC_TIMEOUT_MS)
+
+            val sent = transfer(writeEndpoint, pattern.copyOf(), pattern.size, SYNC_TIMEOUT_MS)
+            if (sent != pattern.size) {
+                writeFailures++
+                Thread.sleep(SYNC_RETRY_MS)
+                continue
+            }
+
+            val read = transfer(readEndpoint, buffer, buffer.size, SYNC_TIMEOUT_MS)
+            if (read != buffer.size || !isSyncPattern(buffer)) {
+                readFailures++
+                // Consecutive means consecutive. One bad buffer restarts the count, as it does in
+                // GlassOS: the point is evidence that the pipe is quiet and aligned, not that it
+                // managed it once.
+                consecutive = 0
+                Thread.sleep(SYNC_RETRY_MS)
+                continue
+            }
+            consecutive++
+        }
+        return consecutive >= SYNC_CONSECUTIVE
+    }
+
+    /** The sync pattern: every byte `0xFF`, except index 3 which the console may write. */
+    private fun isSyncPattern(buffer: ByteArray): Boolean =
+        buffer.indices.all { it == 3 || buffer[it] == 0xFF.toByte() }
+
+    /**
+     * Read frames until one of them is an answer rather than an acknowledgement.
+     *
+     * Measured on a FitPro2 console: the first frame back from a `DEVICE_INFO` can be the request
+     * *itself*, byte for byte. It is a well-formed frame with the right address, length, command and
+     * checksum — so every structural check passes, and the byte a caller then reads as a status is
+     * really the request's own checksum.
+     *
+     * GlassOS never trips over this because its USB path validates each read and simply reads again
+     * when a frame is not usable (`rj/p`, `wh/c.r`). Reading exactly once and believing whatever came
+     * back is the assumption that was wrong.
+     */
+    private fun readAnswer(request: ByteArray, timeoutMs: Long): ByteArray? {
+        val deadline = System.nanoTime() + timeoutMs * 1_000_000
+        while (true) {
+            val remainingMs = (deadline - System.nanoTime()) / 1_000_000
+            if (remainingMs <= 0) return null
+            val reply = readFrame(remainingMs) ?: return null
+            if (!reply.contentEquals(request)) return reply
+            Log.i(
+                FitProTransport.TAG,
+                "usb: console echoed the request; reading on for the answer",
+            )
         }
     }
 
@@ -427,8 +515,22 @@ class UsbSerialTransport private constructor(
      * A transfer returns whatever has arrived, not what was asked for, so a frame can be split
      * across reads. Byte 1 of a FitPro frame is its total length, which is what makes reassembly
      * possible at all — this reads the header, then keeps going until the declared length is
-     * satisfied or the deadline passes. Returning the first partial read instead, which is what this
-     * replaced, hands the parser a header with a missing tail.
+     * satisfied or the deadline passes.
+     *
+     * ## Resynchronising, and why it is not optional
+     *
+     * The stream does not always start where a frame does. Measured on a FitPro2 console
+     * (`vendor 8508 / product 3`), a `DEVICE_INFO` sent to address 4 as `04 04 81 89` read back as
+     * `00 04 04 81` — a leading `00` followed by the frame. Taken at face value that makes byte 1
+     * the *address*, not the length, so the reader declares a 4-byte frame, truncates, and throws
+     * the real answer away. Downstream that surfaced as a console answering `CMD_NOT_SUPPORTED` to
+     * every command, which is a sentence about a machine that was never actually asked.
+     *
+     * A leading zero cannot begin a frame: byte 0 is the device address and address 0 is `NONE`.
+     * GlassOS rejects exactly that (`ai/b.a`: *"Reason: 'bytes [0] == 0'"*) and reads again rather
+     * than believing it — its USB path retries with a ramping timeout for this reason. So leading
+     * zeroes are skipped here, and a header that still cannot be a frame is dropped a byte at a time
+     * until one can, for as long as the deadline allows.
      */
     private fun readFrame(timeoutMs: Long): ByteArray? {
         val deadline = System.nanoTime() + timeoutMs * 1_000_000
@@ -437,6 +539,35 @@ class UsbSerialTransport private constructor(
         var declared = -1
 
         while (true) {
+            // Drop anything that cannot be the first byte of a frame. Cheap, and it is what turns a
+            // stream with a padding byte in front of it back into a protocol.
+            var dropped = 0
+            while (frame.isNotEmpty() && frame[0] == 0.toByte()) {
+                frame = frame.copyOfRange(1, frame.size)
+                dropped++
+            }
+            if (dropped > 0) {
+                declared = -1
+                Log.i(FitProTransport.TAG, "usb: skipped $dropped leading zero byte(s)")
+            }
+
+            if (declared < 0 && frame.size >= 2) {
+                val length = frame[1].toInt() and 0xFF
+                if (length < FitProCodec.FRAME_OVERHEAD || length > FitProCodec.MAX_FRAME_LENGTH) {
+                    // Not a length, so this was not a header. Give up on this byte rather than on
+                    // the read: the frame may begin at the next one.
+                    Log.i(FitProTransport.TAG, "usb: resyncing past a ${length}-byte length claim")
+                    frame = frame.copyOfRange(1, frame.size)
+                    continue
+                }
+                declared = length
+            }
+            if (declared in 1..frame.size) {
+                // Trailing bytes would be the next frame, so hand up exactly this one and let the
+                // caller's exact-fit check stay meaningful.
+                return frame.copyOfRange(0, declared)
+            }
+
             val remainingMs = (deadline - System.nanoTime()) / 1_000_000
             if (remainingMs <= 0) {
                 if (frame.isNotEmpty()) {
@@ -448,18 +579,6 @@ class UsbSerialTransport private constructor(
             if (read < 0) return null
             if (read == 0) continue
             frame += chunk.copyOfRange(0, read)
-
-            if (declared < 0 && frame.size >= 2) {
-                declared = frame[1].toInt() and 0xFF
-                // A frame shorter than its own header is corruption, and waiting for more bytes
-                // would just stall until the deadline behind a stream that is already unusable.
-                if (declared < FitProCodec.FRAME_OVERHEAD) return null
-            }
-            if (declared in 1..frame.size) {
-                // Trailing bytes would be the next frame, so hand up exactly this one and let the
-                // caller's exact-fit check stay meaningful.
-                return frame.copyOfRange(0, declared)
-            }
         }
     }
 
@@ -622,6 +741,19 @@ class UsbSerialTransport private constructor(
          * to find out anything about it.
          */
         private const val CANCEL_REAP_MS = 50L
+
+        /**
+         * The sync exchange GlassOS performs before it will speak to a USB console.
+         *
+         * All four numbers come from `wh/c.X`: a 64-byte pattern, two consecutive good buffers to
+         * call it synchronised, ten failures of either kind before giving up, and a 500 ms pause
+         * between attempts. The per-transfer budget is the adapter's own `f17339x`, 300 ms.
+         */
+        private const val SYNC_BUFFER_BYTES = 64
+        private const val SYNC_CONSECUTIVE = 2
+        private const val SYNC_MAX_FAILURES = 10
+        private const val SYNC_TIMEOUT_MS = 300
+        private const val SYNC_RETRY_MS = 500L
 
 
         /**
@@ -838,7 +970,18 @@ class UsbSerialTransport private constructor(
             // failure would be reported against a console that is working.
             blocked = false
             Log.i(FitProTransport.TAG, "usb open: ${device.deviceName} as $variant")
-            return UsbSerialTransport(manager, device, connection, iface, read, write, variant)
+            val transport =
+                UsbSerialTransport(manager, device, connection, iface, read, write, variant)
+            // Before any command is sent. Reported rather than fatal: a console that will not sync
+            // is unlikely to answer afterwards, but "it never synchronised" is a far more useful
+            // report than a handshake that silently finds nothing, and the diagnostics can only
+            // describe a transport that exists.
+            if (transport.synchronise()) {
+                Log.i(FitProTransport.TAG, "usb: console synchronised")
+            } else {
+                Log.w(FitProTransport.TAG, "usb: console did not answer the 0xFF sync")
+            }
+            return transport
         }
 
         /**
