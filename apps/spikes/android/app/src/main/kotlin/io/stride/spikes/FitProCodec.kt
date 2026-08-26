@@ -398,7 +398,28 @@ object FitProCodec {
         // ---- lifetime counters and console flags ----
         MOTOR_TOTAL_DISTANCE(69, 4, readOnly = true),
         TOTAL_TIME(70, 4, readOnly = true),
+
+        /**
+         * Field 95 in FitPro1's own `BitField` enum (`Sindarin.FitPro1.Bits.BitField`, decompiled
+         * from `ifit-standalone.apk`'s Xamarin assemblies). GlassOS/FitPro2 has no binding for it —
+         * this device never saw it before this investigation. iFit writes it unconditionally right
+         * after unlock, from `!IsBitFieldSupported(RequireStartRequested) || !IsBeltBasedMachine()`.
+         * EXPERIMENTAL: not yet confirmed this write is required or has this effect on real hardware.
+         */
+        IDLE_MODE_LOCKOUT(95, 1, readOnly = false),
         START_REQUESTED(96, 1, readOnly = true),
+
+        /**
+         * Field 108, same source as [IDLE_MODE_LOCKOUT]. iFit's `FitPro1Console` writes this
+         * (echoing whatever the console's own supported-fields bitmap already says about it)
+         * immediately after unlock and before anything else that touches workout state — see
+         * `FitPro1Console.cs`: `SetRequireStartRequested(IsBitFieldSupported(RequireStartRequested))`.
+         * Candidate explanation for why `WORKOUT_MODE = RUNNING` was refused with a clean `FAILED`
+         * on the X22i even after every other precondition (unlock, supported-field checks) held:
+         * this console may simply never have been told to leave whatever state it starts in.
+         * EXPERIMENTAL: not yet confirmed this write is required or has this effect on real hardware.
+         */
+        REQUIRE_START_REQUESTED(108, 1, readOnly = false),
         IS_READY_TO_DISCONNECT(116, 1, readOnly = true),
         ;
 

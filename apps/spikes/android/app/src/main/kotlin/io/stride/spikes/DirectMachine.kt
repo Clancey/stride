@@ -391,6 +391,15 @@ class DirectMachineSession(
         // diagnose a locked console as an unsupported one.
         security = if (info.requiresSecurity) unlock() else SecurityState.NotRequired
 
+        // EXPERIMENTAL, being verified against a real X22i: iFit's own FitPro1Console writes these
+        // two fields immediately after unlock, unconditionally, before it will consider a console
+        // initialized for control (see Register.REQUIRE_START_REQUESTED/IDLE_MODE_LOCKOUT). Sent as
+        // best-effort, informational writes here for the same reason SYSTEM_INFO/VERSION_INFO above
+        // are: too early for authorisedWrite's probe gate, and not worth failing connect() over.
+        if (info.supports(FitProCodec.Register.REQUIRE_START_REQUESTED)) {
+            initializeStartGate(info)
+        }
+
         // The probe reads registers too, so it needs the same supported-register filter — see
         // FitProProbe.attempt. deviceInfo is set above, so `supports` can answer by now.
         val probeResult = probe.confirm(transport, reference, address) { info.supports(it) }
@@ -400,6 +409,41 @@ class DirectMachineSession(
             probe = probeResult,
             detail = describe(info, probeResult),
         ).also { lastConnect = it }
+    }
+
+    /**
+     * EXPERIMENTAL — reproduces `FitPro1Console`'s post-unlock initialization writes, in order to
+     * test whether the X22i's clean, immediate `FAILED` on `WORKOUT_MODE = RUNNING` (see
+     * `DIRECT_MACHINE_PROTOCOL.md`'s "What is still open") is actually a missing-initialization
+     * problem rather than a start-command problem. iFit writes both fields unconditionally right
+     * after unlock, before it treats the console as ready for control; `[connect]` had never sent
+     * either write before this.
+     *
+     * Best-effort and silent on failure: this is diagnostic, not something a rider's connection
+     * should fail over, and [Register.supports] having already gated the call means a refusal here
+     * is itself a finding worth the log line, not a surprise worth surfacing further.
+     */
+    private fun initializeStartGate(info: FitProCodec.DeviceInfo) {
+        val writes = buildList {
+            add(FitProCodec.writeOf(FitProCodec.Register.REQUIRE_START_REQUESTED, byteArrayOf(1)))
+            if (info.supports(FitProCodec.Register.IDLE_MODE_LOCKOUT)) {
+                add(FitProCodec.writeOf(FitProCodec.Register.IDLE_MODE_LOCKOUT, byteArrayOf(0)))
+            }
+        }
+        val body = FitProCodec.readWriteBody(writes, emptyList())
+        val frame = FitProCodec.frame(body, address = address)
+        val reply = runCatching { transport.exchange(frame) }.getOrNull()
+        if (reply == null) {
+            Log.w(TAG, "start-gate init: no answer")
+            return
+        }
+        val response = FitProCodec.parseResponse(reply, emptyList(), expectAddress = replyAddress ?: address)
+        Log.i(
+            TAG,
+            "start-gate init (REQUIRE_START_REQUESTED=1" +
+                (if (writes.size > 1) ", IDLE_MODE_LOCKOUT=0" else "") +
+                ") -> ${response?.let { if (it.accepted) "accepted" else it.status } ?: "malformed reply"}",
+        )
     }
 
     /**
