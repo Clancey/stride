@@ -546,6 +546,40 @@ the machine's own notion of workout state is authoritative, and the stream tells
 else* (a hardware button, the safety key) changed it. Stride's session state machine must treat that
 stream as an input, not assume it is the only actor.
 
+**A pause is not an end, and the state machine has to say which.** `idle → running ⇄ paused` and
+`→ idle` were the whole vocabulary, and that was not enough: three different rider actions arrive as
+"now idle" and only one of them is a workout being finished. A session therefore carries the
+*reason* it returned to idle, and it is passed to listeners as an argument rather than left on the
+session to be read back, so a listener making its own transition cannot overwrite it under the
+listeners that have not run yet.
+
+- **Paused** is resumable. The rider stepped off; the belt is expected to move again, and the
+  console's own Stop button is adopted as a pause. It gets the pause command and nothing else.
+- **Abandoned** is a start that never began — refused, cancelled, or timed out. It gets the stop, on
+  the grounds that a refusal can be a reply that was lost rather than a command that never landed,
+  and nothing more: it is the retry path, and the goal survives precisely because it is not a
+  workout the rider completed.
+- **Ended** is the rider pressing End. Deliberate, final, not resumable — and the only one that
+  earns the extra writes below.
+
+**What an end does beyond stopping.** Two things, both queued *behind* the stop and never in front
+of it, because a stop preempts everything and gaining a fan write in front of it would be a worse
+app than the bug being fixed:
+
+1. **Re-assert zero.** Speed 0, then incline 0 if that was accepted. This is not "faking a stop by
+   commanding speed 0" in place of the native verb — the native stop still goes first, and this is
+   insurance for the case where its frame was lost. On a console that took the stop these are
+   refused, which costs nothing; on one that did not, they are what stops the belt. They are
+   explicitly **not** confirmation: a stop is done on ack plus observed deceleration (§5.4), and a
+   command Stride sent is neither.
+2. **Fan off.** The missing counterpart to restoring the fan on start. Sent unconditionally rather
+   than gated on what Stride thinks the fan is doing — a restore still in flight would be invisible
+   to such a check and would turn the fan on right behind the stop — and it deliberately does not
+   overwrite the rider's remembered fan preference, which the next workout replays.
+
+Both are retired by a new workout, so a rider who ends one and immediately starts another does not
+have their start queued behind round trips settling a session that is over.
+
 **No auto-start, ever.** The belt never begins moving from app launch, boot, profile switch, or a
 companion command without explicit on-console confirmation.
 

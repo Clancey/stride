@@ -420,6 +420,36 @@ side, which maps RESUME to `WORKOUT_RUNNING`.
 `resume()` now writes RESUME and falls back to RUNNING only if the console refuses, so a machine that
 does not implement the mode still resumes.
 
+### Ending a workout writes zero twice — deliberately
+
+`stop()` is one frame carrying `KPH = 0` and `WORKOUT_MODE = IDLE` together, and that has not
+changed. What has is what follows it, and only at a definitive **End workout** — never at a pause.
+An end now sends, in this order and each as its own queued job behind the stop:
+
+| Order | Write | Sent when |
+|---|---|---|
+| 1 | `KPH = 0`, `WORKOUT_MODE = IDLE` | always — the stop itself, preempting the queue |
+| 2 | `KPH = 0` | always |
+| 3 | `GRADE = 0` | only if 2 was accepted |
+| 4 | `FAN_STATE = OFF` | always |
+
+The second zero looks redundant and is the point. If the stop frame landed, the console is idle, it
+will most likely refuse 2 and 3, and the cost is a log line. If the stop frame was **lost** — a
+dropped BLE chunk, a USB board that left the bus (see the hazard below) — then the console is still
+in a workout, it accepts 2, and that is the write that stops the treadmill. The trade is two round
+trips on the ending path against a belt left running under an app showing "Start workout".
+
+`GRADE` is gated on the speed write being accepted, because the only reason to be sending 3 at all
+is that 2 was needed, and a belt that is still moving is the last state to be dropping a deck in.
+It is clamped like any other incline, so a machine whose reported grade range excludes zero gets as
+flat as it goes rather than a value it would refuse — the same coercion `startWorkout` applies on
+the way in.
+
+None of this is stop *confirmation*. A stop is done on ack plus observed deceleration in telemetry
+(`docs/PLAN.md` §5.4), and `ACTUAL_KPH` (16) is where that reading comes from — a register Stride
+only reads. Commanded `KPH` (0) and observed `ACTUAL_KPH` (16) are different fields, and no amount
+of writing the first is evidence about the second.
+
 ## `workoutId` — VERIFIED, and synthesised on the direct path
 
 Every GlassOS metric response carries a `workoutID` in field 1 (`nb/r3` — `GetSpeedResponse`:

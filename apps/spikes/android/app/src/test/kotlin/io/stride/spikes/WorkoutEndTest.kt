@@ -1,0 +1,143 @@
+package io.stride.spikes
+
+import org.junit.Assert.assertEquals
+import org.junit.Test
+
+/**
+ * Telling a workout that *ended* from one that was merely paused.
+ *
+ * The bug these exist for is issue #29: Stride turned the console fan on at the start of every
+ * workout and never turned it off, so a machine left alone after a run kept blowing indefinitely.
+ * Adding the missing half is easy; adding it to the *wrong* transition is the part that needed
+ * pinning, because a pause and an end used to be one shrug away from each other in this code.
+ *
+ * A pause is resumable. The rider stepped off to answer the door, the belt is expected to move
+ * again, and an app that shut their fan down and dropped their deck to flat every time they paused
+ * would be deciding on their behalf that the session is over. It is also not only a button: the
+ * console's own Stop button is adopted as a pause by [consoleFollowUp], so getting this wrong would
+ * end a workout every time somebody used the machine's own controls.
+ *
+ * Pure, so every branch is checkable without a treadmill — the same reason [startSettlement] and
+ * [consoleFollowUp] are pure.
+ */
+class WorkoutEndTest {
+
+    /** The feature, stated directly: End is the one transition that settles the machine. */
+    @Test
+    fun `ending a workout stops the belt and settles the machine`() {
+        assertEquals(
+            EndFollowUp.STOP_AND_SETTLE,
+            endFollowUp(
+                previous = WorkoutSession.State.PAUSED,
+                next = WorkoutSession.State.IDLE,
+                ending = WorkoutSession.Ending.ENDED,
+            ),
+        )
+    }
+
+    /**
+     * The end is not conditional on where it was ended from.
+     *
+     * The overlay only offers "End workout" from PAUSED today, but `SpikeBridge.workoutStop` and
+     * `WorkoutSession.stop` will both end a RUNNING session, and an end is an end.
+     */
+    @Test
+    fun `a workout ended while running settles the machine too`() {
+        assertEquals(
+            EndFollowUp.STOP_AND_SETTLE,
+            endFollowUp(
+                previous = WorkoutSession.State.RUNNING,
+                next = WorkoutSession.State.IDLE,
+                ending = WorkoutSession.Ending.ENDED,
+            ),
+        )
+    }
+
+    /**
+     * A pause gets none of it — not the fan, not the re-assert, not the deck.
+     *
+     * This is the test the whole change is balanced on. A pause never reaches IDLE, so it must ask
+     * the end path for nothing at all; the pause command itself is issued elsewhere.
+     */
+    @Test
+    fun `a pause is not an end`() {
+        assertEquals(
+            EndFollowUp.NOTHING,
+            endFollowUp(
+                previous = WorkoutSession.State.RUNNING,
+                next = WorkoutSession.State.PAUSED,
+                ending = null,
+            ),
+        )
+    }
+
+    /** Nor is resuming out of one, or starting, or confirming a start. */
+    @Test
+    fun `no live transition is an end`() {
+        val live = listOf(
+            WorkoutSession.State.PAUSED to WorkoutSession.State.RUNNING,
+            WorkoutSession.State.IDLE to WorkoutSession.State.STARTING,
+            WorkoutSession.State.STARTING to WorkoutSession.State.RUNNING,
+        )
+        for ((previous, next) in live) {
+            assertEquals(
+                "$previous -> $next must not settle the machine",
+                EndFollowUp.NOTHING,
+                endFollowUp(previous, next, ending = null),
+            )
+        }
+    }
+
+    /**
+     * An abandoned start still stops the belt, and still gets nothing else.
+     *
+     * `WorkoutSession.abandon` is a start the machine refused, the rider cancelled, or the watchdog
+     * gave up on. The stop is unchanged and unconditional — a refusal can be a reply that was lost
+     * rather than a command that never landed, so a belt that might be moving is always told to
+     * stop. The settling is deliberately withheld: this is the retry path, nothing established the
+     * belt ever moved, and the round trips would land on the one screen where a rider is standing
+     * on a treadmill waiting to hear whether their start worked.
+     */
+    @Test
+    fun `an abandoned start stops the belt without settling the machine`() {
+        assertEquals(
+            EndFollowUp.STOP,
+            endFollowUp(
+                previous = WorkoutSession.State.STARTING,
+                next = WorkoutSession.State.IDLE,
+                ending = WorkoutSession.Ending.ABANDONED,
+            ),
+        )
+    }
+
+    /**
+     * An IDLE transition with no ending recorded stops, and does no more.
+     *
+     * Unreachable today — every path to IDLE names its ending — which is exactly why it is pinned.
+     * The safe reading of "we do not know what this was" is to stop the belt and touch nothing
+     * else; an unrecognised ending must never be a licence to start moving a deck.
+     */
+    @Test
+    fun `an ending this build does not recognise still stops the belt`() {
+        assertEquals(
+            EndFollowUp.STOP,
+            endFollowUp(
+                previous = WorkoutSession.State.RUNNING,
+                next = WorkoutSession.State.IDLE,
+                ending = null,
+            ),
+        )
+    }
+
+    /** Already idle asks for nothing: there is no session to end and no belt we started. */
+    @Test
+    fun `an idle session that goes idle again asks for nothing`() {
+        for (ending in listOf(null, WorkoutSession.Ending.ENDED, WorkoutSession.Ending.ABANDONED)) {
+            assertEquals(
+                "idle -> idle ($ending) must ask for nothing",
+                EndFollowUp.NOTHING,
+                endFollowUp(WorkoutSession.State.IDLE, WorkoutSession.State.IDLE, ending),
+            )
+        }
+    }
+}

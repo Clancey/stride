@@ -455,7 +455,7 @@ class OverlayService : Service() {
     private val cyan = Color.rgb(40, 199, 255)
     private val cyanMuted = Color.rgb(190, 234, 255)
 
-    private val workoutListener: (WorkoutSession.State) -> Unit = { state ->
+    private val workoutListener = WorkoutSession.Listener { state, _ ->
         mainHandler.post {
             // A setpoint the rider asked for before the machine would take one. RUNNING is the
             // first moment the console will accept it; IDLE means the start was refused or given

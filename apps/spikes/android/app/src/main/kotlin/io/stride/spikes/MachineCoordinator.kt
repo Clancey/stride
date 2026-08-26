@@ -130,6 +130,19 @@ object MachineCoordinator {
     /** Compared by identity in [drain], so it must be the exact string the stop job carries. */
     private const val STOP_LABEL = "Stop"
 
+    /**
+     * The end-of-workout re-assert.
+     *
+     * Deliberately **not** called "confirm". A stop is confirmed by ack plus observed deceleration
+     * in telemetry (plan §5.4), and nothing this job does is evidence of either — it is another
+     * command going out, not a reading coming back. Naming it "confirm stopped" would be the first
+     * step towards somebody treating its [Outcome.Ok] as proof the belt is at rest, which is the
+     * exact mistake that ends with "stopped" on screen over a moving belt.
+     */
+    private const val REASSERT_LABEL = "Re-assert zero"
+
+    private const val FAN_OFF_LABEL = "Fan off (workout ended)"
+
     private data class Job(
         val generation: Int,
         val label: String,
@@ -140,11 +153,39 @@ object MachineCoordinator {
          * incline or fan change, which have nothing to do with it.
          */
         val speedGen: Int? = null,
+        /**
+         * The end-of-workout generation this job belongs to, or null for jobs that are not tidying
+         * up after a finished workout. See [endGeneration].
+         */
+        val endGen: Int? = null,
+        /**
+         * Whether this job may overwrite [lastLabel] / [lastOutcome].
+         *
+         * False for the end-of-workout writes. They run *behind* a stop, and a tidy-up that
+         * succeeded must never be the last thing recorded about an end whose stop failed — the
+         * outcome a rider needs to see after pressing End is what happened to the stop.
+         */
+        val reportsOutcome: Boolean = true,
         val run: () -> Outcome,
     )
 
     private val queue = LinkedBlockingDeque<Job>()
     private val generation = AtomicInteger(0)
+
+    /**
+     * Retires the writes that tidy up after a finished workout.
+     *
+     * Separate from [generation] for the same reason [speedGeneration] is: that one means
+     * "everything queued is stale", and a stop must keep meaning exactly that. This one means "the
+     * workout those writes belonged to is over and something newer wants the machine".
+     *
+     * It exists because the tidy-up costs round trips — a re-assert is two, the fan is a third —
+     * and each one can block for the console's full command timeout. A rider who ends a workout and
+     * immediately starts another would otherwise have their start queued behind the best part of a
+     * minute of writes for a session that no longer exists, which is long enough for
+     * [WorkoutMachineCoupling]'s start watchdog to give up on a start that was never sent.
+     */
+    private val endGeneration = AtomicInteger(0)
 
     /**
      * Retires pending speed jobs without touching anything else.
@@ -211,6 +252,9 @@ object MachineCoordinator {
     @Synchronized
     fun rebind(commands: MachineCommands?) {
         generation.incrementAndGet()
+        // The previous transport's leftovers include any end-of-workout tidy-up, which was aimed at
+        // a machine we are no longer talking to.
+        endGeneration.incrementAndGet()
         queue.clear()
         this.commands = commands
         if (commands != null && !running) {
@@ -289,81 +333,88 @@ object MachineCoordinator {
      * encodes a related discovery — GlassOS only publishes telemetry *during* a workout, so
      * adopting a live one is how metrics start flowing at all.
      */
-    fun startWorkout(onDone: ((Outcome) -> Unit)? = null) = submit("Start workout", onDone = onDone) {
-        val gen = generation.get()
-        // Connect first, always. It is cheap on a console that is already attached — it just
-        // answers with the current state — and it is the difference between working and not on one
-        // that is not. A rider pressing Start is the one moment we know they want the machine, so
-        // this is the right place to make sure GlassOS has actually given it to us.
-        //
-        // Routed through MachineLink rather than straight to the wire so this shares the poll's
-        // handshake: a start arriving just after one attached returns immediately instead of
-        // repeating it, and a start arriving during one waits for that answer rather than racing it.
-        // The snapshot cannot be used to skip this — it is up to a poll interval stale.
-        val connected = MachineLink.connectNow()
-        if (!connected.attached) {
-            // Fail here rather than pressing on. Every command below would go on to block for the
-            // full timeout and then fail anyway, turning a refusal we already know about into most
-            // of a minute of the rider watching a spinner. This is not the app overruling the
-            // console: we asked the hardware, just now, and it told us — either by saying it has no
-            // machine, or by not answering at all.
-            return@submit Outcome.Failed(
-                if (connected is MachineLink.ConnectResult.Disconnected) {
-                    "The console has no treadmill attached."
-                } else {
-                    "The console did not answer."
-                },
-            )
-        }
-        // Re-read rather than trusting one miss: a null here is "we could not ask", which on the
-        // GlassOS path is often a single dropped RPC and on the direct path is a dropped frame.
-        var state = it.workoutState()
-        var reads = 1
-        while (state == null && reads < MAX_STATE_READS) {
-            if (!settle()) return@submit Outcome.Failed("Interrupted")
-            state = it.workoutState()
-            reads++
-        }
+    fun startWorkout(onDone: ((Outcome) -> Unit)? = null) {
+        // A new workout retires the previous one's tidy-up. Those writes are queued ahead of this
+        // one and each can block for the console's command timeout; letting them run first would
+        // spend that time putting a finished session to bed while a rider stands on the belt
+        // waiting for "Starting…" to become a workout.
+        endGeneration.incrementAndGet()
+        submit("Start workout", onDone = onDone) {
+            val gen = generation.get()
+            // Connect first, always. It is cheap on a console that is already attached — it just
+            // answers with the current state — and it is the difference between working and not on one
+            // that is not. A rider pressing Start is the one moment we know they want the machine, so
+            // this is the right place to make sure GlassOS has actually given it to us.
+            //
+            // Routed through MachineLink rather than straight to the wire so this shares the poll's
+            // handshake: a start arriving just after one attached returns immediately instead of
+            // repeating it, and a start arriving during one waits for that answer rather than racing it.
+            // The snapshot cannot be used to skip this — it is up to a poll interval stale.
+            val connected = MachineLink.connectNow()
+            if (!connected.attached) {
+                // Fail here rather than pressing on. Every command below would go on to block for the
+                // full timeout and then fail anyway, turning a refusal we already know about into most
+                // of a minute of the rider watching a spinner. This is not the app overruling the
+                // console: we asked the hardware, just now, and it told us — either by saying it has no
+                // machine, or by not answering at all.
+                return@submit Outcome.Failed(
+                    if (connected is MachineLink.ConnectResult.Disconnected) {
+                        "The console has no treadmill attached."
+                    } else {
+                        "The console did not answer."
+                    },
+                )
+            }
+            // Re-read rather than trusting one miss: a null here is "we could not ask", which on the
+            // GlassOS path is often a single dropped RPC and on the direct path is a dropped frame.
+            var state = it.workoutState()
+            var reads = 1
+            while (state == null && reads < MAX_STATE_READS) {
+                if (!settle()) return@submit Outcome.Failed("Interrupted")
+                state = it.workoutState()
+                reads++
+            }
 
-        val moving = (MachineLink.speedMph ?: 0.0) > BELT_MOVING_MPH
-        if (shouldAdoptWorkout(state, MachineLink.speedMph)) {
-            Log.i(TAG, "console already running with the belt moving; adopting the existing workout")
-            return@submit Outcome.Ok
-        }
-        if (state == null) {
-            // A moving belt we cannot account for is the one case where doing nothing is right.
-            // Clearing would stop someone else's run; starting would send a start sequence to a
-            // console that is already under way. Adopting is the only option that moves nothing.
-            if (moving) {
-                Log.w(TAG, "console state unreadable but the belt is moving; adopting rather than starting")
+            val moving = (MachineLink.speedMph ?: 0.0) > BELT_MOVING_MPH
+            if (shouldAdoptWorkout(state, MachineLink.speedMph)) {
+                Log.i(TAG, "console already running with the belt moving; adopting the existing workout")
                 return@submit Outcome.Ok
             }
-            // Otherwise refuse. Starting blind means issuing a start against a console whose session
-            // we could not clear and whose state we cannot confirm afterwards — and every speed we
-            // then send would be aimed at a machine we never established was listening.
-            Log.w(TAG, "refusing to start: console workout state could not be read")
-            return@submit Outcome.Failed("The console did not report its workout state")
-        }
+            if (state == null) {
+                // A moving belt we cannot account for is the one case where doing nothing is right.
+                // Clearing would stop someone else's run; starting would send a start sequence to a
+                // console that is already under way. Adopting is the only option that moves nothing.
+                if (moving) {
+                    Log.w(TAG, "console state unreadable but the belt is moving; adopting rather than starting")
+                    return@submit Outcome.Ok
+                }
+                // Otherwise refuse. Starting blind means issuing a start against a console whose session
+                // we could not clear and whose state we cannot confirm afterwards — and every speed we
+                // then send would be aimed at a machine we never established was listening.
+                Log.w(TAG, "refusing to start: console workout state could not be read")
+                return@submit Outcome.Failed("The console did not report its workout state")
+            }
 
-        // Tried and disproven live on the X22i, kept as a note rather than silently forgotten: a
-        // direct `WorkoutMode = Running` write from `RESULTS`, skipping the wait for `IDLE`
-        // entirely — matching iFit's own `WorkoutFacade.StartWorkoutAsync`, which never checks
-        // console state before writing. iFit's own code not gating on state turned out not to mean
-        // the console accepts it from any state: asked directly from `RESULTS` here, it came back
-        // `Rejected(reason=failed)`, cleanly. Whatever lets iFit's client get away with an
-        // unconditional write is something upstream of the wire protocol — its own UI probably
-        // never offers Start until the console has already gone idle in real usage timing — not a
-        // console-side allowance this app can rely on. `IDLE` really is required.
-        val cleared = clearWorkout(it, state)
-        if (!cleared) return@submit Outcome.Failed("The console would not end its previous workout")
-        // Re-checked immediately before the one command here that can set the belt in motion.
-        // Everything above blocks — the handshake, the state reads, and the clearing loop each wait
-        // on the console — so by now the rider may have cancelled, or the start watchdog may have
-        // given up and put the UI back to idle. Starting anyway would move a treadmill under a
-        // screen that shows no workout. The stop that follows a cancel would catch it a moment
-        // later, but a moment is exactly what must not happen on a machine someone is standing on.
-        if (generation.get() != gen) return@submit Outcome.Superseded
-        it.startWorkout().toOutcome()
+            // Tried and disproven live on the X22i, kept as a note rather than silently forgotten: a
+            // direct `WorkoutMode = Running` write from `RESULTS`, skipping the wait for `IDLE`
+            // entirely — matching iFit's own `WorkoutFacade.StartWorkoutAsync`, which never checks
+            // console state before writing. iFit's own code not gating on state turned out not to mean
+            // the console accepts it from any state: asked directly from `RESULTS` here, it came back
+            // `Rejected(reason=failed)`, cleanly. Whatever lets iFit's client get away with an
+            // unconditional write is something upstream of the wire protocol — its own UI probably
+            // never offers Start until the console has already gone idle in real usage timing — not a
+            // console-side allowance this app can rely on. `IDLE` really is required.
+            val cleared = clearWorkout(it, state)
+            if (!cleared) return@submit Outcome.Failed("The console would not end its previous workout")
+            // Re-checked immediately before the one command here that can set the belt in motion.
+            // Everything above blocks — the handshake, the state reads, and the clearing loop each wait
+            // on the console — so by now the rider may have cancelled, or the start watchdog may have
+            // given up and put the UI back to idle. Starting anyway would move a treadmill under a
+            // screen that shows no workout. The stop that follows a cancel would catch it a moment
+            // later, but a moment is exactly what must not happen on a machine someone is standing on.
+            if (generation.get() != gen) return@submit Outcome.Superseded
+            it.startWorkout().toOutcome()
+        }
     }
 
     /** Wait out a console state transition. Returns false if the wait was interrupted. */
@@ -566,6 +617,100 @@ object MachineCoordinator {
         }
     }
 
+    /**
+     * Put the machine back into a known-safe state after a workout the rider *ended*.
+     *
+     * The counterpart to [restoreFan], and deliberately not reachable from a pause. A pause is
+     * resumable — the rider stepped off, the belt is expected to move again, and shutting the fan
+     * down or flattening the deck under them would be the app deciding their session is over. This
+     * runs only for [WorkoutSession.Ending.ENDED]; see [WorkoutMachineCoupling.endFollowUp].
+     *
+     * ## Why anything at all, when [stop] already sent a zero
+     *
+     * Because the interesting case is the one where it did not land. `DirectMachineCommands.stop`
+     * puts `KPH = 0` and `WORKOUT_MODE = IDLE` in a single frame, and a frame that was lost leaves
+     * a belt running under an app that has gone back to showing "Start workout". If the stop *did*
+     * land, the console is idle and will most likely refuse these writes, which costs a log line
+     * and nothing else. If it did not, these are the writes that stop the treadmill. Paying two
+     * round trips on the ending path to cover that is the trade this exists to make.
+     *
+     * ## What it is not
+     *
+     * It is not confirmation. A stop is done on ack **plus** observed deceleration in telemetry,
+     * and this produces neither — see [REASSERT_LABEL]. The [Outcome] it records is deliberately
+     * not published (`reportsOutcome = false`), so nothing downstream can read a successful
+     * re-assert as a successful stop.
+     *
+     * Queued, never preempting. [stop] has already bumped the generation and taken the front of the
+     * queue by the time this is called, so this can only ever sit behind it. That ordering is not
+     * an accident of timing: the caller issues the stop first, and `submit` only ever appends.
+     */
+    fun reassertZero() {
+        // Sampled here, on the caller's thread, so the checks inside the job compare against the
+        // state this end belonged to rather than against whatever is current when it runs.
+        val gen = generation.get()
+        val end = endGeneration.get()
+        submit(REASSERT_LABEL, endGen = end, reportsOutcome = false) { commands ->
+            // Through the same clamp as every other speed request, not as a raw zero. The floor
+            // being 0 rather than the machine's reported minimum is a safety rule, and it is stated
+            // in exactly one place (clampSpeed) so a second copy here cannot drift away from it.
+            val speed = commands.setSpeedKph(clampSpeed(0.0) * MPH_TO_KPH)
+            if (speed !is MachineAck.Ok) {
+                // Nothing more goes out. A machine that would not take a zero speed is not one to
+                // start moving the deck on, and a refusal here is the expected answer from a
+                // console the stop already put to idle.
+                Log.i(TAG, "end-of-workout zero speed was not accepted ($speed); leaving the deck alone")
+                return@submit speed.toOutcome()
+            }
+            // Re-checked between the two writes, not just before the first. The speed write blocks
+            // for a round trip, and a stop or a new workout arriving inside that window means this
+            // deck movement belongs to a session that is over — moving it anyway would be this
+            // job's writes outliving the generation that authorised them.
+            if (generation.get() != gen || endGeneration.get() != end) return@submit Outcome.Superseded
+            // The zero speed was accepted, so the belt is commanded to a stop before the deck
+            // moves. Flat is the state a rider steps off onto, and it is the same state
+            // DirectMachineCommands.startWorkout writes on the way in — a workout should not end
+            // leaving the deck wherever the last hill put it.
+            //
+            // Clamped, so a machine whose reported grade range excludes zero gets as flat as it
+            // goes rather than a value it would refuse.
+            commands.setInclinePercent(clampIncline(0.0)).toOutcome()
+        }
+    }
+
+    /**
+     * Shut the fan off, because the workout is over.
+     *
+     * The missing half of [restoreFan]. Stride has turned the fan on at the start of every workout
+     * since that landed and has never turned it off, so a console left alone after a run sat there
+     * blowing until somebody noticed — issue #29.
+     *
+     * **Sent unconditionally, not gated on [lastFanState].** Skipping when Stride does not think it
+     * has a fan running looks like an easy saving and is a race: `restoreFan` records the state
+     * from inside its own queued job, so a restore still in flight when the workout ends would be
+     * invisible here — and would then turn the fan on immediately behind the stop, which is
+     * precisely the state this is supposed to leave the machine out of. [lastFanState] is also only
+     * ever Stride's own last *request*; the console has its own controls.
+     *
+     * A refusal is not an error. It means this machine has no fan register that will take a write,
+     * which is a fact about the treadmill and not a failure of the end — swallowed for the same
+     * reason [restoreFan] swallows a speculative Auto.
+     *
+     * [StrideSettings.fanState] is deliberately untouched. That is the rider's remembered
+     * preference and the value the next [restoreFan] replays; recording an automatic shutdown into
+     * it would quietly teach the app that they want the fan off from now on.
+     */
+    fun stopFan() {
+        val end = endGeneration.get()
+        submit(FAN_OFF_LABEL, endGen = end, reportsOutcome = false) { commands ->
+            val ack = commands.setFanState(GlassOsCommands.FAN_OFF)
+            // Only a state the machine actually took. Recording it optimistically would leave the
+            // overlay's fan pills claiming "Off" over a fan that is still running.
+            if (ack is MachineAck.Ok) lastFanState = GlassOsCommands.FAN_OFF
+            if (ack is MachineAck.Refused) Outcome.Ok else ack.toOutcome()
+        }
+    }
+
     // -------------------------------------------------------------- plumbing
 
     private fun submit(
@@ -573,6 +718,8 @@ object MachineCoordinator {
         delayMs: Long = 0L,
         onDone: ((Outcome) -> Unit)? = null,
         speedGen: Int? = null,
+        endGen: Int? = null,
+        reportsOutcome: Boolean = true,
         // MachineCommands, not GlassOsCommands: the coordinator owns the clamps and the ramp and
         // must not know which wire is underneath it. That split is what lets the direct register
         // path substitute for GlassOS without a second copy of any of the safety rules.
@@ -580,7 +727,7 @@ object MachineCoordinator {
     ) {
         val gen = generation.get()
         queue.addLast(
-            Job(gen, label, onDone, speedGen) {
+            Job(gen, label, onDone, speedGen, endGen, reportsOutcome) {
                 if (delayMs > 0) {
                     try {
                         Thread.sleep(delayMs)
@@ -594,6 +741,9 @@ object MachineCoordinator {
                 // request that arrived while this step was waiting its turn.
                 if (generation.get() != gen) return@Job Outcome.Superseded
                 if (speedGen != null && speedGeneration.get() != speedGen) return@Job Outcome.Superseded
+                // A workout's tidy-up is worth nothing to the workout that replaced it, and it
+                // holds the worker for a round trip it could be spending on a start.
+                if (endGen != null && endGeneration.get() != endGen) return@Job Outcome.Superseded
                 // Deliberately not short-circuited on [MachineLink.consoleDetached]. Refusing here
                 // without touching the wire would be faster, but it also makes the app's own
                 // reading of the console the thing that decides whether a rider may use their
@@ -624,8 +774,13 @@ object MachineCoordinator {
                     Outcome.Failed(t.message ?: t.javaClass.simpleName)
                 }
             }
-            lastLabel = job.label
-            lastOutcome = outcome
+            // Skipped for the end-of-workout writes. They run behind a stop, and a tidy-up that
+            // succeeded must never become the last recorded word on an end whose stop failed.
+            if (job.reportsOutcome) {
+                lastLabel = job.label
+                lastOutcome = outcome
+            }
+
             // A ramp step that failed must not be followed by the next, larger one. Each step is
             // only safe because the one below it landed; continuing past a failure would deliver an
             // increase bigger than MAX_STEP_UP_MPH in a single jump, which is the exact thing the
