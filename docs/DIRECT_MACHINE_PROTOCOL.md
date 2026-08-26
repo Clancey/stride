@@ -448,17 +448,27 @@ Stride can see a stopped belt, which after a pause it normally can, and mid-run 
 
 **A zero from `ACTUAL_KPH` is not automatically permission either — see issue #34.** On the X22i
 that register reads exactly `0x0000` on every poll while a rider walks at 4 mph, with
-`CURRENT_DISTANCE` accumulating the real pace beside it. That is not a decode bug and not a missing
-register; iFit shows live speed on the same console. It is a confident, well-formed, entirely
+`CURRENT_DISTANCE` accumulating the real pace beside it. It is a confident, well-formed, entirely
 plausible zero — so a null check does not catch it, and a gate built only on "speed reads zero"
 flattens the deck under a moving belt on that machine.
+
+Two things make it unrepairable by asking differently. **iFit never reads that register on a
+treadmill**: `SpeedMetric` selects `Kph` (field 0, the commanded setpoint) for belt-based consoles
+and `ActualKph` (16) only for non-belt ones, so iFit showing a correct speed there says nothing
+about whether field 16 works. And **there is no per-field validity marker** — `SetResponseBytes`
+checks only command status and total length, then consumes raw bytes in field order, so "the value
+is zero" and "I do not have this value" are the same bytes.
 
 The gate therefore also requires that this console has, at some point on this link, reported a
 speed above the moving threshold at all. Until it has, its zero is indistinguishable from a
 register stuck at zero and is treated as worth nothing. On an X22i exhibiting #34 the deck is never
-flattened, which is exactly where it sat before any of this existed. If #34 is solved, or
-corroboration from `CURRENT_DISTANCE` failing to advance is added, that condition can be
-strengthened — it must not be dropped.
+flattened, which is exactly where it sat before any of this existed.
+
+`Rpm` (field 5) is the obvious next avenue for a real motion signal on such a console: it is
+**read-only**, so it is a machine measurement rather than a setpoint, and it may carry roller or
+motor movement where field 16 is dead. Nobody has checked whether the X22i populates it, so nothing
+depends on it yet. Corroborating against `CURRENT_DISTANCE` failing to advance would serve too.
+Either would let that condition be strengthened — it must not be dropped.
 
 `GRADE = 0` is clamped like any other incline, so a machine whose reported grade range excludes
 zero gets as flat as it goes rather than a value it would refuse — the same coercion `startWorkout`

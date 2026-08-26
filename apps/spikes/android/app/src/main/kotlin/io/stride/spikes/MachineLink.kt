@@ -342,7 +342,9 @@ object MachineLink {
      * poll while a rider is genuinely walking at 4 mph. Not null, not absent, not a decode error —
      * a confident, well-formed, entirely plausible zero, while `CURRENT_DISTANCE` accumulates the
      * real pace beside it. "We could not ask" and "we asked, and the answer is a lie" are different
-     * failures, and a null check only catches the first.
+     * failures, and a null check only catches the first. There is no per-field validity marker in
+     * the reply framing either, so on the wire that zero is indistinguishable from an absent value
+     * by construction.
      *
      * So anything that would treat a zero speed as evidence of a stopped belt has to know whether
      * this console has ever demonstrated that it reports motion at all. On a machine whose register

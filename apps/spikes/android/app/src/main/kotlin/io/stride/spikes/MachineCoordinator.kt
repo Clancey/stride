@@ -851,19 +851,34 @@ internal const val BELT_MOVING_MPH = 0.1
  *
  * `observedSpeedMph == 0.0` looks like the honest reading this should turn on, and on the X22i it
  * is a lie. `ACTUAL_KPH` reads exactly `0x0000` on every poll while a rider walks at 4 mph, with
- * `CURRENT_DISTANCE` accumulating the real pace beside it — not a decode bug, not a missing
- * register, and iFit shows live speed on the same console. **Not null, either.** A gate that only
+ * `CURRENT_DISTANCE` accumulating the real pace beside it. **Not null, either.** A gate that only
  * refuses on null accepts that console's confident, well-formed zero and flattens the deck under a
  * moving belt, which is the same hazard the ack version had, reached through a different door and
  * with no branch to limit it.
+ *
+ * Two findings say this cannot be repaired by asking differently:
+ *
+ * - **iFit never reads that register on a treadmill.** `SpeedMetric` selects `LatestBasicInfo.Kph`
+ *   — field 0, the commanded *setpoint* — for belt-based consoles, and `ActualKph` (16) only for
+ *   non-belt ones. So iFit displaying a correct speed on this machine says nothing about whether
+ *   field 16 works; it would look right either way. Stride is the first client to read it honestly,
+ *   which is why Stride is the first to see the zeros.
+ * - **There is no per-field validity marker.** `ReadWriteDataCmd.SetResponseBytes` checks command
+ *   status and total length, then consumes raw bytes in field order. Nothing distinguishes "the
+ *   value is zero" from "I do not have this value", so the two are identical on the wire by
+ *   construction.
  *
  * So the reading alone is not the question. [everReportedMotion] asks whether this console's speed
  * register has *ever* said anything but zero on this link; until it has, a zero from it is
  * indistinguishable from a register stuck at zero and is worth nothing. See
  * [MachineLink.everReportedMotion].
  *
- * If #34 is ever solved, or corroboration from `CURRENT_DISTANCE` not advancing is added, this can
- * be strengthened. It must not be weakened.
+ * The obvious next avenue, if a real motion signal is wanted on such a console: `Rpm` is field 5
+ * and **read-only** on FitPro1, which makes it a machine measurement rather than a setpoint, so it
+ * may carry roller or motor movement where field 16 is dead. Nobody has checked whether the X22i
+ * populates it, so nothing here builds on it — but that is where to look. Corroborating against
+ * `CURRENT_DISTANCE` failing to advance would work too. Either would let this be strengthened. It
+ * must not be weakened.
  *
  * **Null is not permission.** [MachineLink.speedMph] is null when the snapshot is stale or the
  * machine could not be asked, and "we cannot see the belt" has to mean "do not move anything",
