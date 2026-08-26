@@ -1714,8 +1714,10 @@ class OverlayService : Service() {
             measured = { MachineLink.inclinePercent },
             pending = PendingSetpoint(tolerance = INCLINE_ARRIVED_TOLERANCE, graceMs = PENDING_GRACE_MS),
             onPick = { percent ->
-                requestSetpoint(MachineLink.canCommandIncline()) {
-                    MachineCoordinator.setInclinePercent(percent)
+                // Never starts a belt: tilting the deck is not a request for motion. See
+                // requestSetpoint.
+                requestSetpoint(mayStart = false) { done ->
+                    MachineCoordinator.setInclinePercent(percent, done)
                 }
                 lastGesture = "incline -> $percent%"
             },
@@ -1773,16 +1775,35 @@ class OverlayService : Service() {
      * value, it goes through [WorkoutSession] exactly as the Start button does — so the same
      * handshake, the same watchdog and the same refusal reporting apply — and if the start is
      * refused the setpoint is dropped rather than replayed at whatever happens next.
+     *
+     * ## Why [mayStart] is not simply true
+     *
+     * Only a *speed* tap may start a belt. Asking for 5 mph on a stopped machine is a request for
+     * motion and reads as one; asking for 4% incline is a request to tilt the deck, and starting the
+     * belt because someone wanted the deck moved is surprise motion — the one thing the safety rules
+     * here are written against. It is also what the machine's own keys do: a speed key starts a
+     * NordicTrack, an incline key does not.
+     *
+     * So incline still says what it needs rather than taking a liberty, and the column stays live
+     * either way so nothing looks broken.
      */
-    private fun requestSetpoint(readyNow: Boolean, apply: () -> Unit) {
-        if (readyNow) {
-            pendingSetpoint = null
-            apply()
-            return
+    private fun requestSetpoint(
+        mayStart: Boolean,
+        apply: (onDone: ((MachineCoordinator.Outcome) -> Unit)?) -> Unit,
+    ) {
+        apply { outcome ->
+            if (outcome !is MachineCoordinator.Outcome.Rejected) return@apply
+            mainHandler.post {
+                if (!mayStart || WorkoutSession.state != WorkoutSession.State.IDLE) {
+                    showMachineControlUnavailable()
+                    return@post
+                }
+                // Re-sent rather than remembered as a value, so the retry goes through the same
+                // clamp and the same ramp the first attempt did.
+                pendingSetpoint = { apply(null) }
+                WorkoutSession.start()
+            }
         }
-        // Latest tap wins. Someone who taps 5 and then 7 while the belt is spinning up meant 7.
-        pendingSetpoint = apply
-        if (WorkoutSession.state == WorkoutSession.State.IDLE) WorkoutSession.start()
     }
 
     private fun addSpeedRail() {
@@ -1803,8 +1824,8 @@ class OverlayService : Service() {
             measured = { MachineLink.speedMph },
             pending = PendingSetpoint(tolerance = SPEED_ARRIVED_TOLERANCE, graceMs = PENDING_GRACE_MS),
             onPick = { mph ->
-                requestSetpoint(MachineLink.canCommandSpeed()) {
-                    MachineCoordinator.setSpeedMph(mph)
+                requestSetpoint(mayStart = true) { done ->
+                    MachineCoordinator.setSpeedMph(mph, done)
                 }
                 lastGesture = "speed -> $mph mph"
             },

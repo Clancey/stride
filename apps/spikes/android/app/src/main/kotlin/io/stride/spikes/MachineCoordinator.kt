@@ -462,7 +462,7 @@ object MachineCoordinator {
      * The ramp only ever applies upward. Asking for a lower speed is a single immediate command,
      * because slowing down is never the dangerous direction.
      */
-    fun setSpeedMph(mph: Double) {
+    fun setSpeedMph(mph: Double, onDone: ((Outcome) -> Unit)? = null) {
         val target = clampSpeed(mph)
         // Every new speed request retires the previous one, including a ramp still climbing. Without
         // this, asking to slow down merely queues *behind* the remaining steps of the climb, so the
@@ -471,7 +471,7 @@ object MachineCoordinator {
         val gen = speedGeneration.incrementAndGet()
         val current = MachineLink.speedMph
         if (current == null || target <= current || target - current <= MAX_STEP_UP_MPH) {
-            submit(label = "Speed ${format(target)} mph", speedGen = gen) {
+            submit(label = "Speed ${format(target)} mph", speedGen = gen, onDone = onDone) {
                 it.setSpeedKph(target * MPH_TO_KPH).toOutcome()
             }
             return
@@ -486,14 +486,23 @@ object MachineCoordinator {
             }
             next += MAX_STEP_UP_MPH
         }
-        submit(label = "Speed ${format(target)} mph", delayMs = STEP_INTERVAL_MS, speedGen = gen) {
+        // Only the last step reports: the caller asked for a speed, not for a ramp, and the
+        // outcome that matters is whether the machine ended up taking it.
+        submit(
+            label = "Speed ${format(target)} mph",
+            delayMs = STEP_INTERVAL_MS,
+            speedGen = gen,
+            onDone = onDone,
+        ) {
             it.setSpeedKph(target * MPH_TO_KPH).toOutcome()
         }
     }
 
-    fun setInclinePercent(percent: Double) {
+    fun setInclinePercent(percent: Double, onDone: ((Outcome) -> Unit)? = null) {
         val target = clampIncline(percent)
-        submit("Incline ${format(target)}%") { it.setInclinePercent(target).toOutcome() }
+        submit("Incline ${format(target)}%", onDone = onDone) {
+            it.setInclinePercent(target).toOutcome()
+        }
     }
 
     /**
