@@ -566,12 +566,16 @@ listeners that have not run yet.
 of it, because a stop preempts everything and gaining a fan write in front of it would be a worse
 app than the bug being fixed:
 
-1. **Re-assert zero.** Speed 0, then incline 0 if that was accepted. This is not "faking a stop by
-   commanding speed 0" in place of the native verb — the native stop still goes first, and this is
-   insurance for the case where its frame was lost. On a console that took the stop these are
-   refused, which costs nothing; on one that did not, they are what stops the belt. They are
-   explicitly **not** confirmation: a stop is done on ack plus observed deceleration (§5.4), and a
-   command Stride sent is neither.
+1. **Re-assert zero.** Speed 0, and then incline 0 **only when telemetry shows the belt at rest**.
+   The speed half is not "faking a stop by commanding speed 0" in place of the native verb — the
+   native stop still goes first, and this is insurance for the case where its frame was lost. On a
+   console that took the stop it is refused, which costs nothing; on one that did not, it is what
+   stops the belt. It is explicitly **not** confirmation: a stop is done on ack plus observed
+   deceleration (§5.4), and a command Stride sent is neither. The incline half is gated on the
+   observed reading rather than on that write being acknowledged, because an ack describes a
+   console accepting a register and not a belt slowing — and gating on the ack would have moved the
+   deck *only* on the lost-stop branch, which is the one where the belt is still running. An
+   unreadable speed is not permission either.
 2. **Fan off.** The missing counterpart to restoring the fan on start. Sent unconditionally rather
    than gated on what Stride thinks the fan is doing — a restore still in flight would be invisible
    to such a check and would turn the fan on right behind the stop — and it deliberately does not

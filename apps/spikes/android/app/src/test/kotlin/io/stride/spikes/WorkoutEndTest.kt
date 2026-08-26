@@ -1,6 +1,8 @@
 package io.stride.spikes
 
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
+import org.junit.Assert.assertTrue
 import org.junit.Test
 
 /**
@@ -139,5 +141,42 @@ class WorkoutEndTest {
                 endFollowUp(WorkoutSession.State.IDLE, WorkoutSession.State.IDLE, ending),
             )
         }
+    }
+
+    // ------------------------------------------------------------------ moving the deck
+
+    /**
+     * The deck goes flat only for a belt Stride can *see* has stopped.
+     *
+     * The first version of this gated on the re-asserted `KPH = 0` coming back accepted, which is a
+     * statement about a console taking a register write and not about a belt. It was worse than
+     * useless: on a console that took the stop, the re-assert is refused and no deck moves — so the
+     * ack gate fired only on the branch where the console was still in a workout with the belt
+     * running, which is the single state a deck must not move in.
+     */
+    @Test
+    fun `a stopped belt may have its deck flattened`() {
+        assertTrue(mayFlattenDeck(0.0))
+        // Rounding noise around a stop is still a stop.
+        assertTrue(mayFlattenDeck(0.05))
+    }
+
+    @Test
+    fun `a moving belt keeps its deck`() {
+        assertFalse(mayFlattenDeck(0.5))
+        assertFalse(mayFlattenDeck(6.0))
+    }
+
+    /**
+     * And a belt Stride cannot see keeps its deck too.
+     *
+     * Null is "the telemetry snapshot is stale, or the machine could not be asked" — never "it is
+     * stopped". The start path already refuses to move a treadmill on probably; the deck is held to
+     * the same rule, and the cost of being wrong this way is a deck left on a hill, which is where
+     * it sat before any of this existed.
+     */
+    @Test
+    fun `an unreadable belt keeps its deck`() {
+        assertFalse("null speed is not permission to move anything", mayFlattenDeck(null))
     }
 }

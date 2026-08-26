@@ -627,12 +627,12 @@ object MachineCoordinator {
      *
      * ## Why anything at all, when [stop] already sent a zero
      *
-     * Because the interesting case is the one where it did not land. `DirectMachineCommands.stop`
-     * puts `KPH = 0` and `WORKOUT_MODE = IDLE` in a single frame, and a frame that was lost leaves
-     * a belt running under an app that has gone back to showing "Start workout". If the stop *did*
-     * land, the console is idle and will most likely refuse these writes, which costs a log line
-     * and nothing else. If it did not, these are the writes that stop the treadmill. Paying two
-     * round trips on the ending path to cover that is the trade this exists to make.
+     * Because the interesting case is the one where it did not land. A stop is a single frame —
+     * `DirectMachineCommands.stop` puts `KPH = 0` and `WORKOUT_MODE = IDLE` in one — and a frame
+     * that was lost leaves a belt running under an app that has gone back to showing "Start
+     * workout". If the stop *did* land, the console is idle and will most likely refuse this, which
+     * costs a log line and nothing else. If it did not, this is the write that stops the treadmill.
+     * Paying a round trip on the ending path to cover that is the trade this exists to make.
      *
      * ## What it is not
      *
@@ -655,22 +655,18 @@ object MachineCoordinator {
             // being 0 rather than the machine's reported minimum is a safety rule, and it is stated
             // in exactly one place (clampSpeed) so a second copy here cannot drift away from it.
             val speed = commands.setSpeedKph(clampSpeed(0.0) * MPH_TO_KPH)
-            if (speed !is MachineAck.Ok) {
-                // Nothing more goes out. A machine that would not take a zero speed is not one to
-                // start moving the deck on, and a refusal here is the expected answer from a
-                // console the stop already put to idle.
-                Log.i(TAG, "end-of-workout zero speed was not accepted ($speed); leaving the deck alone")
-                return@submit speed.toOutcome()
-            }
             // Re-checked between the two writes, not just before the first. The speed write blocks
             // for a round trip, and a stop or a new workout arriving inside that window means this
             // deck movement belongs to a session that is over — moving it anyway would be this
             // job's writes outliving the generation that authorised them.
             if (generation.get() != gen || endGeneration.get() != end) return@submit Outcome.Superseded
-            // The zero speed was accepted, so the belt is commanded to a stop before the deck
-            // moves. Flat is the state a rider steps off onto, and it is the same state
-            // DirectMachineCommands.startWorkout writes on the way in — a workout should not end
-            // leaving the deck wherever the last hill put it.
+            val observed = MachineLink.speedMph
+            if (!mayFlattenDeck(observed)) {
+                Log.i(TAG, "belt not observably at rest (speed=$observed); leaving the deck where it is")
+                return@submit speed.toOutcome()
+            }
+            // Flat is the state a rider steps off onto, and it is the same state a workout is
+            // started in — a run should not end leaving the deck wherever the last hill put it.
             //
             // Clamped, so a machine whose reported grade range excludes zero gets as flat as it
             // goes rather than a value it would refuse.
@@ -830,3 +826,30 @@ internal fun shouldAdoptWorkout(state: Int?, beltSpeedMph: Double?): Boolean =
 
 /** Above this the belt is moving, rather than reporting rounding noise around a stop. */
 private const val BELT_MOVING_MPH = 0.1
+
+/**
+ * Whether the deck may be driven to flat as part of ending a workout.
+ *
+ * Pure, and separate from [MachineCoordinator], because getting it wrong moves a physical part
+ * under someone stepping off a treadmill and every branch has to be checkable without one.
+ *
+ * ## Why an ack is not enough, and was the first answer here
+ *
+ * The obvious gate is "the zero speed we just re-sent was accepted, so the belt is stopping". It is
+ * wrong twice. [MachineAck.Ok] means a console took a register write; it says nothing about a belt.
+ * And it selects for exactly the wrong case: if the stop landed, the console is idle and refuses
+ * the write, so an ack-gated deck movement would happen *only* on the branch where the console is
+ * still in a workout with the belt running. That is the one state a deck must not move in, arrived
+ * at by a rule meant to prevent it.
+ *
+ * So the gate is observed speed — the same reading [shouldAdoptWorkout] uses to answer "is this
+ * belt moving", from `ACTUAL_KPH` on the direct path, which is a register Stride only ever reads.
+ *
+ * **Null is not permission.** [MachineLink.speedMph] is null when the snapshot is stale or the
+ * machine could not be asked, and "we cannot see the belt" has to mean "do not move anything",
+ * matching the rule the start path already holds itself to: probably-stopped is not a basis for
+ * moving a treadmill. The cost of being wrong in this direction is a deck left on a hill, which is
+ * exactly where it sat before any of this existed.
+ */
+internal fun mayFlattenDeck(observedSpeedMph: Double?): Boolean =
+    observedSpeedMph != null && observedSpeedMph <= BELT_MOVING_MPH

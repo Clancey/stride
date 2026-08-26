@@ -128,19 +128,44 @@ class EndOfWorkoutSequenceTest {
      *
      * The ordering is not a nicety. `stop` empties the queue and takes the front of it; the two
      * settling calls only ever append. If that ever inverts, a treadmill waits for a fan.
+     *
+     * No incline here, and that is the assertion rather than an omission: nothing has told this
+     * coordinator what the belt is doing, and [mayFlattenDeck] refuses to move a deck it cannot see
+     * a stopped belt behind.
      */
     @Test
     fun `the stop goes out before anything that settles the machine`() {
         endWorkout()
-        awaitCalls(4)
-        assertEquals(listOf("stop", "speed 0.00", "incline 0.0", "fan 0"), console.calls)
+        awaitCalls(3)
+        settle()
+        assertEquals(listOf("stop", "speed 0.00", "fan 0"), console.calls)
+    }
+
+    /**
+     * With no fresh telemetry, the deck is never moved.
+     *
+     * Stated on its own because it is a safety property and not a side effect of the test harness.
+     * `MachineLink.speedMph` is null when the snapshot is stale or the machine could not be asked,
+     * and an app that cannot see the belt must not move a physical part under a rider stepping off
+     * it. The zero speed still goes out — that half is what covers a lost stop.
+     */
+    @Test
+    fun `a belt Stride cannot see is not a belt whose deck it moves`() {
+        endWorkout()
+        awaitCalls(3)
+        settle()
+        assertTrue("the zero must still be re-asserted", console.calls.contains("speed 0.00"))
+        assertTrue(
+            "no incline may be written without an observed stop, saw ${console.calls}",
+            console.calls.none { it.startsWith("incline") },
+        )
     }
 
     /** The fan is genuinely turned off, not merely commanded to something. */
     @Test
     fun `ending a workout turns the fan off`() {
         endWorkout()
-        awaitCalls(4)
+        awaitCalls(3)
         assertTrue("the fan must be told OFF", console.calls.contains("fan ${GlassOsCommands.FAN_OFF}"))
         assertEquals(GlassOsCommands.FAN_OFF, MachineCoordinator.lastFanState)
     }
@@ -161,7 +186,7 @@ class EndOfWorkoutSequenceTest {
         console.calls.clear()
 
         endWorkout()
-        awaitCalls(4)
+        awaitCalls(3)
         assertTrue(
             "an already-off fan is still told off; the console has its own controls",
             console.calls.contains("fan ${GlassOsCommands.FAN_OFF}"),
@@ -177,26 +202,31 @@ class EndOfWorkoutSequenceTest {
      */
     @Test
     fun `a stop during the re-assert cancels the rest of it`() {
+        // Every job is queued before the worker is allowed to touch any of them. Without the gate
+        // this test races the worker: if it reached setSpeedKph before stopFan had queued, the
+        // nested stop's queue.clear() would have nothing to clear and the fan job would survive.
+        val gate = CountDownLatch(1)
+        console.blockUntil = gate
         console.duringSpeedWrite = {
             console.duringSpeedWrite = null
             MachineCoordinator.stop()
         }
         endWorkout()
+        gate.countDown()
         awaitCalls(3)
         settle()
         assertEquals(listOf("stop", "speed 0.00", "stop"), console.calls)
     }
 
     /**
-     * A machine that will not take a zero speed does not get its deck moved.
+     * A machine that will not take a zero speed still gets its fan turned off.
      *
-     * On the happy path this is the *expected* answer: the stop has already put the console in
-     * IDLE, and an idle console refuses setpoints. The re-assert earns its round trips in the
-     * unhappy case, where the stop frame was lost — and there the belt is still moving, which is
-     * the last state to be dropping a deck in.
+     * The two are independent jobs on purpose. A console that has already gone idle refuses
+     * setpoints — that is the *expected* answer on the happy path — and letting a refusal there
+     * suppress the fan would reintroduce issue #29 for every workout that ended normally.
      */
     @Test
-    fun `a refused zero speed leaves the deck where it is`() {
+    fun `a refused zero speed does not suppress the fan`() {
         console.speedAck = MachineAck.Refused("not in a workout")
         endWorkout()
         awaitCalls(3)
@@ -215,9 +245,9 @@ class EndOfWorkoutSequenceTest {
     fun `a fan write that throws still lets the workout end`() {
         console.fanThrows = IllegalStateException("transport went away")
         endWorkout()
-        awaitCalls(4)
+        awaitCalls(3)
         settle()
-        assertEquals(listOf("stop", "speed 0.00", "incline 0.0", "fan 0"), console.calls)
+        assertEquals(listOf("stop", "speed 0.00", "fan 0"), console.calls)
         // And the failure did not poison what Stride believes about the fan: the state is only ever
         // recorded for a write the machine actually took.
         assertEquals(GlassOsCommands.FAN_HIGH, MachineCoordinator.lastFanState)
@@ -239,7 +269,7 @@ class EndOfWorkoutSequenceTest {
         val elapsedMs = TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - startedAt)
         assertTrue("ending took ${elapsedMs}ms with the console wedged", elapsedMs < 500)
         gate.countDown()
-        awaitCalls(4)
+        awaitCalls(3)
     }
 
     /**
@@ -254,7 +284,7 @@ class EndOfWorkoutSequenceTest {
     fun `the settling writes do not overwrite the stop's outcome`() {
         console.stopAck = MachineAck.NoAnswer("the console did not answer")
         endWorkout()
-        awaitCalls(4)
+        awaitCalls(3)
         settle()
         assertEquals("Stop", MachineCoordinator.lastLabel)
         assertTrue(
