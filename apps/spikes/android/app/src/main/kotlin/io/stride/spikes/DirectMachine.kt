@@ -300,13 +300,31 @@ class DirectMachineSession(
     fun authorisedWrite(
         label: String,
         gate: List<FitProCodec.Register>,
+        /**
+         * Whether this command may go out while [startGate] is [StartGate.Incomplete].
+         *
+         * False for everything that asks the belt to move. True only for a stop: `PLAN.md` §3.1 has
+         * stop preemption "*never* rate-limited or ramp-delayed" and §5.2 ramp-limits acceleration
+         * "but **never on deceleration or stop**", and a start gate we could not finish initialising
+         * is exactly the kind of thing a stop must not be queued behind. The asymmetry is safe in
+         * the direction that matters: refusing a start on a console in an unknown state costs a
+         * rider a workout, while refusing a stop on a belt that is already moving — a rider can
+         * start one from the console's own panel — is the failure this project exists to avoid.
+         *
+         * Note this does not bypass [FitProProbe]'s refusal, which is a different question: that one
+         * says we have not established the peer is the motor controller at all, and writing a stop
+         * to a device that may not be a treadmill is not a stop.
+         */
+        startGateExempt: Boolean = false,
         build: (DirectMachineSession) -> List<FitProCodec.Write>,
     ): MachineAck = synchronized(wire) {
         probe.refusalReason()?.let { return MachineAck.Refused(it) }
         // Same shape of gate as the probe's, and for the same reason. The probe answers "is this
         // peer the machine we think it is"; this answers "are its interlocks in the state we think
-        // they are". Both have to hold before a frame that can move a belt goes out.
-        (startGate as? StartGate.Incomplete)?.let { return MachineAck.Refused(it.reason) }
+        // they are". Both have to hold before a frame that asks a belt to move goes out.
+        if (!startGateExempt) {
+            (startGate as? StartGate.Incomplete)?.let { return MachineAck.Refused(it.reason) }
+        }
 
         val info = deviceInfo
         val missing = gate.filter { info != null && !info.supports(it) }
@@ -510,6 +528,13 @@ class DirectMachineSession(
      * reply cannot distinguish "neither applied" from "only the lockout was cleared" — and that
      * second state is the least gated of the three.
      *
+     * Stated precisely, because the loose version of this claim is wrong: the guarantee is **not**
+     * that every failure leaves the console more gated than it started. If the lockout write's own
+     * reply is lost after it landed, the result is the ordinary `(108=1, 95=0)` state. The guarantee
+     * is the one that matters — *the lockout is never cleared unless the gate was armed first* —
+     * because "lockout cleared, gate not armed" is the only combination that is worse than doing
+     * nothing at all, and sending 95 only after 108 is acknowledged is what excludes it.
+     *
      * ## Where this is deliberately stricter than iFit
      *
      * Two places, both chosen rather than copied:
@@ -522,64 +547,128 @@ class DirectMachineSession(
      *   [ConnectResult], and makes [authorisedWrite] refuse control — because a console whose gate
      *   state is unknown is not one to send speed or mode commands to. That is the same discipline
      *   [authorisedWrite] already applies to a reply with a bad checksum.
+     * - **The console is asked whether a start is already pending** before the lockout is cleared,
+     *   and the lockout is left alone if it cannot answer. iFit clears it unconditionally. See
+     *   [startIsPending].
      */
     private fun initializeStartGate(info: FitProCodec.DeviceInfo): StartGate {
         // Field semantics come from `Sindarin.FitPro1`, and by this codebase's own account
         // "GlassOS/FitPro2 has no binding" for either one. A FitPro2 board that happens to set bit
         // 108 would mean something we have never verified, so restrict this by generation as well as
-        // by capability. Without this the Commercial 1750 is protected only by the accident that it
-        // has never completed DEVICE_INFO, and making that work is an active goal.
+        // by capability. Note the generation half only bites over USB, where `variantOf` reads the
+        // product id: `BleTransport.variant` is hardcoded FITPRO1, so a BLE-attached console is held
+        // by the capability check alone.
         if (transport.variant != FitProCodec.Variant.FITPRO1) return StartGate.NotApplicable
         if (!info.supports(FitProCodec.Register.REQUIRE_START_REQUESTED)) return StartGate.NotApplicable
         // Nothing was attempted, so nothing is unknown — and the probe already refuses control on
         // its own account, which is the more accurate reason to show the rider.
         if (!probe.confirmed) return StartGate.NotApplicable
 
-        // The sequence, in iFit's order. Kept as data so that the question of how it reaches the
-        // wire stays in exactly one place — see [sendStartGateSteps].
-        val steps = buildList {
-            add(FitProCodec.Register.REQUIRE_START_REQUESTED to 1)
-            if (info.supports(FitProCodec.Register.IDLE_MODE_LOCKOUT)) {
-                add(FitProCodec.Register.IDLE_MODE_LOCKOUT to if (BELT_BASED_MACHINE) 0 else 1)
-            }
+        // Step one: arm the gate. Its own frame — see [sendStartGateWrite].
+        val armed = sendStartGateWrite(FitProCodec.Register.REQUIRE_START_REQUESTED, 1)
+        if (armed != null) return StartGate.Incomplete(armed)
+
+        if (!info.supports(FitProCodec.Register.IDLE_MODE_LOCKOUT)) {
+            Log.i(TAG, "start-gate init: armed; this console has no IDLE_MODE_LOCKOUT to clear")
+            return StartGate.Ready(idleModeLockoutCleared = false)
         }
-        val lockoutStepPresent = steps.size > 1
-        return when (val failure = sendStartGateSteps(steps)) {
-            null -> {
-                Log.i(TAG, "start-gate init: ${steps.joinToString(" then ") { "${it.first.name}=${it.second}" }} accepted")
-                StartGate.Ready(idleModeLockoutCleared = lockoutStepPresent)
-            }
-            else -> StartGate.Incomplete(failure)
-        }
+
+        // Step two, before clearing anything: establish that the console is not already holding a
+        // start request. See [startIsPending] for why an acknowledgement alone is not enough.
+        startIsPending(info)?.let { return StartGate.Incomplete(it) }
+
+        val lockout = if (BELT_BASED_MACHINE) 0 else 1
+        val cleared = sendStartGateWrite(FitProCodec.Register.IDLE_MODE_LOCKOUT, lockout)
+        if (cleared != null) return StartGate.Incomplete(cleared)
+
+        Log.i(TAG, "start-gate init: REQUIRE_START_REQUESTED=1 then IDLE_MODE_LOCKOUT=$lockout, both accepted")
+        return StartGate.Ready(idleModeLockoutCleared = true)
     }
 
     /**
-     * Put [steps] on the wire in the order given, stopping at the first one the console does not
-     * acknowledge. Returns null when every step landed, or a rider-visible reason when one did not.
+     * Whether anything stops [IDLE_MODE_LOCKOUT] being cleared right now. Null means go ahead.
      *
-     * **This is the one place the start gate's frame layout is decided.** Each step goes out as its
-     * own frame, because a single frame cannot express an order: [FitProCodec.registerBlock] sorts
-     * by field id, so batching `REQUIRE_START_REQUESTED` (108) with `IDLE_MODE_LOCKOUT` (95) puts
-     * the lockout *first*, reversing the sequence. Should iFit turn out to batch them after all,
-     * the change is confined to this function — build one [FitProCodec.readWriteBody] from every
-     * step instead of looping.
+     * Two questions, answered by one read frame.
      *
-     * Stopping at the first failure is the safety-relevant half. Field 108 arms a gate and field 95
-     * removes one, so abandoning the sequence early always leaves the console *more* gated than it
-     * started, never less. `MachineAck.NoAnswer` counts as a failure for the same reason: per
-     * [FitProTransport.exchange], a command whose reply was lost "may still have landed", so silence
-     * makes the gate's state unknown rather than unchanged.
+     * **Is a start already pending?** This is the auto-start question, and it is the reason this
+     * read exists. Clearing the idle lockout does not command motion — nothing here writes `KPH` or
+     * `WORKOUT_MODE`, and [Register.START_REQUESTED] is read-only so Stride cannot ask for a start
+     * even if it wanted to. But `connect()` runs unattended, from launch and from every reconnect,
+     * and "we command no motion" is not the same claim as "no motion can result". A console already
+     * holding a start request — a rider pressed Start on its own panel — is the case where removing
+     * an interlock could let motion follow, and `PLAN.md` §5 admits no auto-start from launch or
+     * boot. So the lockout is cleared only against a console that says no start is pending, and a
+     * console that cannot be asked is treated as one that might be.
+     *
+     * **Did the arming write actually take?** FitPro carries no request id, so [parseResponse] can
+     * only correlate a reply by address and command — which this file already notes is how "a late
+     * reply to a previous frame" gets mistaken for an acknowledgement. Reading field 108 back turns
+     * an acknowledgement into an observation. It is advisory rather than required: a console that
+     * declines to read the field back has not contradicted its own ack, and failing initialization
+     * on that would be inventing a precondition iFit never had. A field that reads back as *zero* is
+     * a contradiction, and is treated as one.
      */
-    private fun sendStartGateSteps(steps: List<Pair<FitProCodec.Register, Int>>): String? {
-        for ((register, value) in steps) {
-            val label = "start-gate ${register.name.lowercase().replace('_', ' ')}"
-            val ack = authorisedWrite(label, gate = listOf(register)) {
-                listOf(FitProCodec.writeOf(register, byteArrayOf(value.toByte())))
-            }
-            if (ack !is MachineAck.Ok) {
-                Log.w(TAG, "start-gate init: ${register.name}=$value not acknowledged ($ack)")
-                return startGateRefusal(ack)
-            }
+    private fun startIsPending(info: FitProCodec.DeviceInfo): String? {
+        val pendingRegister = FitProCodec.Register.START_REQUESTED
+        if (!info.supports(pendingRegister)) {
+            Log.w(TAG, "start-gate init: console does not report START_REQUESTED; not clearing the lockout")
+            return "Stride couldn't confirm this console isn't already waiting to start, so it left" +
+                " its idle lockout alone."
+        }
+
+        val reads = listOf(pendingRegister, FitProCodec.Register.REQUIRE_START_REQUESTED)
+        val response = runCatching { exchange(reads = reads) }.getOrNull()
+        if (response == null || !response.accepted || !response.checksumValid) {
+            Log.w(TAG, "start-gate init: could not read START_REQUESTED back ($response)")
+            return "Stride couldn't confirm this console isn't already waiting to start, so it left" +
+                " its idle lockout alone."
+        }
+
+        // Advisory, per the note above: only a definite zero is evidence against the ack.
+        val armedValue = response.value(FitProCodec.Register.REQUIRE_START_REQUESTED)
+            ?.firstOrNull()?.toInt()?.and(0xFF)
+        if (armedValue == 0) {
+            Log.w(TAG, "start-gate init: REQUIRE_START_REQUESTED acknowledged but reads back 0")
+            return "This console accepted Stride's start-gate setting and then reported it unset."
+        }
+
+        val pending = response.value(pendingRegister)?.firstOrNull()?.toInt()?.and(0xFF)
+        if (pending == null) {
+            Log.w(TAG, "start-gate init: START_REQUESTED missing from the reply")
+            return "Stride couldn't confirm this console isn't already waiting to start, so it left" +
+                " its idle lockout alone."
+        }
+        if (pending != 0) {
+            Log.w(TAG, "start-gate init: START_REQUESTED=$pending; not clearing the idle lockout")
+            return "This console is already holding a start request, so Stride left its idle lockout" +
+                " in place rather than releasing it on your behalf."
+        }
+        return null
+    }
+
+    /**
+     * Send one start-gate field in a frame of its own. Returns null on acknowledgement, or a
+     * rider-visible reason.
+     *
+     * **This is where the start gate's frame layout is decided.** One field per frame, because a
+     * single frame cannot express an order: [FitProCodec.registerBlock] sorts by field id, so
+     * batching `REQUIRE_START_REQUESTED` (108) with `IDLE_MODE_LOCKOUT` (95) would put the lockout
+     * *first*, reversing the sequence. iFit does not batch them either — each setter gets its own
+     * `ReadWriteDataCmd` — and its `ReadWriteDataCmd` carries the same ascending sort, so batching
+     * would reverse them in either implementation.
+     *
+     * `MachineAck.NoAnswer` counts as a failure: per [FitProTransport.exchange], a command whose
+     * reply was lost "may still have landed", so silence makes a field's state unknown rather than
+     * unchanged.
+     */
+    private fun sendStartGateWrite(register: FitProCodec.Register, value: Int): String? {
+        val label = "start-gate ${register.name.lowercase().replace('_', ' ')}"
+        val ack = authorisedWrite(label, gate = listOf(register)) {
+            listOf(FitProCodec.writeOf(register, byteArrayOf(value.toByte())))
+        }
+        if (ack !is MachineAck.Ok) {
+            Log.w(TAG, "start-gate init: ${register.name}=$value not acknowledged ($ack)")
+            return startGateRefusal(ack)
         }
         return null
     }
@@ -1388,16 +1477,21 @@ class DirectMachineCommands(private val session: DirectMachineSession) : Machine
      * through a second unintended state before this was understood.
      *
      * `RESULTS` is not the end of it, though — see the third write below.
+     *
+     * Every write in this path is [DirectMachineSession.authorisedWrite]'s `startGateExempt`. None
+     * of them can increase belt motion — one commands zero speed and the other two end the session —
+     * and a start gate Stride could not finish initialising is exactly what a stop must not be
+     * queued behind. Leaving a console parked in `RESULTS` for that reason would be its own bug.
      */
     override fun stop(): MachineAck {
-        val speedAck = write("stop speed", FitProCodec.Register.KPH) {
+        val speedAck = write("stop speed", FitProCodec.Register.KPH, startGateExempt = true) {
             listOf(FitProCodec.writeOf(FitProCodec.Register.KPH, FitProCodec.encodeSpeed(0.0)))
         }
         if (speedAck !is MachineAck.Ok) {
             Log.w(TAG, "stop: speed-to-zero was not accepted: $speedAck")
         }
         if (session.supports(FitProCodec.Register.WORKOUT_MODE) == false) return speedAck
-        val resultsAck = write("end workout", FitProCodec.Register.WORKOUT_MODE) {
+        val resultsAck = write("end workout", FitProCodec.Register.WORKOUT_MODE, startGateExempt = true) {
             listOf(
                 FitProCodec.writeOf(
                     FitProCodec.Register.WORKOUT_MODE,
@@ -1423,7 +1517,7 @@ class DirectMachineCommands(private val session: DirectMachineSession) : Machine
      */
     private fun cleanUpWorkout(): MachineAck {
         Thread.sleep(RESULTS_CLEANUP_DELAY_MS)
-        return write("clean up workout", FitProCodec.Register.WORKOUT_MODE) { session ->
+        return write("clean up workout", FitProCodec.Register.WORKOUT_MODE, startGateExempt = true) { session ->
             buildList {
                 add(
                     FitProCodec.writeOf(
@@ -1598,8 +1692,9 @@ class DirectMachineCommands(private val session: DirectMachineSession) : Machine
     private inline fun write(
         label: String,
         vararg gate: FitProCodec.Register,
+        startGateExempt: Boolean = false,
         noinline build: (DirectMachineSession) -> List<FitProCodec.Write>,
-    ): MachineAck = session.authorisedWrite(label, gate.toList(), build)
+    ): MachineAck = session.authorisedWrite(label, gate.toList(), startGateExempt, build)
 
     private companion object {
         const val TAG = "DirectMachine"

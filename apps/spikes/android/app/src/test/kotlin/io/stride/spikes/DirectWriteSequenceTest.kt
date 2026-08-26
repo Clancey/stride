@@ -386,6 +386,19 @@ class DirectWriteSequenceTest {
             FitProCodec.Register.MAX_GRADE to 1500,
         )
 
+        /**
+         * Register values this console will report, updated by every write it accepts.
+         *
+         * A real console reflects what it was told, and the start-gate init reads field 108 back to
+         * check its own acknowledgement — a fake that always answered zero would fail that check for
+         * the wrong reason. Pre-seed an entry to model a console that reports something Stride did
+         * not write, which is exactly what `START_REQUESTED` is for.
+         */
+        val state = mutableMapOf<FitProCodec.Register, Int>()
+
+        private fun valueOf(register: FitProCodec.Register): Int =
+            state[register] ?: readValues[register] ?: 0
+
         override fun exchange(frame: ByteArray, command: FitProCodec.Command): ByteArray? = when (command) {
             FitProCodec.Command.DEVICE_INFO -> deviceInfo()
             FitProCodec.Command.READ_WRITE_DATA -> readWrite(frame)
@@ -428,13 +441,16 @@ class DirectWriteSequenceTest {
 
             if (writtenHere.any { it in silentFor }) return null
             val status = writtenHere.firstNotNullOfOrNull { refuse[it] } ?: FitProCodec.Status.DONE
+            if (status == FitProCodec.Status.DONE) {
+                for ((register, value) in values) state[register] = value
+            }
 
             val readMaskLen = body[i].toInt() and 0xFF
             i++
             val out = ArrayList<Byte>()
             if (status == FitProCodec.Status.DONE) {
                 for (register in fieldsIn(body, i, readMaskLen)) {
-                    val v = readValues[register] ?: 0
+                    val v = valueOf(register)
                     for (b in 0 until register.width) out += ((v shr (8 * b)) and 0xFF).toByte()
                 }
             }
@@ -562,6 +578,72 @@ class DirectWriteSequenceTest {
         assertTrue(
             "no workout mode may reach a console in this state",
             wire.written.none { it.first == FitProCodec.Register.WORKOUT_MODE },
+        )
+    }
+
+    /**
+     * A console already holding a start request keeps its idle lockout.
+     *
+     * This is the auto-start guard. `connect()` runs unattended, from launch and from every
+     * reconnect, so "Stride commands no motion" is a weaker claim than "no motion can result" on a
+     * console where somebody already pressed Start on the panel. `PLAN.md` §5 admits no auto-start
+     * from launch or boot, so the interlock stays where it is and control is refused instead.
+     */
+    @Test
+    fun `a console already holding a start request keeps its idle lockout`() {
+        val wire = StartGateConsole()
+        wire.state[FitProCodec.Register.START_REQUESTED] = 1
+        val result = DirectMachineSession(wire).connect()
+
+        assertEquals(
+            "the gate may be armed, but the lockout must not be released",
+            listOf(listOf(requireStart to 1)),
+            wire.writeFrames,
+        )
+        assertTrue(result.startGateIncomplete)
+    }
+
+    /**
+     * And so does one that cannot be asked.
+     *
+     * A console that does not report `START_REQUESTED` cannot tell us whether a start is pending,
+     * and absence of evidence is not evidence of absence when the question is whether a belt may
+     * move on its own.
+     */
+    @Test
+    fun `a console that cannot report a pending start keeps its idle lockout`() {
+        val wire = StartGateConsole(
+            fields = FitProCodec.Register.entries.map { it.fieldId }.toSet() -
+                FitProCodec.Register.START_REQUESTED.fieldId,
+        )
+        val result = DirectMachineSession(wire).connect()
+
+        assertEquals(listOf(listOf(requireStart to 1)), wire.writeFrames)
+        assertTrue(result.startGateIncomplete)
+    }
+
+    /**
+     * A stop still goes out even when the start gate never finished.
+     *
+     * `PLAN.md` §5: a stop "is never ramp-limited, delayed, or queued behind another command — it
+     * preempts". An initialization we could not complete is precisely the sort of thing it must not
+     * be queued behind, and the belt can be moving for reasons Stride did not cause: a rider can
+     * start one from the console's own panel. Refusing a start in this state costs a workout;
+     * refusing a stop is the failure this project exists to avoid.
+     */
+    @Test
+    fun `a stop is not blocked by an incomplete start gate`() {
+        val wire = StartGateConsole()
+        wire.refuse[requireStart] = FitProCodec.Status.FAILED
+        val session = DirectMachineSession(wire)
+        session.connect()
+        wire.frames.clear()
+
+        val ack = DirectMachineCommands(session).stop()
+        assertEquals("a stop must reach a console whose gate state is unknown", MachineAck.Ok, ack)
+        assertTrue(
+            "the stop must actually command zero speed",
+            wire.written.any { it.first == FitProCodec.Register.KPH && it.second == 0 },
         )
     }
 

@@ -588,8 +588,18 @@ that look alike" above rather than here, because the trap is that it looks wrong
      `InitializeConsole` awaits neither setter and aborts for neither, whereas Stride waits for the
      arming write before sending the lockout write; and iFit discards both results, whereas Stride
      propagates the outcome into `ConnectResult` and refuses control while the gate's state is
-     unknown. Both are choices appropriate to a reimplementation that can move a belt, not
-     reproductions of iFit's behaviour.
+     unknown. A third: before clearing the lockout Stride reads `START_REQUESTED` (96) back and
+     leaves the lockout alone unless the console says no start is pending — `connect()` runs
+     unattended from launch and from every reconnect, and "Stride commands no motion" is a weaker
+     claim than "no motion can result" on a console that is already holding a start request. All
+     three are choices appropriate to a reimplementation that can move a belt, not reproductions of
+     iFit's behaviour.
+
+     Stated precisely, because the loose version is wrong: the guarantee is *not* that every failure
+     leaves the console more gated than it started — if the lockout write's reply is lost after it
+     landed, the result is the ordinary `(108=1, 95=0)`. The guarantee is that **the lockout is never
+     cleared unless the gate was armed first**, which is what excludes the one combination worse than
+     doing nothing.
   3. **`IsBeltBasedMachine()` is assumed, not read.** `DeviceExtensions.IsBeltBasedMachine` answers
      it from the primary device in `DeviceInfoCmd`, and accepts `Treadmill` **and**
      `InclineTrainer` — the X22i is an incline trainer, so hardcoding true is right for this console
@@ -599,9 +609,12 @@ that look alike" above rather than here, because the trap is that it looks wrong
      the assumption; FitPro1 equipment that is not belt-based needs the real conditional and would
      send `IDLE_MODE_LOCKOUT = 1`.
 
-  The init is gated on `Variant.FITPRO1` *and* on the console reporting field 108, so it is a
-  structural no-op on GlassOS-era consoles including the Commercial 1750. Re-confirmation on an X22i
-  against the two-frame sequence is still wanted.
+  The init is gated on `Variant.FITPRO1` *and* on the console reporting field 108. Over USB that is
+  two independent gates — `variantOf` reads the product id, and a 1750 resolves to `FITPRO2` — so it
+  is a structural no-op on GlassOS-era consoles. Over BLE it is one gate, not two:
+  `BleTransport.variant` is hardcoded `FITPRO1` and derives nothing from the device, so a
+  BLE-attached console is held by the capability check alone. Re-confirmation on an X22i against the
+  two-frame sequence is still wanted.
 - The preset **ladder step** (1.0) is invented. No preset register exists in FitPro, so the direct
   path must synthesise the quick picks; the endpoints come from the machine's own MIN/MAX registers,
   but nothing corroborates the spacing between them.
