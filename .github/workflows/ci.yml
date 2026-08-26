@@ -25,10 +25,16 @@ on:
   push:
     branches: [main]
 
-# A force-push should not leave two runs racing to report on the same ref.
+# A force-push should not leave two runs racing to report on the same pull request.
+#
+# Not on main, though. There, cancelling means a commit that has already landed never gets
+# verified: two merges close together and the first one's run dies with the branch state it was
+# checking still unexamined. On a pull request the superseded run is genuinely worthless, because
+# nobody is going to merge the commit it was testing. On the default branch every commit is one
+# somebody may bisect to, so each is worth the minutes.
 concurrency:
   group: ci-${{ github.ref }}
-  cancel-in-progress: true
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 permissions:
   contents: read
