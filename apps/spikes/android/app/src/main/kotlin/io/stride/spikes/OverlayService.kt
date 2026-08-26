@@ -104,6 +104,20 @@ class OverlayService : Service() {
         }
 
         /**
+         * Whether a track floor window is attached and drawing **right now**.
+         *
+         * Deliberately not the same question as [trackFloorOn], which answers what the rider asked
+         * for. The two come apart whenever the overlay is not in a position to honour it: the
+         * service has not started, `SYSTEM_ALERT_WINDOW` was revoked, the rider collapsed the
+         * chrome, or `addView` threw and the floor was quietly dropped.
+         *
+         * The launcher's plain backdrop hangs off this rather than off the choice, because blanking
+         * Stride's own home screen for a track that is not on screen would leave a console with no
+         * Home button showing nothing at all.
+         */
+        val trackFloorVisible: Boolean get() = active?.trackFloorView != null
+
+        /**
          * Rebuild the overlay's windows, if one is running.
          *
          * Needed whenever something outside the service changes what the chrome is made of —
@@ -405,6 +419,19 @@ class OverlayService : Service() {
      * chrome and opening it again should put the marker back where it was, not back at the start.
      */
     private val lapTracker = LapTracker(LAP_MILES)
+
+    /**
+     * The last lap number the machine actually reported, or 1 before it has reported any.
+     *
+     * Held here rather than left to the view because [addTrackFloor] builds a *new* [TrackFloorView]
+     * on every chrome rebuild, and the lap number is what picks the track's colour now. Without
+     * this, a rebuild on lap seven — a goal being set, a video starting, the rails being hidden —
+     * would repaint the loop back to its lap-one colour and claim the workout had restarted.
+     *
+     * Survives a dropped reading for the same reason: [LapTracker] gives up after twelve seconds,
+     * and "we cannot see you" is not "you are back at the beginning".
+     */
+    private var lastKnownLap = 1
     private var goalRingView: GoalRingView? = null
     private var goalRingRoot: View? = null
     private var cornerLeftView: View? = null
@@ -442,8 +469,12 @@ class OverlayService : Service() {
                 else -> Unit
             }
             // A lap position measured against the previous session says nothing about this one, and
-            // the machine's own distance counter resets underneath us at the same moment.
-            if (state == WorkoutSession.State.IDLE) lapTracker.reset()
+            // the machine's own distance counter resets underneath us at the same moment. The
+            // colour the track earned goes with it: a new workout starts on lap one's palette.
+            if (state == WorkoutSession.State.IDLE) {
+                lapTracker.reset()
+                lastKnownLap = 1
+            }
             // The track floor and the goal ring only exist while a workout does, so a state change
             // is a structural change to the chrome, not just new text in it. Rebuilding only when
             // the answer actually flipped keeps pause/resume from tearing the overlay down twice.
@@ -1226,10 +1257,15 @@ class OverlayService : Service() {
      * Null is passed through deliberately: [TrackFloorView] draws an empty track for it rather than
      * parking the marker on the start line, which is a claim about a workout we cannot see rather
      * than a report of one.
+     *
+     * Position and lap go over in one call. They are one sample and the view colours itself from
+     * the lap, so handing them across separately let a lap boundary paint the incoming colour
+     * around the whole loop for the second it took the marker to animate through the wrap.
      */
     private fun applyLapPosition(floor: TrackFloorView) {
         val position = lapTracker.sample(MachineLink.distanceMiles, System.currentTimeMillis())
-        floor.progress = position?.progress
+        if (position != null) lastKnownLap = position.lap
+        floor.setLapPosition(position?.progress, lastKnownLap)
         floor.lapBadge = position?.let { "LAP ${it.lap}" } ?: ""
     }
 

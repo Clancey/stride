@@ -171,6 +171,12 @@ class SpikeBridge {
   static Future<bool> trackFloorSet(bool? chosen) =>
       _bool('trackFloorSet', <String, dynamic>{'chosen': chosen});
 
+  /// Whether the launcher stands down to a plain backdrop while the track floor
+  /// is on screen. Two-state: there is no "automatic", because the launcher is
+  /// only ever behind the track once the rider has asked for the track.
+  static Future<bool> trackBackdropSet(bool blank) =>
+      _bool('trackBackdropSet', <String, dynamic>{'blank': blank});
+
   // App store - catalog, updates, installs
   //
   // Every one of these is a *Safe variant: the app store is the one surface that must never take

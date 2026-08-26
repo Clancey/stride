@@ -20,6 +20,7 @@ object StrideSettings {
     private const val FILE = "stride.settings"
 
     private const val KEY_TRACK_FLOOR = "overlay.trackFloor"
+    private const val KEY_TRACK_BACKDROP = "overlay.trackBackdrop"
     private const val KEY_TRANSPORT = "machine.transport"
     private const val KEY_FAN = "machine.fanState"
     private const val KEY_HR_STRAP = "sensor.heartRateStrap"
@@ -90,6 +91,27 @@ object StrideSettings {
             requirePrefs().edit().apply {
                 if (value == null) remove(KEY_TRACK_FLOOR) else putBoolean(KEY_TRACK_FLOOR, value)
             }.apply()
+        }
+
+    /**
+     * Whether Stride's own launcher stands down to a plain backdrop while the track floor is drawn.
+     *
+     * Two-state, unlike [trackFloor], and that is not an oversight. There is no useful "decide
+     * automatically" here: the launcher is only ever behind the track when the rider has already
+     * asked for the track to be there, so the automatic answer and the "leave my launcher alone"
+     * answer are the same answer.
+     *
+     * False by default, because the alternative default would hide the app grid, the settings
+     * button and the workout panel on a console with no physical Home or Back button, for riders
+     * who never asked for any of that.
+     *
+     * Read by the launcher rather than by the overlay: the overlay draws nothing for this setting,
+     * so caching a copy of it in [OverlayService] would be state nothing reads.
+     */
+    var trackBackdrop: Boolean
+        get() = requirePrefs().getBoolean(KEY_TRACK_BACKDROP, false)
+        set(value) {
+            requirePrefs().edit().putBoolean(KEY_TRACK_BACKDROP, value).apply()
         }
 
     /**

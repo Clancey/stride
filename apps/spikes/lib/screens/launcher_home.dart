@@ -46,6 +46,22 @@ class LauncherHomeState extends State<LauncherHome>
   Timer? _appstorePoll;
   bool _editingPins = false;
 
+  /// True while the track floor is on screen *and* the rider asked for a plain
+  /// backdrop behind it. Both halves come from the platform, because only the
+  /// platform knows whether the floor's window was actually added — see
+  /// `OverlayService.trackFloorVisible`.
+  bool _blankBackdrop = false;
+
+  /// Set by a tap on the plain backdrop, and by the overlay's Home button.
+  ///
+  /// This is the way out, and it is the reason the backdrop is drawn here
+  /// rather than as another overlay window. The console has no physical Home or
+  /// Back button: a plain screen that hid the app grid with no way to ask for it
+  /// back would be a console the rider cannot operate. The track floor's window
+  /// is `FLAG_NOT_TOUCHABLE`, so a tap anywhere in the middle of the screen
+  /// reaches this launcher underneath it.
+  bool _backdropRevealed = false;
+
   @override
   void initState() {
     super.initState();
@@ -56,6 +72,7 @@ class LauncherHomeState extends State<LauncherHome>
     _ensureOverlay();
     _workout.addListener(_syncGoalWithSession);
     _refreshAppstore();
+    _refreshBackdrop();
     // Slow on purpose. The badge only has to be right the next time someone
     // looks at the launcher; the service is what keeps the console current, and
     // polling it hard would burn cycles on a screen that is usually idle.
@@ -70,6 +87,28 @@ class LauncherHomeState extends State<LauncherHome>
   /// target that no longer exists.
   void _syncGoalWithSession() {
     if (_workout.isIdle && _goal.isTrackable) _loadGoal();
+    // The track floor comes and goes with the workout, and the plain backdrop
+    // follows the floor rather than the setting.
+    _refreshBackdrop();
+  }
+
+  /// Re-read whether the launcher should be standing down behind the track.
+  ///
+  /// Never throws and always fails toward showing the launcher. A bridge that
+  /// is missing or unhappy is not evidence that a track is on screen, and the
+  /// wrong guess in that direction is a console showing nothing.
+  Future<void> _refreshBackdrop() async {
+    var blank = false;
+    try {
+      final floor = await SpikeBridge.trackFloorGet();
+      blank =
+          (floor['backdrop'] as bool? ?? false) &&
+          (floor['visible'] as bool? ?? false);
+    } on Object {
+      blank = false;
+    }
+    if (!mounted || blank == _blankBackdrop) return;
+    setState(() => _blankBackdrop = blank);
   }
 
   @override
@@ -91,11 +130,26 @@ class LauncherHomeState extends State<LauncherHome>
   /// back. Installs and removals made outside Stride land here too.
   @override
   void didChangeAppLifecycleState(AppLifecycleState state) {
-    if (state == AppLifecycleState.resumed) _loadApps();
+    if (state != AppLifecycleState.resumed) return;
+    _loadApps();
+    // Coming back from another app is what re-arms the plain backdrop, and the
+    // order matters: the reveal is only dropped once the platform has confirmed
+    // a track floor is actually on screen to replace the launcher with. Doing it
+    // the other way round would hide the app grid on the strength of a stale
+    // answer, on a console whose only Home button is the one Stride draws.
+    _refreshBackdrop().then((_) {
+      if (!mounted || !_blankBackdrop || !_backdropRevealed) return;
+      setState(() => _backdropRevealed = false);
+    });
   }
 
+  /// Put the launcher back to its root state. Called when the overlay's Home
+  /// button is pressed, which makes that button a second way out of the plain
+  /// backdrop — one that does not depend on the rider guessing that the blank
+  /// screen is tappable.
   void resetToLauncherRoot() {
     if (_editingPins) setState(() => _editingPins = false);
+    if (!_backdropRevealed) setState(() => _backdropRevealed = true);
     if (_pinnedScroll.hasClients) {
       _pinnedScroll.animateTo(
         0,
@@ -216,84 +270,93 @@ class LauncherHomeState extends State<LauncherHome>
             ],
           ),
         ),
-        child: SafeArea(
-          child: Padding(
-            padding: const EdgeInsets.fromLTRB(
-              StrideSpace.xl,
-              StrideSpace.lg,
-              StrideSpace.xl,
-              StrideSpace.xl,
-            ),
-            child: AnimatedBuilder(
-              animation: _profiles,
-              builder: (context, _) {
-                final pinned = _pinnedApps();
-                final editing = _editingPins && pinned.isNotEmpty;
-                return Column(
-                  crossAxisAlignment: CrossAxisAlignment.start,
-                  children: [
-                    SetupCard(status: _setup),
-                    _LauncherHeader(
-                      onAllApps: _openAllApps,
-                      onDiagnostics: _openDiagnostics,
-                      onSettings: _openSettings,
-                      onGoal: _startWorkoutFlow,
-                      goal: _goal,
-                      updateCount: _appstore.actionableCount,
-                      onUpdates: _openUpdates,
-                    ),
-                    const SizedBox(height: StrideSpace.lg),
-                    Expanded(
-                      child: Row(
-                        crossAxisAlignment: CrossAxisAlignment.stretch,
+        // The plain backdrop is this gradient with the content taken away, so
+        // it matches Stride's scheme by construction rather than by a second
+        // colour somebody has to remember to keep in step. Branching here, above
+        // the SafeArea, is what makes it full-bleed: inside, it would leave the
+        // launcher's own padding as a visible frame around the track.
+        child: _blankBackdrop && !_backdropRevealed
+            ? _BlankBackdrop(
+                onReveal: () => setState(() => _backdropRevealed = true),
+              )
+            : SafeArea(
+                child: Padding(
+                  padding: const EdgeInsets.fromLTRB(
+                    StrideSpace.xl,
+                    StrideSpace.lg,
+                    StrideSpace.xl,
+                    StrideSpace.xl,
+                  ),
+                  child: AnimatedBuilder(
+                    animation: _profiles,
+                    builder: (context, _) {
+                      final pinned = _pinnedApps();
+                      final editing = _editingPins && pinned.isNotEmpty;
+                      return Column(
+                        crossAxisAlignment: CrossAxisAlignment.start,
                         children: [
+                          SetupCard(status: _setup),
+                          _LauncherHeader(
+                            onAllApps: _openAllApps,
+                            onDiagnostics: _openDiagnostics,
+                            onSettings: _openSettings,
+                            onGoal: _startWorkoutFlow,
+                            goal: _goal,
+                            updateCount: _appstore.actionableCount,
+                            onUpdates: _openUpdates,
+                          ),
+                          const SizedBox(height: StrideSpace.lg),
                           Expanded(
-                            flex: 7,
-                            child: _LauncherPanel(
-                              profiles: _profiles,
-                              loading: _loading,
-                              error: _error,
-                              pinned: pinned,
-                              iconCache: _iconCache,
-                              scrollController: _pinnedScroll,
-                              onLaunch: _launch,
-                              onAllApps: _openAllApps,
-                              onUnpin: _confirmUnpin,
-                              editing: editing,
-                              onStartEditing: () =>
-                                  setState(() => _editingPins = true),
-                              onDoneEditing: () =>
-                                  setState(() => _editingPins = false),
-                              onReorder: _reorderPinned,
+                            child: Row(
+                              crossAxisAlignment: CrossAxisAlignment.stretch,
+                              children: [
+                                Expanded(
+                                  flex: 7,
+                                  child: _LauncherPanel(
+                                    profiles: _profiles,
+                                    loading: _loading,
+                                    error: _error,
+                                    pinned: pinned,
+                                    iconCache: _iconCache,
+                                    scrollController: _pinnedScroll,
+                                    onLaunch: _launch,
+                                    onAllApps: _openAllApps,
+                                    onUnpin: _confirmUnpin,
+                                    editing: editing,
+                                    onStartEditing: () =>
+                                        setState(() => _editingPins = true),
+                                    onDoneEditing: () =>
+                                        setState(() => _editingPins = false),
+                                    onReorder: _reorderPinned,
+                                  ),
+                                ),
+                                // Only one workout surface at a time. When the overlay is up it owns the
+                                // workout entirely, and drawing a second panel behind it produced two
+                                // sets of controls and two safety notices that disagreed with each other
+                                // — the overlay showing live speed while this panel still read
+                                // "Not measured". Contradictory safety copy is worse than none, because
+                                // it teaches the rider to stop believing the notice that matters.
+                                if (!_overlayRunning) ...[
+                                  const SizedBox(width: StrideSpace.lg),
+                                  Expanded(
+                                    flex: 5,
+                                    child: _WorkoutPanel(
+                                      controller: _workout,
+                                      goal: _goal,
+                                      onStart: _startWorkoutFlow,
+                                      overlayStatus: _overlayStatus,
+                                    ),
+                                  ),
+                                ],
+                              ],
                             ),
                           ),
-                          // Only one workout surface at a time. When the overlay is up it owns the
-                          // workout entirely, and drawing a second panel behind it produced two
-                          // sets of controls and two safety notices that disagreed with each other
-                          // — the overlay showing live speed while this panel still read
-                          // "Not measured". Contradictory safety copy is worse than none, because
-                          // it teaches the rider to stop believing the notice that matters.
-                          if (!_overlayRunning) ...[
-                            const SizedBox(width: StrideSpace.lg),
-                            Expanded(
-                              flex: 5,
-                              child: _WorkoutPanel(
-                                controller: _workout,
-                                goal: _goal,
-                                onStart: _startWorkoutFlow,
-                                overlayStatus: _overlayStatus,
-                              ),
-                            ),
-                          ],
                         ],
-                      ),
-                    ),
-                  ],
-                );
-              },
-            ),
-          ),
-        ),
+                      );
+                    },
+                  ),
+                ),
+              ),
       ),
     );
   }
@@ -318,13 +381,16 @@ class LauncherHomeState extends State<LauncherHome>
   }
 
   void _openSettings() {
-    Navigator.of(context)
-        .push(
-          MaterialPageRoute<void>(builder: (context) => const SettingsScreen()),
-        )
-        // Grants can change while that screen is open, and the setup card is the thing that has to
-        // notice.
-        .then((_) => _setup.refresh());
+    Navigator.of(
+      context,
+    ).push(MaterialPageRoute<void>(builder: (context) => const SettingsScreen()))
+    // Grants can change while that screen is open, and the setup card is the thing that has to
+    // notice. So can the backdrop choice, which is the setting most likely to have been the
+    // reason for the visit.
+    .then((_) {
+      _setup.refresh();
+      _refreshBackdrop();
+    });
   }
 
   void _openDiagnostics() {
@@ -533,6 +599,91 @@ class LauncherHomeState extends State<LauncherHome>
     if (_editingPins && _pinnedApps().isEmpty) {
       setState(() => _editingPins = false);
     }
+  }
+}
+
+/// What the launcher shows instead of itself while the track floor is the thing
+/// on screen.
+///
+/// Issue #30: riders using the track as their main visual got "Stride", "Your
+/// workout apps, one tap away", "Pinned apps" and "Browse apps" competing with
+/// it for attention. This is that content taken away, not a second design — the
+/// gradient it sits on is the launcher's own, so it cannot drift out of step
+/// with the theme.
+///
+/// The one thing it must never be is a screen with nothing on it. This console
+/// has no physical Home or Back button, so a blank launcher with no visible way
+/// back is a console the rider cannot operate. Two answers to that, and the
+/// second exists because the first is a guess:
+///
+///  * the whole surface is tappable, opaque to hit testing so a tap on empty
+///    space counts rather than falling through to the `Scaffold`;
+///  * a plainly labelled button says so, kept quiet enough not to compete with
+///    the track and placed where the launcher's own header normally sits, which
+///    is clear of both the oval and the overlay's bottom corners.
+class _BlankBackdrop extends StatelessWidget {
+  const _BlankBackdrop({required this.onReveal});
+
+  final VoidCallback onReveal;
+
+  @override
+  Widget build(BuildContext context) {
+    return GestureDetector(
+      behavior: HitTestBehavior.opaque,
+      onTap: onReveal,
+      child: SizedBox.expand(
+        child: SafeArea(
+          child: Align(
+            alignment: Alignment.topLeft,
+            child: Padding(
+              padding: const EdgeInsets.fromLTRB(
+                StrideSpace.xl,
+                StrideSpace.lg,
+                StrideSpace.xl,
+                StrideSpace.xl,
+              ),
+              child: Material(
+                color: StrideColors.panel,
+                borderRadius: BorderRadius.circular(StrideRadius.md),
+                child: InkWell(
+                  borderRadius: BorderRadius.circular(StrideRadius.md),
+                  onTap: onReveal,
+                  child: Container(
+                    height: StrideSpace.minTouch,
+                    padding: const EdgeInsets.symmetric(
+                      horizontal: StrideSpace.lg,
+                    ),
+                    decoration: BoxDecoration(
+                      borderRadius: BorderRadius.circular(StrideRadius.md),
+                      border: Border.all(color: StrideColors.line),
+                    ),
+                    child: const Row(
+                      mainAxisSize: MainAxisSize.min,
+                      children: [
+                        Icon(
+                          Icons.apps,
+                          color: StrideColors.textMuted,
+                          size: 26,
+                        ),
+                        SizedBox(width: StrideSpace.sm),
+                        Text(
+                          'Show apps',
+                          style: TextStyle(
+                            fontSize: 17,
+                            fontWeight: FontWeight.w700,
+                            color: StrideColors.textMuted,
+                          ),
+                        ),
+                      ],
+                    ),
+                  ),
+                ),
+              ),
+            ),
+          ),
+        ),
+      ),
+    );
   }
 }
 
