@@ -74,6 +74,10 @@ class MainActivity : FlutterActivity() {
         // Idempotent, and deliberately also done by OverlayService: either surface can be the one
         // on screen, and whichever comes up first should start reading the machine.
         StrideSettings.attach(applicationContext)
+        // Idempotent with the overlay's own call, and needed here too: the launcher can be the
+        // surface a rider comes back to after a process kill, and a safety latch nothing raised
+        // would leave them looking at "Start workout" over a belt Stride never confirmed stopped.
+        StopEscalation.restore()
         MachineLink.attach(applicationContext)
         // The periodic update check is registered here as well as on boot: a console that is never
         // rebooted (the common case - it is plugged in) would otherwise only ever check once.

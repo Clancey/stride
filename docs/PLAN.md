@@ -345,6 +345,7 @@ Responsibilities:
 | Stop preemption | ✅ `stop()` bumps the generation *before* queueing, so queued work is discarded — but the mid-ramp case is **not yet exercised on hardware** |
 | Generation IDs | ✅ every job carries one; `Outcome.Superseded` is a normal result, not an error |
 | Command ack + timeout | ✅ `COMMAND_TIMEOUT_S = 12` for commands, 2 s for reads so a stalled console degrades to "no reading" instead of freezing the overlay |
+| Positive stop confirmation | ✅ `stopVerdict` — ack **plus** two agreeing post-stop readings of a belt at rest, on a console whose speed register has proved it reports motion, with distance permitted to veto. Anything else is `Unconfirmed` and escalates. **Not verified against a lost stop on hardware** — that case cannot be induced safely |
 | Telemetry watchdog | ❌ not built |
 | Attach-to-moving-machine recovery | ✅ adopts a workout already running on the console rather than assuming idle |
 | Safety-key latch | ❌ not built — the key is still the only true stop, and the UI says so |
@@ -536,7 +537,8 @@ if-chain.
 
 ### 3.5 Workout session
 
-`idle → running ⇄ paused → summary`, layered **on top of** the coordinator, which owns safety. Owns
+`idle → starting → running ⇄ paused → stopping → summary`, layered **on top of** the coordinator,
+which owns safety. Owns
 elapsed vs. moving time, distance integration, calorie estimation, laps, media side effects, and
 emits a `WorkoutSummary` → FIT → sync queue.
 
@@ -561,6 +563,24 @@ listeners that have not run yet.
   workout the rider completed.
 - **Ended** is the rider pressing End. Deliberate, final, not resumable — and the only one that
   earns the extra writes below.
+
+**An end goes to `stopping`, not to idle.** `WorkoutSession.stop` used to publish `IDLE` — and
+notify every listener — *before* the coupling had so much as called `MachineCoordinator.stop()`, so
+the app showed "Start workout" over a belt nothing had asked to stop yet, let alone confirmed
+stopped. A stop is done on ack plus observed deceleration (§5.4), and `stopping` is the state in
+which neither has arrived. Only the stop's verdict leaves it, and the session then returns to idle
+whichever way the verdict went — what withholds the Start control after an unconfirmed stop is
+`StopEscalation`'s latch, not the session state, because a session a rider cannot get out of would
+be a worse failure than the one being fixed.
+
+**`stopping` cannot delay the stop.** It is published on the way *into* the same listener
+notification that issues the stop command, on the same thread, in the same call: a label applied as
+the stop goes past, never a gate it waits behind.
+
+**An abandon deliberately does not pass through it.** That is the retry path — a start refused,
+cancelled, or never answered — and holding it behind a confirmation would lock the rider out of
+pressing Start again on the one screen where they are standing on a treadmill waiting to hear
+whether their start worked.
 
 **What an end does beyond stopping.** Two things, both queued *behind* the stop and never in front
 of it, because a stop preempts everything and gaining a fan write in front of it would be a worse
@@ -896,6 +916,59 @@ Enforced by §3.1's coordinator, from the very first control command in Phase 1:
 3. **Absolute clamps** at installation/device level; profiles may only tighten them.
 4. **Positive stop confirmation.** A stop is "done" only on ack *plus* observed deceleration in
    telemetry. If neither arrives, the UI escalates to **"USE THE SAFETY KEY"** — not "stopped".
+
+   **What "observed" has to mean, and why it is not simply a zero.** Four conditions, all required
+   (`MachineCoordinator.stopVerdict`):
+
+   1. the console acked the stop;
+   2. its speed register has, at some point on this link, reported motion at all
+      (`MachineLink.everReportedMotion`) — on the X22i `ACTUAL_KPH` reads a confident, well-formed
+      `0x0000` on every poll while a rider walks at 4 mph (issue #34), and there is no per-field
+      validity marker in the protocol that could tell that apart from a genuine zero, so a console
+      that has only ever said zero is not saying anything;
+   3. two agreeing readings say the belt is at rest, **at least one of them taken after the stop** —
+      after by poll count, because a reading is believed for four seconds and one taken *before* a
+      stop must never be allowed to confirm it. The reading current when the stop went out may
+      complete the pair but can never be the whole of it;
+   4. `CURRENT_DISTANCE` did not advance across those readings.
+
+   **Why the pre-stop reading is allowed to be one of the two — measured, not assumed.** GlassOS
+   publishes metrics only while a workout is live, so *ending* one takes the telemetry away:
+   `GlassOsTelemetry.reading` returns **null, not zero**, once no `workoutId` is stamped. A belt run
+   on a GlassOS console timed it — `WorkoutService` reported `IDLE` **34 ms** after the stop, the
+   metric services were still answering with real values at **+0.5 s**, and everything was null by
+   **+3.1 s**. Nothing narrows that window further. Requiring both readings to come from after the
+   stop would make every ordinary end depend on which end of that range is true, and if it is the
+   near one then *every* end escalates. **An alarm that always fires is a worse safety defect than
+   the gap this issue closes**, because it teaches a rider to ignore the one that matters. Allowing
+   the pre-stop reading to complete the pair costs nothing: a moving belt cannot produce two at-rest
+   readings straddling a stop on an honest register, and on a dishonest one the distance veto still
+   applies. Ending from RUNNING still needs two post-stop readings, because there the pre-stop
+   reading says the belt was moving.
+
+   **Distance may veto a confirmation and may never grant one.** That asymmetry is what makes the
+   rule safe on a console nobody has characterised. Distance *advancing* is monotone positive
+   evidence of travel — a register that ticks in 10 m steps still only ticks when 10 m have passed —
+   so an increase can be trusted without knowing the quantum. Distance *failing to advance* is not
+   evidence of rest: a 10 m quantum at 4 mph is five and a half seconds of real motion reading as
+   "unchanged". The belt run measured GlassOS's own quantum at roughly **0.45 m**, which is fine
+   enough to be useful — but the FitPro register path counts whole metres and no other machine has
+   been measured, so a machine that publishes no distance cannot have a stop confirmed, and degrades
+   to the escalation rather than to reassurance. This is also the only leg that catches a speed
+   register which reports motion, earns the latch, and *then* goes dead while the belt is still
+   running.
+
+   **Confirmation never delays a stop.** It is armed after the stop is queued, runs on its own
+   scheduler, and only ever reads. The command path is untouched — see §5.2.
+
+   **The escalation is a latch**, not a message: `StopEscalation` is raised by the machine, cleared
+   only by an explicit local acknowledgement, survives a process kill, withholds the Start control
+   while it is up, and is announced both as a non-dismissible card and as a high-importance
+   notification so it is not lost when the overlay is behind another app. The one narrow exception
+   to escalating is `shouldEscalate`: a console that positively reports *no treadmill attached*, or
+   a start the console *explicitly refused*, does not raise the alarm — an alarm a rider sees when
+   nothing is wrong is one they learn to dismiss without reading. A start that merely went
+   **unanswered** does escalate, because its reply may have been lost behind a belt that started.
 5. **A stop sent over a dead link is not a fail-safe.** Characterize what GlassOS does when its
    controlling client dies: if losing the client does not stop the belt, then no software fail-safe
    is achievable and the docs must say so plainly.
@@ -910,7 +983,8 @@ Enforced by §3.1's coordinator, from the very first control command in Phase 1:
 | Belt keeps moving after app process death | none from inside a dead process | Characterize GlassOS dead-client behavior; document safety key as primary | **High if GlassOS does not auto-stop** |
 | Delayed command executes after stop | generation ID mismatch | discard stale generation | Low |
 | Telemetry stalls while belt commanded to move | watchdog timeout | attempt stop, escalate UI | Medium — depends on row 1 |
-| Stop command lost on a failed link | no ack, no observed deceleration | escalate to "USE SAFETY KEY" | Medium |
+| Stop command lost on a failed link | no ack, no observed deceleration | resolves `Unconfirmed`, UI escalates to "USE THE SAFETY KEY" and withholds Start until acknowledged | Medium — the escalation is a warning, not a stop |
+| Speed register reports rest while the belt is moving | `CURRENT_DISTANCE` advancing across the post-stop readings | distance vetoes the confirmation; resolves `Unconfirmed` and escalates | Low–medium — a console where speed lies *and* distance is dead is not distinguishable in-band, and the answer for it is the safety key |
 | Overlay engine crashes, stop button disappears | service-side heartbeat on the overlay window | native fallback window; a whole-process kill still defeats this | Medium |
 | Navigation panel or edge gesture hides the stop control while moving | UI invariant test | stop control is pinned and cannot be occluded or dismissed while the belt moves | Low |
 | Runaway acceleration from a bad UI value | coordinator clamp + ramp limit | reject before transmit | Low |

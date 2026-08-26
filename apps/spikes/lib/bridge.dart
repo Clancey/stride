@@ -69,6 +69,19 @@ class SpikeBridge {
   static Future<bool> workoutResume() => _bool('workoutResume');
   static Future<int> workoutStop() => _int('workoutStop');
   static Future<bool> workoutCancelStart() => _bool('workoutCancelStart');
+
+  /// The "USE THE SAFETY KEY" latch: `active`, `reason`, `detail`, `instruction`.
+  ///
+  /// Read here as well as drawn by the overlay because the overlay is not
+  /// guaranteed to exist — `SYSTEM_ALERT_WINDOW` may never have been granted,
+  /// the rider can stop it, and Android can kill it. A warning only one surface
+  /// can show is not a warning.
+  static Future<Map<String, dynamic>> stopEscalation() => _map('stopEscalation');
+
+  /// The rider says they have dealt with it. The only thing that clears the
+  /// latch — nothing in the app may clear it for them.
+  static Future<bool> stopEscalationAcknowledge() =>
+      _bool('stopEscalationAcknowledge');
   static Future<Map<String, dynamic>> volumeGet() => _map('volumeGet');
   static Future<bool> volumeSet(int level) =>
       _bool('volumeSet', {'level': level});

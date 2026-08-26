@@ -1030,8 +1030,7 @@ class _EndOfGridSlot extends StatelessWidget {
   }
 }
 
-class _WorkoutPanel extends StatelessWidget {
-  const _WorkoutPanel({
+class _WorkoutPanel extends StatelessWidget {  const _WorkoutPanel({
     required this.controller,
     required this.goal,
     required this.onStart,
@@ -1058,6 +1057,17 @@ class _WorkoutPanel extends StatelessWidget {
               children: [
                 _WorkoutHeader(state: controller.state),
                 const SizedBox(height: StrideSpace.sm),
+                // Above everything, including the safety notice it supersedes.
+                // This is the one thing on this panel a rider must not scroll
+                // past, and it is drawn here as well as by the overlay because
+                // the overlay is not guaranteed to exist: SYSTEM_ALERT_WINDOW
+                // may never have been granted, the rider can stop it, and
+                // Android can kill it under memory pressure. A warning only one
+                // surface can show is not a warning.
+                if (controller.stopEscalation.active) ...[
+                  _StopEscalationCard(controller: controller),
+                  const SizedBox(height: StrideSpace.sm),
+                ],
                 _SafetyNotice(text: controller.machine.metricsNotice),
                 const SizedBox(height: StrideSpace.sm),
                 _ElapsedHero(elapsedMs: controller.elapsedMs),
@@ -1134,6 +1144,10 @@ class _StatePill extends StatelessWidget {
     final running = state == 'running';
     final paused = state == 'paused';
     final starting = state == 'starting';
+    // Drawn as its own word rather than folded into READY. A pill that said READY while a stop was
+    // still unconfirmed would be the same claim the whole of issue #39 is about, in two syllables.
+    final stopping = state == 'stopping';
+    final pending = paused || starting || stopping;
     return Container(
       constraints: const BoxConstraints(minHeight: 44),
       padding: const EdgeInsets.symmetric(
@@ -1143,7 +1157,7 @@ class _StatePill extends StatelessWidget {
       decoration: BoxDecoration(
         color: running
             ? StrideColors.accent
-            : paused || starting
+            : pending
             ? StrideColors.warning
             : StrideColors.panelHigh,
         borderRadius: BorderRadius.circular(StrideRadius.xl),
@@ -1156,11 +1170,11 @@ class _StatePill extends StatelessWidget {
               ? 'PAUSED'
               : starting
               ? 'STARTING'
+              : stopping
+              ? 'STOPPING'
               : 'READY',
           style: Theme.of(context).textTheme.labelMedium?.copyWith(
-            color: running || paused || starting
-                ? StrideColors.ink
-                : StrideColors.text,
+            color: running || pending ? StrideColors.ink : StrideColors.text,
             fontWeight: FontWeight.w900,
           ),
         ),
@@ -1316,12 +1330,73 @@ class _SafetyNotice extends StatelessWidget {
   }
 }
 
+class _StopEscalationCard extends StatelessWidget {
+  const _StopEscalationCard({required this.controller});
+
+  final WorkoutController controller;
+
+  @override
+  Widget build(BuildContext context) {
+    final escalation = controller.stopEscalation;
+    final theme = Theme.of(context);
+    return Container(
+      width: double.infinity,
+      padding: const EdgeInsets.all(StrideSpace.md),
+      decoration: BoxDecoration(
+        color: StrideColors.panelHigh,
+        borderRadius: BorderRadius.circular(StrideRadius.lg),
+        border: Border.all(color: StrideColors.danger, width: 2),
+      ),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Text(
+            'USE THE SAFETY KEY',
+            style: theme.textTheme.titleLarge?.copyWith(
+              color: StrideColors.danger,
+              fontWeight: FontWeight.w900,
+            ),
+          ),
+          const SizedBox(height: StrideSpace.xs),
+          // What failed, then what to do. Both come from the host: MachineLink
+          // and StopEscalation own every safety sentence in this app, and a
+          // second copy of the wording here is a second thing to get wrong.
+          if (escalation.detail.isNotEmpty)
+            Text(escalation.detail, style: theme.textTheme.bodyMedium),
+          if (escalation.instruction.isNotEmpty) ...[
+            const SizedBox(height: StrideSpace.xs),
+            Text(
+              escalation.instruction,
+              style: theme.textTheme.bodyMedium?.copyWith(
+                fontWeight: FontWeight.w700,
+              ),
+            ),
+          ],
+          const SizedBox(height: StrideSpace.sm),
+          // The only way out, and deliberately an acknowledgement rather than a
+          // fix: Stride cannot fix this. Until it is pressed the host refuses to
+          // start a workout, so without this button a rider on a console with no
+          // overlay would be left with a dead Start and no way to explain it.
+          FilledButton(
+            style: FilledButton.styleFrom(
+              minimumSize: const Size(double.infinity, StrideSpace.minTouch),
+              backgroundColor: StrideColors.danger,
+              foregroundColor: StrideColors.ink,
+            ),
+            onPressed: () => controller.acknowledgeStopEscalation(),
+            child: const _ButtonLabel("I've stopped the belt"),
+          ),
+        ],
+      ),
+    );
+  }
+}
+
 class _WorkoutActions extends StatelessWidget {
   const _WorkoutActions({required this.controller, required this.onStart});
 
   final WorkoutController controller;
   final VoidCallback onStart;
-
   @override
   Widget build(BuildContext context) {
     if (controller.isIdle) {
@@ -1357,6 +1432,30 @@ class _WorkoutActions extends StatelessWidget {
           ),
         ),
         label: const _ButtonLabel('Starting…'),
+      );
+    }
+
+    if (controller.isStopping) {
+      // The mirror of "Starting…" — the stop is on the wire and nothing has confirmed the belt is
+      // at rest. Not tappable, because there is nothing useful to press: the stop has already
+      // preempted the queue and the answer is the only thing outstanding. What it must not do is
+      // read as "Start workout", which is what this state exists to stop it doing (#39).
+      return FilledButton.icon(
+        style: FilledButton.styleFrom(
+          minimumSize: const Size(double.infinity, StrideSpace.minTouch),
+          backgroundColor: StrideColors.warning,
+          foregroundColor: StrideColors.ink,
+        ),
+        onPressed: null,
+        icon: const SizedBox(
+          width: 26,
+          height: 26,
+          child: CircularProgressIndicator(
+            strokeWidth: 3,
+            color: StrideColors.ink,
+          ),
+        ),
+        label: const _ButtonLabel('Stopping…'),
       );
     }
 

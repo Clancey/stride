@@ -56,6 +56,70 @@ void main() {
     expect(controller.volume.available, isFalse);
     expect(controller.machine.canCommand, isFalse);
     expect(controller.lastError, contains('unavailable'));
+    // And a bridge that cannot answer must not manufacture a safety alarm out
+    // of its own silence. The host is the only thing that raises this latch.
+    expect(controller.stopEscalation.active, isFalse);
+  });
+
+  test('a stop that could not be confirmed is surfaced, and can be cleared', () async {
+    // This is the case the launcher has to cover on its own: no overlay is
+    // running — never granted SYSTEM_ALERT_WINDOW, stopped by the rider, or
+    // killed under memory pressure — so the card the overlay would have drawn
+    // does not exist and this screen is the only thing that can warn anybody.
+    final bridge = _FakeWorkoutBridge(state: 'idle')
+      ..escalation = const StopEscalationState(
+        active: true,
+        reason: 'NOT_OBSERVED',
+        detail: 'Stride told the treadmill to stop and the console accepted '
+            'it, but no telemetry came back to show the belt actually slowing.',
+        instruction: 'Do not assume the belt has stopped. Pull the safety key.',
+      );
+    final controller = WorkoutController(
+      bridge: bridge,
+      tickInterval: const Duration(milliseconds: 10),
+    );
+    addTearDown(controller.dispose);
+
+    await controller.load();
+    expect(controller.stopEscalation.active, isTrue);
+    expect(controller.stopEscalation.detail, contains('no telemetry'));
+    expect(controller.stopEscalation.instruction, contains('safety key'));
+
+    // The only way out, and it has to work from here: the host refuses to start
+    // a workout while the latch is up, so a screen that could show the warning
+    // but not clear it would leave a rider with a dead Start button for good.
+    await controller.acknowledgeStopEscalation();
+    expect(controller.stopEscalation.active, isFalse);
+  });
+
+  test('leaving "stopping" re-reads the latch', () async {
+    // The verdict lands asynchronously and the session goes idle either way, so
+    // the transition out of "stopping" is the moment an unconfirmed stop has
+    // just raised the warning — and the ticker stops at idle, so there may be
+    // no later poll to notice it.
+    final bridge = _FakeWorkoutBridge(state: 'stopping');
+    final controller = WorkoutController(
+      bridge: bridge,
+      tickInterval: const Duration(milliseconds: 5),
+    );
+    addTearDown(controller.dispose);
+
+    await controller.load();
+    expect(controller.state, 'stopping');
+    expect(controller.stopEscalation.active, isFalse);
+
+    bridge
+      ..state = 'idle'
+      ..escalation = const StopEscalationState(
+        active: true,
+        reason: 'STILL_MOVING',
+        detail: 'The machine is still reporting that the belt is moving.',
+        instruction: 'Pull the safety key.',
+      );
+    await Future<void>.delayed(const Duration(milliseconds: 60));
+
+    expect(controller.state, 'idle');
+    expect(controller.stopEscalation.active, isTrue);
   });
 }
 
@@ -124,6 +188,19 @@ class _FakeWorkoutBridge implements WorkoutBridgeClient {
 
   @override
   Future<MachineSnapshot> machineSnapshot() async => machine;
+
+  /// The safety-key latch. Defaults to clear, so a fake that says nothing about
+  /// it cannot manufacture an alarm.
+  StopEscalationState escalation = const StopEscalationState.clear();
+
+  @override
+  Future<StopEscalationState> stopEscalation() async => escalation;
+
+  @override
+  Future<bool> stopEscalationAcknowledge() async {
+    escalation = const StopEscalationState.clear();
+    return true;
+  }
 }
 
 class _ThrowingWorkoutBridge implements WorkoutBridgeClient {
@@ -158,4 +235,10 @@ class _ThrowingWorkoutBridge implements WorkoutBridgeClient {
 
   @override
   Future<MachineSnapshot> machineSnapshot() async => _missing();
+
+  @override
+  Future<StopEscalationState> stopEscalation() async => _missing();
+
+  @override
+  Future<bool> stopEscalationAcknowledge() async => _missing();
 }

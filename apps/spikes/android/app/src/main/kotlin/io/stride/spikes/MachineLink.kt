@@ -333,6 +333,53 @@ object MachineLink {
     @Volatile private var client: GlassOsClient? = null
 
     /**
+     * One poll's worth of the readings a stop confirmation needs, taken together.
+     *
+     * Read as a single object rather than through [speedMph] and [distanceMiles] on purpose. Those
+     * are two separate reads of a field the poll thread rewrites, so a caller sampling them one
+     * after the other can straddle a poll and pair a distance from *before* a stop with a speed
+     * from after it — which is exactly the comparison a confirmation is making, so getting a
+     * mismatched pair there is not a cosmetic race.
+     *
+     * [seq] is what ties a reading to a moment. It is a count of polls, deliberately not a
+     * timestamp: [snapshotAt] is wall-clock, and an NTP correction or a timezone change mid-run
+     * must never be able to make a reading taken *before* a stop look like one taken after it.
+     */
+    data class Observation(
+        /** Which poll produced this. Strictly increasing; comparable across a stop. */
+        val seq: Long,
+        /** When it was taken, for the freshness test only. */
+        val atMs: Long,
+        val speedMph: Double?,
+        val distanceMiles: Double?,
+    )
+
+    @Volatile private var latestObservation: Observation? = null
+
+    /**
+     * How many polls have succeeded on this link.
+     *
+     * Ungated by freshness, because its one job is to be sampled at the instant a stop goes out so
+     * that later readings can be told from earlier ones. A stale link still has a definite count,
+     * and "no reading was fresh when we stopped" must not collapse into "every reading is newer
+     * than the stop".
+     *
+     * Only ever written by the poll thread, so the read-modify-write is single-writer.
+     */
+    @Volatile
+    var readingSeq: Long = 0L
+        private set
+
+    /**
+     * The freshest complete observation, or null when nothing is fresh.
+     *
+     * Same freshness rule as every other reading ([FRESHNESS_MS]); null means "we cannot see the
+     * belt" and must never be read as "the belt is stopped".
+     */
+    fun observation(): Observation? =
+        latestObservation?.takeIf { System.currentTimeMillis() - it.atMs <= FRESHNESS_MS }
+
+    /**
      * Whether this machine has ever, on this link, reported a speed that means the belt is moving.
      *
      * Not a reading — a statement about whether this console's speed register can be believed when
@@ -1205,6 +1252,12 @@ object MachineLink {
         client = null
         snapshot = null
         snapshotAt = 0L
+        // Cleared with the snapshot, for the same reason: a reading belongs to the machine that
+        // produced it. [readingSeq] is deliberately *not* reset — it is a monotonic ordering used
+        // to tell a reading taken before a stop from one taken after it, and restarting the count
+        // would make a fresh reading on the new transport compare as older than a stop issued on
+        // the previous one.
+        latestObservation = null
         // A different machine has to earn the benefit of the doubt again. Carrying this across a
         // transport swap would let an honest console vouch for the register of the one that
         // replaced it.
@@ -1267,7 +1320,12 @@ object MachineLink {
             }
             if (read != null) {
                 snapshot = read
-                snapshotAt = System.currentTimeMillis()
+                val at = System.currentTimeMillis()
+                snapshotAt = at
+                // Published as one object, after the snapshot, so a stop confirmation gets a speed
+                // and a distance that came off the same poll. See Observation.
+                readingSeq += 1
+                latestObservation = Observation(readingSeq, at, read.speedMph, read.distanceMiles)
                 // Latched, never cleared by a later zero. The question this answers is not "is the
                 // belt moving now" — that is what the snapshot is for — but "does this console's
                 // speed register ever say anything but zero". See everReportedMotion and issue #34.
@@ -1310,8 +1368,15 @@ object MachineLink {
             }
             // Poll faster while the machine says it may be moving. There is no reason to hammer a
             // console sitting idle, and no excuse for a laggy readout while someone is running.
+            //
+            // Also while a stop is waiting to be confirmed, which is the one moment a slow poll
+            // would be actively harmful: a console walking to WORKOUT_RESULTS reports a belt that
+            // "may not be moving" and would drop this to two seconds, so the two agreeing readings
+            // a confirmation needs would take four — long enough to time out and escalate a stop
+            // that worked perfectly. See MachineCoordinator.stopConfirmationPending.
             val moving = read?.let { GlassOsClient.ConsoleState.beltMayBeMoving(it.consoleState) }
-            handler?.postDelayed(this, if (moving == true) 500L else 2_000L)
+            val fast = moving == true || MachineCoordinator.stopConfirmationPending
+            handler?.postDelayed(this, if (fast) 500L else 2_000L)
         }
     }
 

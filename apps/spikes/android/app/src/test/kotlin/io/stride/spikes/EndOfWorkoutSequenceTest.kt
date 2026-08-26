@@ -130,6 +130,21 @@ class EndOfWorkoutSequenceTest {
     }
 
     /**
+     * The same, with a confirmation watcher attached, as the coupling really does it.
+     *
+     * Returns the verdict, waited for rather than polled so a test that is wrong hangs for its
+     * timeout and then fails rather than passing on a race.
+     */
+    private fun endWorkoutAwaitingVerdict(): StopVerdict {
+        val settled = java.util.concurrent.ArrayBlockingQueue<StopVerdict>(4)
+        MachineCoordinator.stop { settled.add(it) }
+        MachineCoordinator.reassertZero()
+        MachineCoordinator.stopFan()
+        return settled.poll(15, TimeUnit.SECONDS)
+            ?: throw AssertionError("the stop confirmation never settled")
+    }
+
+    /**
      * The stop is first on the wire, and the settling writes queue behind it.
      *
      * The ordering is not a nicety. `stop` empties the queue and takes the front of it; the two
@@ -297,5 +312,98 @@ class EndOfWorkoutSequenceTest {
             "a failed stop must still read as failed, saw ${MachineCoordinator.lastOutcome}",
             MachineCoordinator.lastOutcome is MachineCoordinator.Outcome.Failed,
         )
+    }
+
+    // -------------------------------------------------------------- positive stop confirmation
+
+    /**
+     * **Issue #39.** No amount of writing to a console can produce a confirmed stop.
+     *
+     * The property the whole change turns on, tested against a console that says yes to everything
+     * and reports no telemetry at all. Every command here acks; the belt is invisible; the verdict
+     * must be unconfirmed. If this ever passes as [StopVerdict.Confirmed], somebody has wired an
+     * ack back into the confirmation and the app is once again reporting "stopped" on the strength
+     * of having asked.
+     */
+    @Test
+    fun `a console that acks everything and reports nothing cannot confirm a stop`() {
+        val verdict = endWorkoutAwaitingVerdict()
+        assertTrue(
+            "a write must never confirm a stop, saw $verdict",
+            verdict is StopVerdict.Unconfirmed,
+        )
+    }
+
+    /** A stop the console refused is answered immediately, not after the confirmation timeout. */
+    @Test
+    fun `a refused stop is reported without waiting out the confirmation`() {
+        console.stopAck = MachineAck.Refused("not in a workout")
+        val startedAt = System.nanoTime()
+        val verdict = endWorkoutAwaitingVerdict()
+        val elapsedMs = TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - startedAt)
+        assertEquals(StopVerdict.Unconfirmed(StopUnconfirmed.NOT_ACKED), verdict)
+        assertTrue(
+            "a stop the console refused must not wait for telemetry that cannot help it; took ${elapsedMs}ms",
+            elapsedMs < 4_000,
+        )
+    }
+
+    /**
+     * The stop still goes out first with a watcher attached, and the watcher adds nothing to the
+     * wire.
+     *
+     * This is the regression test for the one way this change could have broken the invariant it
+     * was written to serve: confirmation happens *after and alongside* a stop, so the sequence a
+     * treadmill sees must be exactly what it was before.
+     */
+    @Test
+    fun `attaching a confirmation does not change what reaches the wire`() {
+        endWorkoutAwaitingVerdict()
+        settle()
+        assertEquals(listOf("stop", "speed 0.00", "fan 0"), console.calls)
+    }
+
+    /**
+     * A watcher retired by a newer stop settles as superseded rather than vanishing.
+     *
+     * Two properties in one, and both are wedges if they break. It must **settle**, because a
+     * session waiting on this verdict to leave [WorkoutSession.State.STOPPING] has nothing else to
+     * release it. And it must settle as [StopUnconfirmed.SUPERSEDED] rather than as a failure,
+     * because that is the one unconfirmed verdict that must not raise a safety alarm — the newer
+     * stop's own watcher is the thing entitled to speak for the machine now.
+     */
+    @Test
+    fun `a stop superseded by a newer one still settles, and does not alarm`() {
+        val settled = java.util.concurrent.ArrayBlockingQueue<StopVerdict>(4)
+        MachineCoordinator.stop { settled.add(it) }
+        MachineCoordinator.stop()
+        val verdict = settled.poll(15, TimeUnit.SECONDS)
+            ?: throw AssertionError("a superseded confirmation never settled")
+        assertEquals(StopVerdict.Unconfirmed(StopUnconfirmed.SUPERSEDED), verdict)
+        assertTrue(
+            "a superseded stop must not send anyone to the safety key",
+            !shouldEscalate(verdict, StopCause.ENDED, consoleDetached = false, beltSeenMoving = true),
+        )
+    }
+
+    /**
+     * Ending still never blocks the caller, now with a watcher pending as well as a wedged console.
+     *
+     * That thread is the one notifying every workout listener, and on the overlay it is the main
+     * thread. The watcher runs on its own scheduler precisely so that waiting seconds for a
+     * treadmill cannot become waiting seconds for a screen.
+     */
+    @Test
+    fun `ending never blocks the caller even with a confirmation pending`() {
+        val gate = CountDownLatch(1)
+        console.blockUntil = gate
+        val startedAt = System.nanoTime()
+        MachineCoordinator.stop { }
+        MachineCoordinator.reassertZero()
+        MachineCoordinator.stopFan()
+        val elapsedMs = TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - startedAt)
+        assertTrue("ending took ${elapsedMs}ms with the console wedged", elapsedMs < 500)
+        gate.countDown()
+        awaitCalls(3)
     }
 }

@@ -277,6 +277,17 @@ object WorkoutMachineCoupling {
                     is MachineCoordinator.Outcome.Failed -> outcome.reason
                     else -> ""
                 }
+                // A refusal is the console saying it did nothing; a failure is silence, and silence
+                // may be a reply that was lost behind a belt that did start. Recorded before the
+                // abandon, because abandon notifies listeners synchronously and the stop goes out
+                // inside that notification.
+                synchronized(this) {
+                    lastAbandonCause = if (outcome is MachineCoordinator.Outcome.Rejected) {
+                        StopCause.START_REFUSED
+                    } else {
+                        StopCause.START_UNANSWERED
+                    }
+                }
                 Log.w(TAG, "start refused by the machine; returning to idle: $detail")
                 WorkoutSession.abandon()
                 OverlayService.reportStartRefused(detail)
@@ -319,6 +330,10 @@ object WorkoutMachineCoupling {
         val stale = synchronized(this) { token != startToken }
         if (stale || WorkoutSession.state != WorkoutSession.State.STARTING) return
         Log.w(TAG, "start was never answered after ${START_TIMEOUT_MS}ms; returning to idle")
+        // Silence, not a refusal. The console may well have started the belt and lost the reply, so
+        // an unconfirmable stop here is worth an alarm. This is the default anyway; it is set
+        // explicitly so the intent survives somebody changing the default.
+        synchronized(this) { lastAbandonCause = StopCause.START_UNANSWERED }
         WorkoutSession.abandon()
         OverlayService.reportStartRefused("The treadmill did not answer.")
     }
@@ -331,13 +346,22 @@ object WorkoutMachineCoupling {
         }
         // A session ending is the end of what the console was doing too, whoever ended it. Leaving
         // the old reading in place would let the *next* workout inherit this one's edge and pause
-        // itself the first time the console reported anything.
-        if (next == WorkoutSession.State.IDLE) forgetConsole()
+        // itself the first time the console reported anything. STOPPING counts as an ending here:
+        // it is where an end arrives now, and a console walking to WORKOUT_RESULTS behind a stop
+        // must not read as the rider pressing the machine's own Stop button.
+        if (next == WorkoutSession.State.IDLE || next == WorkoutSession.State.STOPPING) {
+            forgetConsole()
+        }
         // Following the machine, not driving it. The pause below would otherwise be sent to the
-        // console that has just paused itself. The stop on the way to IDLE is deliberately *not*
-        // suppressed — nothing here adopts an end, so any IDLE transition is the rider's, and a
+        // console that has just paused itself. The stop on the way out is deliberately *not*
+        // suppressed — nothing here adopts an end, so any ending transition is the rider's, and a
         // belt that might be moving is always told to stop.
-        if (adopting.get() && next != WorkoutSession.State.IDLE) return
+        if (adopting.get() &&
+            next != WorkoutSession.State.IDLE &&
+            next != WorkoutSession.State.STOPPING
+        ) {
+            return
+        }
         try {
             when (endFollowUp(previous, next, ending)) {
                 // Not an end. The session is still alive, so this is a start, a pause or a resume —
@@ -347,13 +371,13 @@ object WorkoutMachineCoupling {
                 // Stop, and only stop. An abandoned start still gets this unconditionally: a
                 // refusal can be a reply that was lost rather than a command that never landed, so
                 // a belt that might be moving is always told to stop.
-                EndFollowUp.STOP -> stopOnMachine()
+                EndFollowUp.STOP -> stopOnMachine(abandonCause())
 
                 EndFollowUp.STOP_AND_SETTLE -> {
                     // In this order, always. The stop preempts the queue; the settling writes only
                     // append to it. Calling them the other way round would put a fan write in front
                     // of the command that stops a treadmill.
-                    stopOnMachine()
+                    stopOnMachine(StopCause.ENDED)
                     settleAfterEnd()
                 }
             }
@@ -365,12 +389,18 @@ object WorkoutMachineCoupling {
     }
 
     /**
-     * Tell the belt to stop, and retire any start still waiting to be answered.
+     * Tell the belt to stop, retire any start still waiting to be answered, and watch for the
+     * confirmation.
      *
      * Unconditional for every ending. If the rider is leaving we do not care what state we thought
      * we were in; the belt must be told to stop.
+     *
+     * The confirmation callback is attached here and not inside [MachineCoordinator] because the
+     * decision it feeds — whether an unconfirmed stop is worth an alarm — depends on *why* the stop
+     * was sent, and this class is the only thing that knows. The verdict itself is the
+     * coordinator's; the policy is [shouldEscalate], which is pure and lives beside it.
      */
-    private fun stopOnMachine() {
+    private fun stopOnMachine(cause: StopCause) {
         // Retire the attempt before anything else. Any answer still in flight belongs to a start
         // the rider has left behind, and the token is what tells the two apart — without this bump
         // a slow reply could land after a retry had begun and be mistaken for that newer attempt's
@@ -380,7 +410,63 @@ object WorkoutMachineCoupling {
             pendingWatchdog.also { pendingWatchdog = null }
         }
         retired?.let { watchdog.removeCallbacks(it) }
-        MachineCoordinator.stop()
+        // Sampled here rather than in the callback: this is what the belt was doing when the rider
+        // asked for the stop, and it is the evidence that no exception in [shouldEscalate] may talk
+        // us out of an alarm. Read as one observation so speed cannot be paired with a distance
+        // from a different poll.
+        val seenMoving = MachineLink.everReportedMotion &&
+            (MachineLink.observation()?.speedMph ?: 0.0) > BELT_MOVING_MPH
+        val token = synchronized(this) { ++stopToken }
+        MachineCoordinator.stop { verdict -> onStopSettled(token, verdict, cause, seenMoving) }
+    }
+
+    /**
+     * Which start attempt's stop this is, so a verdict cannot settle a session that has moved on.
+     *
+     * Same job as [startToken] and for the same reason: a stop's answer takes seconds, and in that
+     * time the rider can end again, start again, or have the console do either for them.
+     */
+    private var stopToken = 0
+
+    /**
+     * Why the abandon currently in flight happened, defaulting to the answer that warns.
+     *
+     * [StopCause.START_UNANSWERED] is the default rather than [StopCause.START_REFUSED] because the
+     * two are not symmetric: a refusal is the console telling us it did nothing, and silence is not.
+     * Any path that reaches an abandon without saying why — a rider cancelling from "Starting…",
+     * `SpikeBridge.workoutCancelStart`, anything added later — is treated as silence, which
+     * escalates. Getting that default the other way round would mean a new caller silently opting
+     * out of the alarm.
+     */
+    private fun abandonCause(): StopCause = synchronized(this) {
+        lastAbandonCause.also { lastAbandonCause = StopCause.START_UNANSWERED }
+    }
+
+    private var lastAbandonCause: StopCause = StopCause.START_UNANSWERED
+
+    /**
+     * The stop has been judged. Let the session go, and warn if it needs warning about.
+     *
+     * The session settles either way. There is nothing left for a clock to do about a treadmill,
+     * and leaving it in [WorkoutSession.State.STOPPING] would be a state a rider has no way out of.
+     * What stops the app cheerfully offering to start a belt it could not confirm had stopped is
+     * [StopEscalation]'s latch, which outlives this call and the process.
+     */
+    private fun onStopSettled(
+        token: Int,
+        verdict: StopVerdict,
+        cause: StopCause,
+        beltSeenMoving: Boolean,
+    ) {
+        val stale = synchronized(this) { token != stopToken }
+        // A newer stop owns the machine. Settling the session here would release it while that
+        // newer stop is still unanswered, which is the lie this whole change removes.
+        if (stale) return
+        if (shouldEscalate(verdict, cause, MachineLink.consoleDetached, beltSeenMoving)) {
+            val reason = (verdict as? StopVerdict.Unconfirmed)?.reason ?: StopUnconfirmed.NOT_OBSERVED
+            StopEscalation.raise(reason)
+        }
+        WorkoutSession.settle()
     }
 
     /** The transitions that happen while a session is still alive. */
@@ -441,17 +527,34 @@ internal enum class EndFollowUp {
  * - **An ended workout** is [WorkoutSession.Ending.ENDED]: the rider pressed End. That is a
  *   deliberate, final, non-resumable action, and it is the one that gets [STOP_AND_SETTLE].
  *
- * A transition that is already IDLE asks for nothing: `WorkoutSession.stop` and `abandon` both
- * no-op from IDLE and never reach a listener, so this is belt and braces against a duplicate.
+ * ## Why an end arrives as STOPPING and an abandon as IDLE
+ *
+ * Issue #39. `WorkoutSession.stop` now lands in [WorkoutSession.State.STOPPING] rather than
+ * publishing IDLE over a belt nothing has confirmed stopped, so an *end* reaches this function as a
+ * transition into STOPPING. An abandon still goes straight to IDLE, because holding the retry path
+ * behind a confirmation would lock a rider out of pressing Start again while they stand on a
+ * treadmill wondering whether it is about to move.
+ *
+ * The settle that follows a stop is `STOPPING → IDLE` and asks for nothing: the stop it is settling
+ * has already gone out, and re-sending anything here would be this function commanding a machine
+ * for a workout that ended seconds ago.
+ *
+ * A transition that is already IDLE asks for nothing either: `WorkoutSession.stop` and `abandon`
+ * both no-op from IDLE and never reach a listener, so this is belt and braces against a duplicate.
  */
 internal fun endFollowUp(
     previous: WorkoutSession.State,
     next: WorkoutSession.State,
     ending: WorkoutSession.Ending?,
 ): EndFollowUp = when {
+    // Checked before the STOPPING → x rows below, so a rider pressing End again while a stop is
+    // still unconfirmed re-sends it. A stop control pressed twice means it harder, not less.
+    next == WorkoutSession.State.STOPPING -> EndFollowUp.STOP_AND_SETTLE
+    // The stop for this end went out when the session entered STOPPING. This is only the answer
+    // arriving.
+    previous == WorkoutSession.State.STOPPING -> EndFollowUp.NOTHING
     next != WorkoutSession.State.IDLE -> EndFollowUp.NOTHING
     previous == WorkoutSession.State.IDLE -> EndFollowUp.NOTHING
-    ending == WorkoutSession.Ending.ENDED -> EndFollowUp.STOP_AND_SETTLE
     // Abandoned, or a null this build did not expect. Both get the stop and nothing more: an
     // unrecognised ending is not a licence to start moving a deck, but a belt that might be moving
     // is always told to stop.
