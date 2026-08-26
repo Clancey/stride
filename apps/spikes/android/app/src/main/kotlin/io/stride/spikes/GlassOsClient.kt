@@ -305,12 +305,18 @@ class GlassOsClient(private val context: Context) {
         val inclineWritable: Boolean?,
         val fanWritable: Boolean?,
         /**
-         * Fan level, 0..[MachineLink.FAN_MAX], or null when unknown.
+         * The fan state the *machine* reports, as a [GlassOsCommands] `FAN_*` value, or null when
+         * we do not know.
          *
-         * Defaulted so the GlassOS path — which does not read the fan — keeps saying "unknown"
-         * rather than inventing a zero. The direct path fills it in from `FAN_STATE`.
+         * A reading, not a request. [MachineCoordinator.lastFanState] is the other half of the
+         * picture and is only ever what Stride last asked for; the console has its own fan button
+         * under the rider's hand, and this field is the only thing that ever sees them press it.
+         *
+         * Null means unknown and must never be drawn as OFF — `FAN_OFF` is 0, and the whole point
+         * of keeping this nullable is that "the fan is off" and "nobody could tell us" are
+         * different sentences.
          */
-        val fanLevel: Int? = null,
+        val fanState: Int? = null,
         /**
          * Heart rate as reported by the *machine*, or null when it does not report one.
          *
@@ -319,7 +325,17 @@ class GlassOsClient(private val context: Context) {
          * grip sensors, which is the normal case for anyone actually running.
          */
         val heartRateBpm: Int? = null,
-    )
+    ) {
+        /**
+         * Fan speed, 0..[MachineLink.FAN_MAX], or null when we do not know.
+         *
+         * Derived from [fanState] rather than stored beside it, so the two can never disagree.
+         * `AUTO` deliberately falls out as null: auto is not a level — the machine is choosing —
+         * and drawing it as a number would tell the rider the fan is at a speed it is not.
+         * Anything that wants to *name* the state, including "Auto", must read [fanState].
+         */
+        val fanLevel: Int? get() = fanState?.takeIf { it in 0..MachineLink.FAN_MAX }
+    }
 
     /**
      * Read everything at once. Blocking; call from a background thread.
@@ -363,6 +379,11 @@ class GlassOsClient(private val context: Context) {
             .reading(elapsed?.long(2)?.toDouble(), workoutId, canRead("ElapsedTimeService"))
             ?.toLong()
 
+        // `CanWrite` was already going to be asked for [Snapshot.fanWritable], so the fan read is
+        // handed the answer rather than paying for the round trip a second time.
+        val fanWritable = canWrite("FanStateService")
+        val fanState = readFanState(fanWritable)
+
         return Snapshot(
             consoleState = ConsoleState.name(console),
             workoutId = workoutId,
@@ -381,8 +402,44 @@ class GlassOsClient(private val context: Context) {
             // when a workout starts or ends, which is the case the UI needs it for.
             speedWritable = canWrite("SpeedService"),
             inclineWritable = canWrite("InclineService"),
-            fanWritable = canWrite("FanStateService"),
+            fanWritable = fanWritable,
+            fanState = fanState,
         )
+    }
+
+    /**
+     * The console's own fan state, or null when we genuinely do not know.
+     *
+     * **`GetFanState` answering is not proof that this machine has a fan.** `FanState.OFF` is 0 and
+     * proto3 omits a zero, so a console with no fan and a console whose fan is off both reply with
+     * an empty message — the same trap `GetConsoleState` above has to sidestep, except that there
+     * the console's existence was never in doubt. Defaulting an empty reply to OFF without
+     * independent proof would print a confident "Off" over a treadmill that has no fan at all,
+     * which is the one thing a fan readout must never do.
+     *
+     * So the machine has to say it has one first, and only then is an omitted zero read as OFF.
+     * Two ways to say it, because the two questions fail differently: `CanWrite` is the answer this
+     * poll already has in hand, and `CanRead` is the same question every other metric here asks, for
+     * a console that will talk about reading a fan it will not talk about writing. `CanWrite` is
+     * required to be an explicit `true` — null is "never answered", and unknown is not evidence.
+     *
+     * Tested in that order deliberately: `CanRead` is a round trip, and on a console that has
+     * already said it will take a fan write there is nothing left to establish. Skipping the call
+     * entirely when neither says yes also keeps a fanless machine off the extra round trip.
+     *
+     * **This decodes an absent zero; it does not vouch for the register.** Once the console has
+     * confirmed it has a fan, an omitted field is a correct decode of OFF — that is what proto3
+     * means. It is not a claim that the answer is true. `ACTUAL_KPH` reads a confident, well-formed,
+     * entirely plausible `0x0000` on the X22i while the belt is running (issue #34), and nothing in
+     * a reply frame distinguishes that from a real zero. A fan register can lie the same way, and
+     * no null check here would catch it. What this promises is "the machine said this", which is
+     * the same promise every other reading in this snapshot makes — and is precisely why the
+     * overlay marks a value Stride merely *requested* as something weaker.
+     */
+    private fun readFanState(fanWritable: Boolean?): Int? {
+        if (fanWritable != true && !canRead("FanStateService")) return null
+        val reply = call("FanStateService", "GetFanState") ?: return null
+        return reply.enum(1) ?: GlassOsCommands.FAN_OFF
     }
 
     /**

@@ -1100,19 +1100,20 @@ object FitProValues {
     }
 
     /**
-     * The rider-facing fan level, 0..[MachineLink.FAN_MAX], from a raw `FAN_STATE` value.
+     * The rider-facing fan state, as a [GlassOsCommands] `FAN_*` value, from a raw `FAN_STATE`
+     * value. The inverse of [fanStateFromGlassOs].
      *
-     * `AUTO` and `UNKNOWN` deliberately return null rather than a number. Auto is not a level — the
-     * machine is choosing — and drawing it as "0" would tell the rider the fan is off while it is
-     * about to spin up.
+     * `UNKNOWN` returns null rather than a number. It is the wire's word for a value this firmware
+     * revision does not use, and passing it on as a state would let a garbage byte become something
+     * the overlay draws a name for.
      */
-    fun fanLevel(raw: ByteArray): Int? = when (val state = FitProCodec.decodeFanState(raw)) {
-        FitProCodec.FanState.OFF,
-        FitProCodec.FanState.LOW,
-        FitProCodec.FanState.MEDIUM,
-        FitProCodec.FanState.HIGH,
-        -> state.value
-        FitProCodec.FanState.AUTO, FitProCodec.FanState.UNKNOWN -> null
+    fun fanStateToGlassOs(state: FitProCodec.FanState): Int? = when (state) {
+        FitProCodec.FanState.OFF -> GlassOsCommands.FAN_OFF
+        FitProCodec.FanState.LOW -> GlassOsCommands.FAN_LOW
+        FitProCodec.FanState.MEDIUM -> GlassOsCommands.FAN_MEDIUM
+        FitProCodec.FanState.HIGH -> GlassOsCommands.FAN_HIGH
+        FitProCodec.FanState.AUTO -> GlassOsCommands.FAN_AUTO
+        FitProCodec.FanState.UNKNOWN -> null
     }
 }
 
@@ -1190,7 +1191,11 @@ class DirectMachineClient(private val session: DirectMachineSession) {
             speedWritable = duringWorkout && session.supports(FitProCodec.Register.KPH) != false,
             inclineWritable = duringWorkout && session.supports(FitProCodec.Register.GRADE) != false,
             fanWritable = writable && session.fanRegister != null,
-            fanLevel = fan?.let { response.value(it) }?.let { FitProValues.fanLevel(it) },
+            // Whichever register this console said it implements, decoded to the shared FAN_*
+            // numbering. Auto survives here where it used to be flattened away, because the
+            // overlay names the state rather than plotting it on a scale.
+            fanState = fan?.let { response.value(it) }
+                ?.let { FitProValues.fanStateToGlassOs(FitProCodec.decodeFanState(it)) },
         )
     }
 

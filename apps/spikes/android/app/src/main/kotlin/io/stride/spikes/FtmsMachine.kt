@@ -371,7 +371,7 @@ object FtmsValues {
             inclineWritable = features?.supportsInclineTarget,
             // Not "unknown": the profile has no fan, so this control can never work here.
             fanWritable = false,
-            fanLevel = null,
+            fanState = null,
             // The machine's own sensor, when it has one. MachineLink prefers a strap over this.
             heartRateBpm = sample.heartRateBpm,
         )

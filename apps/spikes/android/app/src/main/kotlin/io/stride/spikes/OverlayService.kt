@@ -455,6 +455,32 @@ class OverlayService : Service() {
     private val cyan = Color.rgb(40, 199, 255)
     private val cyanMuted = Color.rgb(190, 234, 255)
 
+    /**
+     * The fan's colour, and deliberately none of the three this overlay already spends.
+     *
+     * Amber is incline, cyan is speed, and the salmon of [DESTRUCTIVE_INK] is a machine that will
+     * not answer. A fan cell wearing any of them would be making a claim about the treadmill that
+     * it does not mean. This is the violet from `StrideColors.appFallbacks`, which nothing in the
+     * top strip uses.
+     */
+    private val fanViolet = Color.rgb(182, 146, 255)
+
+    /**
+     * The fan readout's own views, kept apart from [machineCells].
+     *
+     * The generic ticker can only rewrite a cell's text between two fixed colours and two fixed
+     * sizes. This one also has to change its *label*, and to appear and disappear, because a
+     * treadmill with no fan must not have a fan cell at all — so it gets its own refresh.
+     */
+    private class FanCell(
+        val root: View,
+        val divider: View,
+        val value: TextView,
+        val label: TextView,
+    )
+
+    private var fanCell: FanCell? = null
+
     private val workoutListener = WorkoutSession.Listener { state, _ ->
         mainHandler.post {
             // A setpoint the rider asked for before the machine would take one. RUNNING is the
@@ -566,6 +592,12 @@ class OverlayService : Service() {
         }
         trackFloorView?.let { applyLapPosition(it) }
         goalRingView?.let { applyGoalRing(it) }
+        applyFanReadout()
+        // The fan picker in the menu sheet has the same problem the readout does, from the other
+        // end: it only repainted on a tap, so anything that moved the fan while the sheet was open
+        // left it lit on a state that had gone. Stride's own automatic fan writes at the start and
+        // end of a workout do exactly that, and so does the console's own fan button.
+        refreshFanSegments()
         refreshNowPlaying()
     }
 
@@ -1527,6 +1559,7 @@ class OverlayService : Service() {
         // pill from every rebuild alive and let the ticker write into views nobody can see.
         machineCells.clear()
         machineNoticeView = null
+        fanCell = null
         // Every edge is free again. Leaving stale insets published would strand the launcher with
         // dead margins where the chrome used to be, which is most obvious right after the user
         // hides the overlay to watch something.
@@ -1603,6 +1636,10 @@ class OverlayService : Service() {
         metrics.addView(metricPillCell("speed mph", speedText(), R.drawable.ic_metric_speed, cyan, 1f).also {
             trackPill(it) { speedText() }
         })
+        // The fan goes last because it is the only cell here that is not about the workout — it is
+        // an appliance on the console, and trailing it keeps the seven workout metrics in the order
+        // and the relative positions a rider already knows.
+        addFanCell(metrics)
         pill.addView(metrics)
         // No safety notice here. The bottom bar already carries it, and the same warning printed
         // twice on one screen is read as decoration -- which is exactly how a rider learns to stop
@@ -1693,6 +1730,9 @@ class OverlayService : Service() {
                 )
             })
             addView(textView(label, 13f, Color.rgb(139, 152, 174), bold = false).apply {
+                // Tagged for the same reason the figure above is: the fan cell's label changes with
+                // what is known about the fan, and a refresh has to be able to find it.
+                tag = "label"
                 maxLines = 1
                 layoutParams = LinearLayout.LayoutParams(
                     LinearLayout.LayoutParams.MATCH_PARENT,
@@ -1702,7 +1742,85 @@ class OverlayService : Service() {
         })
     }
 
-    /** Hairline between readouts, inset from the pill's top and bottom as in stock. */
+    /**
+     * The fan readout, and the reason it is built here rather than through [trackPill].
+     *
+     * Three things this cell does that no other metric does. It can be **absent** — a treadmill
+     * with no fan must not carry a fan cell reading "Not measured" forever, which is a different
+     * and worse statement than saying nothing. It changes its **label**, because the difference
+     * between a reading and a request is the whole point and a rider cannot be expected to decode
+     * it from a colour alone. And its value is a **word**, not a figure.
+     *
+     * Presence is decided every tick and applied with `GONE`, not by rebuilding the chrome.
+     * `docs/PLAN.md` §3.9 requires a rebuild for anything that adds or removes a *window*; this
+     * adds and removes a child inside one, which LinearLayout excludes from weight distribution
+     * when it is `GONE`, so a fanless machine gets exactly the layout it had before this existed.
+     * Rebuilding would have been actively wrong: the signal comes from the machine, and a chrome
+     * rebuild driven by a machine answer that flickers is the flashing overlay `OverlayRebuildTest`
+     * exists to prevent.
+     */
+    private fun addFanCell(metrics: LinearLayout) {
+        val divider = metricDivider()
+        val cell = metricPillCell("fan", MachineLink.NO_READING, R.drawable.ic_metric_fan, fanViolet, 1f)
+        val value = cell.findViewWithTag<TextView>("value") ?: return
+        val label = cell.findViewWithTag<TextView>("label") ?: return
+        metrics.addView(divider)
+        metrics.addView(cell)
+        fanCell = FanCell(root = cell, divider = divider, value = value, label = label)
+        applyFanReadout()
+    }
+
+    /**
+     * Draw whatever is currently known about the fan.
+     *
+     * The three visible states are deliberately not interchangeable, and the styling is the same
+     * argument [styleRailEntry] makes for the quick-pick columns: a value the machine confirmed and
+     * a value Stride merely asked for must not look alike. Item 9 of the checklist on
+     * [MachineLink.canCommand] is the rule — the UI distinguishes requested, confirmed and unknown,
+     * and never shows a requested value styled as a measured one.
+     *
+     * - **Measured** is white at full size, exactly like every other reading in this strip, because
+     *   that is what it is.
+     * - **Requested** carries the accent colour instead of white and says so underneath. Tinting
+     *   rather than dimming is on purpose: the rider asked for this and it is the most useful thing
+     *   we have, it simply is not confirmed.
+     * - **Unknown** is [MachineLink.NO_READING] in the muted style the rest of the strip uses for a
+     *   metric nothing has answered for. Never "Off" — `FAN_OFF` is a state the fan can be in, and
+     *   claiming it because nobody answered is the failure this whole readout exists to avoid.
+     */
+    private fun applyFanReadout() {
+        val cell = fanCell ?: return
+        val readout = MachineLink.fanReadout()
+        val visible = readout != MachineLink.FanReadout.Absent
+        val visibility = if (visible) View.VISIBLE else View.GONE
+        cell.root.visibility = visibility
+        cell.divider.visibility = visibility
+        if (!visible) return
+
+        val measured = readout as? MachineLink.FanReadout.Measured
+        val requested = readout as? MachineLink.FanReadout.Requested
+        val state = measured?.state ?: requested?.state
+        val text = state?.let(GlassOsCommands::fanStateName) ?: MachineLink.NO_READING
+        cell.value.text = text
+        cell.value.setTextSize(TypedValue.COMPLEX_UNIT_SP, if (state == null) 15f else 31f)
+        cell.value.setTextColor(
+            when {
+                state == null -> Color.rgb(150, 165, 188)
+                requested != null -> fanViolet
+                else -> Color.WHITE
+            },
+        )
+        cell.label.text = if (requested != null) "fan · requested" else "fan"
+        // Spoken as one sentence. "High, requested" read out as two labels a swipe apart loses the
+        // qualifier, which is the only part that matters.
+        cell.root.contentDescription = when {
+            state == null -> "Fan, not measured"
+            requested != null -> "Fan $text, requested, not confirmed"
+            else -> "Fan $text"
+        }
+    }
+
+
     private fun metricDivider(): View = View(this).apply {
         setBackgroundColor(Color.argb(70, 128, 148, 184))
         layoutParams = LinearLayout.LayoutParams(dp(1f), LinearLayout.LayoutParams.MATCH_PARENT).apply {
@@ -2391,7 +2509,7 @@ class OverlayService : Service() {
             LinearLayout.LayoutParams.MATCH_PARENT,
             LinearLayout.LayoutParams.WRAP_CONTENT,
         )
-        val current = MachineCoordinator.lastFanState ?: StrideSettings.fanState
+        val current = selectedFanSegment()
         val usable = MachineLink.canCommandFan()
         val states = listOf(
             GlassOsCommands.FAN_OFF,
@@ -2425,7 +2543,7 @@ class OverlayService : Service() {
                     StrideSettings.fanState = state
                     MachineCoordinator.setFan(state)
                     lastGesture = "fan -> ${GlassOsCommands.fanStateName(state)}"
-                    refreshFanSegments(state)
+                    refreshFanSegments()
                 }
             }
             fanSegmentViews[state] = pill
@@ -2433,7 +2551,25 @@ class OverlayService : Service() {
         }
     }
 
-    private fun refreshFanSegments(selected: Int) {
+    /**
+     * Which fan segment to light, best evidence first.
+     *
+     * The machine's own answer outranks Stride's last request, which outranks the rider's
+     * remembered preference. That order used to start at the request, so a sheet opened on a fresh
+     * launch lit the pill for a setting chosen days ago on possibly a different treadmill — and
+     * once the console's own fan button had been pressed, the lit pill was simply wrong.
+     *
+     * The remembered preference stays as the last resort because this is a picker, not a readout:
+     * with nothing lit it looks broken, and the remembered value is at least the one the next
+     * `restoreFan` will send. The readout in the top strip is where "we do not know" is said
+     * honestly, and it is deliberately not said twice in two different vocabularies.
+     */
+    private fun selectedFanSegment(): Int? =
+        MachineLink.fanState ?: MachineCoordinator.lastFanState ?: StrideSettings.fanState
+
+    private fun refreshFanSegments() {
+        if (fanSegmentViews.isEmpty()) return
+        val selected = selectedFanSegment()
         val usable = MachineLink.canCommandFan()
         fanSegmentViews.forEach { (state, view) ->
             styleFanSegment(view, active = state == selected, usable = usable)
@@ -2443,6 +2579,11 @@ class OverlayService : Service() {
     /**
      * The one place a fan segment's look is defined. Dimmed and inert when the console will not
      * take a fan write, for the same reason the rails are: an unusable control must look unusable.
+     *
+     * The active fill is the fan's own violet, not the amber it used to be. Amber is what this
+     * overlay says incline with — the left corner toggle, the incline rail and the incline pill all
+     * wear it — and a fan control lit in it was borrowing a colour that means something else about
+     * the treadmill. The fan now says one thing in one colour, here and in the top strip.
      */
     private fun styleFanSegment(view: TextView, active: Boolean, usable: Boolean) {
         view.isEnabled = usable
@@ -2452,9 +2593,9 @@ class OverlayService : Service() {
             view.background = roundedRect(Color.argb(180, 16, 21, 34), 26f, Color.argb(90, 62, 76, 116))
             return
         }
-        view.setTextColor(if (active) Color.rgb(28, 18, 4) else Color.rgb(206, 214, 232))
+        view.setTextColor(if (active) Color.rgb(14, 10, 26) else Color.rgb(206, 214, 232))
         view.background = rippleRounded(
-            color = if (active) amber else Color.argb(224, 18, 25, 46),
+            color = if (active) fanViolet else Color.argb(224, 18, 25, 46),
             radius = 26f,
             strokeColor = if (active) Color.WHITE else Color.argb(140, 62, 76, 116),
         )
