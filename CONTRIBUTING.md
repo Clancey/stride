@@ -44,19 +44,42 @@ So:
 ## Building and testing
 
 ```bash
-cd apps/spikes             && flutter test   # harness: DER scanner, protobuf inspector, mTLS
-cd packages/stride_control && dart test      # safety coordinator, incl. failure modes
-cd tools/glassos_mock      && dart test      # mock console physics and fault injection
+(cd apps/spikes             && flutter test)  # harness: DER scanner, protobuf inspector, mTLS
+(cd packages/stride_control && dart test)     # safety coordinator, incl. failure modes
+(cd tools/glassos_mock      && dart test)     # mock console physics and fault injection
 ```
+
+Each line is a subshell because all three paths are relative to the repo root. Run
+without them and the second `cd` looks for `apps/spikes/packages/stride_control`,
+fails, `&&` short-circuits, and two of the three suites quietly never run — with the
+error scrolling past under `flutter test`'s output.
 
 **Android lint is not optional**, and neither `flutter build` nor the Dart tests will
 catch what it catches:
 
 ```bash
+# First time only, from the repo root. The subshell matters: the lint command below is
+# relative to the root too, and a bare `cd` here would send it looking for
+# apps/spikes/apps/spikes/android.
+(cd apps/spikes && flutter build apk --debug)
+
 cd apps/spikes/android
 JAVA_HOME=/Library/Java/JavaVirtualMachines/temurin-17.jdk/Contents/Home \
   ./gradlew :app:lintDebug     # Gradle needs JDK 17+
 ```
+
+The build comes first because on a fresh clone **there is no `./gradlew` yet**. Flutter
+generates the Gradle wrapper into `apps/spikes/android/` during an Android build, and
+Flutter's own `.gitignore` template excludes `gradlew`, `gradlew.bat` and
+`gradle-wrapper.jar` for exactly that reason — they are generated, not authored. The same
+build writes `local.properties`. Run the lint command on its own in a clean checkout and
+it fails with "no such file or directory", which reads like a broken repo rather than a
+missing step.
+
+Do not "fix" that by committing the wrapper. It would fight Flutter's template, and the
+committed jar would then drift from whatever the installed Flutter injects. Reach for a
+system Gradle only if you know why you are doing it: the wrapper exists to pin the
+version, and `gradle-wrapper.properties` is the file that says which one.
 
 `NewApi`/`InlinedApi` are build-aborting errors on purpose. Stride compiles against a
 modern SDK but targets a console on API 26–28, so a newer method overload compiles
