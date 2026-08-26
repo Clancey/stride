@@ -76,10 +76,20 @@ class StrideAppstoreService : Service() {
 
     private val installResults = InstallResultReceiver()
 
+    /**
+     * Whether the last [enterForeground] call returned without throwing. Not a cache of the
+     * platform's own view - see [enterForeground] for why it is only ever used to decide whether to
+     * *retry*, never to decide that a retry is unnecessary.
+     */
+    @Volatile
+    private var foreground = false
+
     override fun onCreate() {
         super.onCreate()
         active = this
-        startForegroundWithNotification()
+        // First, before anything below can throw, and its failure deliberately does not stop us
+        // here: see enterForeground and onStartCommand.
+        enterForeground()
         WorkoutSession.addListener(workoutListener)
         // Registered here rather than in the manifest: this firmware silently drops background
         // broadcasts to manifest receivers of an O+ app, which stranded every install at
@@ -95,6 +105,22 @@ class StrideAppstoreService : Service() {
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+        // A start delivered to a service that never made it into the foreground is answered here,
+        // because this is the first moment after onCreate at which we can do anything about it. A
+        // start that arrives at a service which is already foreground needs nothing: the platform
+        // clears its own "you owe me a startForeground()" flag for free in that case
+        // (ActiveServices.sendServiceArgsLocked, "Service already foreground; no new timeout").
+        if (!foreground && !enterForeground()) {
+            // Loud, because this is a different bug from the one this method guards against.
+            // Reaching here means startForeground() itself refused, not that we were too slow.
+            Log.e(TAG, "no foreground notification after two attempts; doing no work")
+            // Safe to stop, and worth doing. If we arrived by the deadline-free route there is no
+            // promise outstanding, so this is a clean exit. If we arrived by the timed route then
+            // the platform is going to tear us down and crash the process within ten seconds either
+            // way, and starting a download first would only add an orphaned staging file to it.
+            stopSelf()
+            return START_NOT_STICKY
+        }
         when (intent?.action) {
             ACTION_STOP -> {
                 stopSelf()
@@ -129,7 +155,11 @@ class StrideAppstoreService : Service() {
     override fun onDestroy() {
         WorkoutSession.removeListener(workoutListener)
         runCatching { unregisterReceiver(installResults) }
-        active = null
+        // Only clear the shared handle if it still points at us. START_NOT_STICKY plus stopSelf
+        // means a check arriving as an ACTION_STOP tears us down can construct the replacement
+        // before this runs, and nulling it then would leave `isRunning` reporting false about a
+        // live service - which `stop` now relies on to avoid creating one just to stop it.
+        if (active === this) active = null
         worker.shutdown()
         super.onDestroy()
     }
@@ -348,7 +378,43 @@ class StrideAppstoreService : Service() {
 
     // ----------------------------------------------------------- foreground
 
-    private fun startForegroundWithNotification() {
+    /**
+     * Put this service in the foreground. Returns false rather than throwing.
+     *
+     * WHY IT IS SHAPED LIKE THIS (issue #26)
+     *
+     * The platform's rule is not "be a foreground service"; it is "if someone called
+     * [Context.startForegroundService] for you, `startForeground()` must run within ten seconds".
+     * Miss that and `ActiveServices` brings the record down with its `fgRequired` flag still set,
+     * which throws `RemoteServiceException` on our *main* thread - a fatal crash of the launcher,
+     * caused by a background update check. See [ForegroundStart], which is where that promise is
+     * avoided in the first place.
+     *
+     * Two consequences are baked in here:
+     *
+     * - **It never throws.** An exception escaping `onCreate` is not caught by anything useful; it
+     *   becomes `RuntimeException: Unable to create service`, a *different* fatal crash, and one
+     *   that also leaves the promise unanswered. A boolean lets the caller decide.
+     * - **Failure does not stop the service from `onCreate`.** Calling `stopSelf()` while a
+     *   `startForegroundService()` promise is outstanding is, verbatim, the code path that produces
+     *   the crash: "Bringing down service while still waiting for start foreground". The decision
+     *   to give up is deferred to [onStartCommand], which runs strictly later.
+     *
+     * The `foreground` flag it sets is only ever read to decide whether to *retry*. It is never
+     * used to conclude that a call is unnecessary, because a successful return is not proof the
+     * platform agreed: on API 31+ a `startForeground()` from a restricted state returns normally
+     * having quietly done nothing.
+     */
+    private fun enterForeground(): Boolean = try {
+        startForeground(NOTIFICATION_ID, buildNotification())
+        foreground = true
+        true
+    } catch (e: Exception) {
+        Log.w(TAG, "could not enter the foreground", e)
+        false
+    }
+
+    private fun buildNotification(): Notification {
         val nm = getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
         val channel = NotificationChannel(
             CHANNEL_ID,
@@ -356,18 +422,26 @@ class StrideAppstoreService : Service() {
             NotificationManager.IMPORTANCE_MIN,
         )
         channel.setShowBadge(false)
-        nm.createNotificationChannel(channel)
+        // Not allowed to abort the notification we are about to build. createNotificationChannel is
+        // idempotent, so on every start after the first the channel is already there and a failure
+        // here changes nothing at all - whereas letting it propagate would turn a cosmetic problem
+        // into the missed startForeground() described above.
+        runCatching { nm.createNotificationChannel(channel) }
+            .onFailure { Log.w(TAG, "update notification channel could not be created", it) }
         // Deliberately says nothing about motor control. It used to read "no motor control", which
         // was false: checking a catalog and downloading an APK never touches the machine link, and
         // only the install itself interrupts anything. Telling a rider their controls are gone
         // while they still work teaches them to distrust the one notice that will matter.
-        val notification: Notification = Notification.Builder(this, CHANNEL_ID)
+        return Notification.Builder(this, CHANNEL_ID)
             .setContentTitle("Stride updates")
             .setContentText("Checking for app updates")
+            // A framework drawable on purpose. A notification with no valid small icon is rejected
+            // by NotificationManagerService, and for a foreground service that rejection is itself
+            // fatal ("Bad notification for startForeground"), so this must not depend on a resource
+            // that a future refactor could rename out from under it.
             .setSmallIcon(android.R.drawable.stat_sys_download_done)
             .setOngoing(true)
             .build()
-        startForeground(NOTIFICATION_ID, notification)
     }
 
     companion object {
@@ -562,12 +636,44 @@ class StrideAppstoreService : Service() {
         fun installBundle(context: Context, bundleId: String) =
             start(context, ACTION_INSTALL_BUNDLE) { it.putExtra(EXTRA_BUNDLE, bundleId) }
 
-        fun stop(context: Context) = start(context, ACTION_STOP)
+        /**
+         * Stop the service, if there is one.
+         *
+         * The `isRunning` guard is not an optimisation. Without it a "stop" is delivered by
+         * *starting* the service, so a stop aimed at a service that is not there creates one purely
+         * in order to tear it down again a moment later - a start-then-stop, which is the second
+         * way to reach the crash in [ForegroundStart]. There is a race here in principle (the
+         * service can die between the check and the start) and it is deliberately not closed with a
+         * lock: losing it costs one redundant service lifetime, and `onStartCommand` puts us in the
+         * foreground before it honours `ACTION_STOP` precisely so that losing it stays harmless.
+         */
+        fun stop(context: Context) {
+            if (!isRunning()) return
+            start(context, ACTION_STOP)
+        }
 
+        /**
+         * Ask the platform to start the service - without a ten-second deadline attached whenever
+         * that is possible.
+         *
+         * Read [ForegroundStart] before changing this. The short version: `startForegroundService`
+         * is a promise, missing it is a fatal `RemoteServiceException` on the main thread (issue
+         * #26), and every caller except [AppstoreWorker] is already in the foreground and therefore
+         * has no need to make one.
+         *
+         * [AppstoreWorker] is the exception and keeps the promise on purpose: it is a `WorkManager`
+         * job that runs when Stride is nothing but a process, where the plain start is refused
+         * outright. Do not "tidy" that fallback away or wrap it in a `runCatching` - the periodic
+         * update check is the thing that stops working, silently, on the consoles nobody is
+         * looking at.
+         */
         private fun start(context: Context, action: String, configure: (Intent) -> Unit = {}) {
             val intent = Intent(context, StrideAppstoreService::class.java).setAction(action)
             configure(intent)
-            context.startForegroundService(intent)
+            ForegroundStart.run(
+                plain = { context.startService(intent) },
+                promised = { context.startForegroundService(intent) },
+            )
         }
 
         /**

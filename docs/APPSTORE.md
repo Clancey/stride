@@ -205,6 +205,46 @@ makes both call sites idempotent.
 `WorkManager` rather than `AlarmManager` because it is the only mechanism that survives Doze and
 app-standby on Android 8/9 without a battery-optimisation exemption we would rather not request.
 
+### 6.1 How the service is started, and why it is usually *not* `startForegroundService`
+
+`Context.startForegroundService()` is not a way to start a service. It is a **promise, with a ten
+second deadline**, that `Service.startForeground()` will run. Break it and the platform does not
+merely refuse the start: on API 28 `ActiveServices.serviceForegroundTimeout` tears the record down
+with its `fgRequired` flag still set, `bringDownServiceLocked` sees that and posts
+`SERVICE_FOREGROUND_CRASH_MSG`, and the app gets `RemoteServiceException:
+Context.startForegroundService() did not then call Service.startForeground()` **on its main
+thread**. On this console that is the launcher dying and taking the only Back and Home with it.
+
+That happened once, on an X22i, on a cold launch (issue #26). It was never a missing call —
+`onCreate` calls `startForeground()` as its first statement. The problem is that `onCreate` is a
+*message on the main thread*, and the launch-path caller made the promise from inside
+`FlutterActivity.onCreate`. The ten seconds were then spent on Flutter engine attach, first layout,
+`onResume` and everything else already queued — all of it ahead of the `CREATE_SERVICE` message
+that would have stopped the clock. The service kept its half of the bargain and never got a turn.
+
+So `StrideAppstoreService.start()` asks for `Context.startService()` first, which carries no
+deadline at all. A service started that way calls `startForeground()` whenever `onCreate` runs and
+ends up in exactly the same state — a real foreground service with the same lifetime. Its only
+limitation is that API 26+ refuses it while the app is in the background, and both refusal shapes
+are handled: an `IllegalStateException` for a target-O+ app, and a silently-null `ComponentName`
+under forced app-standby.
+
+Every caller except one is on screen when it starts the service — `MainActivity`, the Updates sheet
+via `AppstoreBridge`, and `InstallResultReceiver` (whose registration means a foreground service is
+already running). Those cannot hit this crash at all now. `AppstoreWorker` is the exception and
+keeps the promise deliberately: a `WorkManager` tick fires when Stride is nothing but a process, and
+the plain start is refused outright there. Do not "tidy" that fallback away — the periodic update
+check is what stops working, silently, on the consoles nobody is looking at.
+
+Two smaller rules follow, and both are in the code with the reason attached:
+
+- `onCreate` never calls `stopSelf()` when it cannot go foreground. Tearing a service down while a
+  promise is outstanding is, verbatim, the code path that produces the crash. It gives up in
+  `onStartCommand` instead, which runs strictly later, after one retry.
+- `stop()` does nothing when the service is not running. Otherwise a *stop* is delivered by
+  *starting* the service, which creates one purely to tear it down again — the same start-then-stop
+  shape from the other direction.
+
 On top of that, `MainActivity` calls `StrideAppstoreService.checkOnStart()` every launch, gated by
 `UpdatePlan.shouldCheckOnStart` at 30 minutes. Otherwise a console that is only woken up to be used
 could go a long time between periodic runs and greet the rider with stale state. The timestamp lives
@@ -294,6 +334,7 @@ Stride's *first* copy, which Stride obviously cannot do itself — is the adb wa
 | `appstore/ConfirmQueue.kt` | one confirmation on screen at a time, and recoverable (pure) |
 | `appstore/BundlePlan.kt` | ordered multi-package installs, and what to install next (pure) — §11 |
 | `appstore/RelaunchPolicy.kt` | which broadcast means "you were just updated" (pure) |
+| `appstore/ForegroundStart.kt` | plain start vs. the ten-second foreground promise (pure) — §6.1 |
 | `appstore/PackageReplacedReceiver.kt` | brings the launcher and overlay back after a self-update |
 | `appstore/AppstoreState.kt` | single in-process source of truth |
 | `appstore/StrideAppstoreService.kt` | the pipeline, the safety gate, the catalog URL |
