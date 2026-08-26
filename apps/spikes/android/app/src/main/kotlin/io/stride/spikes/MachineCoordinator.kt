@@ -580,10 +580,29 @@ object MachineCoordinator {
     /**
      * The fan state Stride last asked for, or null if it has not asked this run.
      *
+     * **A request, never a reading.** The console has its own fan button and Stride never hears it
+     * pressed, so this can be confidently wrong the moment the rider uses it. Anything drawing a
+     * fan value must prefer [MachineLink.fanState], which is the machine's own answer, and must
+     * never style this like a measurement — see [MachineLink.fanReadout].
+     *
      * Kept in memory only; [StrideSettings] owns the value that outlives the process.
      */
     @Volatile
     var lastFanState: Int? = null
+        private set(value) {
+            field = value
+            // Stamped here rather than at each call site so no future writer can forget. The
+            // readout compares this against the timestamp of the snapshot it is holding, and a
+            // request with no time on it cannot be told from one the machine has already answered.
+            lastFanStateAt = System.currentTimeMillis()
+        }
+
+    /**
+     * When [lastFanState] was last written, on `System.currentTimeMillis` — the same clock
+     * [MachineLink.fanStateAt] reports, because the two are only ever used by comparing them.
+     */
+    @Volatile
+    var lastFanStateAt: Long = 0L
         private set
 
     /**

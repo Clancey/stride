@@ -606,13 +606,119 @@ object MachineLink {
     /**
      * Fan speed, 0..[FAN_MAX], or null when we do not know.
      *
-     * Null on the GlassOS path: it exposes a fan service, but this build does not read it, and a fan
-     * number nobody has checked against the physical fan is worth less than an honest blank. The
-     * direct path does read it, from whichever fan register the machine said it implements.
+     * Read on both paths now: the direct path from whichever fan register the machine said it
+     * implements, GlassOS from `FanStateService/GetFanState`. Auto reads as null here because it is
+     * not a level; [fanState] is the accessor that can name it.
      */
     val fanLevel: Int? get() = fresh()?.fanLevel
 
+    /**
+     * The fan state the *machine* reports, as a [GlassOsCommands] `FAN_*` value, or null when we do
+     * not know.
+     *
+     * This is the only fan value in the app that is a reading. [MachineCoordinator.lastFanState] is
+     * Stride's last *request* and can be wrong the instant the rider touches the console's own fan
+     * button, which nothing in Stride ever hears about.
+     */
+    val fanState: Int? get() = fresh()?.fanState
+
+    /**
+     * When the snapshot behind [fanState] was taken, on the same clock as [MachineCoordinator]
+     * stamps a request. Zero when there has never been one.
+     *
+     * Exposed because "which of these two is newer" is the whole question the readout answers, and
+     * a comparison against a timestamp the caller cannot see is not a comparison anyone can check.
+     */
+    val fanStateAt: Long get() = snapshotAt
+
     const val FAN_MAX: Int = 3
+
+    /**
+     * Whether this machine has a fan at all, as far as anything has been able to establish.
+     *
+     * A latch, not a live reading, and that is the point. [canCommandFan] goes false the moment a
+     * snapshot ages past [FRESHNESS_MS], so a readout keyed straight to it would appear and vanish
+     * on every missed poll. Latching also means the answer survives the gap between the overlay
+     * being built and the machine getting round to describing itself.
+     *
+     * Only ever set from positive evidence — the machine said it would take a fan write, or it
+     * actually reported a fan state. A console that has never said either keeps this false, which
+     * is what keeps a fanless treadmill from growing a fan readout. Same shape as
+     * [everReportedMotion], and for the same reason: a claim about a machine is only ever earned,
+     * never assumed and never withdrawn by a poll that failed to reach it.
+     *
+     * Cleared in [closeTransport], because a different transport is a different machine.
+     */
+    @Volatile private var fanSeen: Boolean = false
+
+    fun fanKnownPresent(): Boolean = fanSeen || canCommandFan()
+
+    /**
+     * What the overlay should say about the fan.
+     *
+     * Pure, and takes its inputs rather than reading them, so every branch below is checkable
+     * without a treadmill. [fanReadout] with no arguments is the live wrapper.
+     *
+     * The distinction this exists to keep is item 9 of the checklist on [canCommand]: the UI
+     * distinguishes requested from confirmed from unknown, and never draws a request as a
+     * measurement. There are three genuinely different things to say here and collapsing any two of
+     * them puts a confident wrong number in front of someone on a moving belt.
+     *
+     * @param reported the machine's own answer, or null if it has not given one
+     * @param reportedAt when the snapshot carrying [reported] was taken
+     * @param requested what Stride last asked for, or null if it has not asked
+     * @param requestedAt when Stride asked
+     * @param knownPresent [fanKnownPresent]
+     */
+    fun fanReadout(
+        reported: Int?,
+        reportedAt: Long,
+        requested: Int?,
+        requestedAt: Long,
+        knownPresent: Boolean,
+    ): FanReadout {
+        // A request Stride made *after* the last snapshot was taken cannot possibly be in it, so the
+        // reading is known to be describing the fan as it was before the rider asked. Showing it
+        // would be a confident readout that is stale by construction — the rider taps High and
+        // watches the strip insist on Low for a poll. Shown as a request until a reading taken
+        // afterwards either confirms it or contradicts it; no grace timer is needed, because the
+        // very next poll settles it either way.
+        if (requested != null && knownPresent && (reported == null || requestedAt > reportedAt)) {
+            return FanReadout.Requested(requested)
+        }
+        // Otherwise the reading wins, even against a disagreeing request. The console's fan button
+        // is under the rider's hand and Stride never hears it; the reading is the only thing that
+        // ever does.
+        if (reported != null) return FanReadout.Measured(reported)
+        // `knownPresent` gates the request, not just the blank, and it has to. `restoreFan` records
+        // its target whenever the rider has a remembered preference — `!speculative` — whether or
+        // not the machine took it, so a treadmill with no fan can be sitting on a `lastFanState` of
+        // High. Without this gate it would draw one.
+        return if (knownPresent) FanReadout.Unknown else FanReadout.Absent
+    }
+
+    fun fanReadout(): FanReadout = fanReadout(
+        reported = fanState,
+        reportedAt = fanStateAt,
+        requested = MachineCoordinator.lastFanState,
+        requestedAt = MachineCoordinator.lastFanStateAt,
+        knownPresent = fanKnownPresent(),
+    )
+
+    /** What is known about the fan, and how well. See [fanReadout]. */
+    sealed class FanReadout {
+        /** The machine's own answer. May be drawn like any other measured metric. */
+        data class Measured(val state: Int) : FanReadout()
+
+        /** Stride's request, not yet confirmed by a reading. Must never be drawn as measured. */
+        data class Requested(val state: Int) : FanReadout()
+
+        /** There is a fan and nobody can say what it is doing. [NO_READING], never "Off". */
+        object Unknown : FanReadout()
+
+        /** No fan on this machine. Show nothing at all — an empty readout is not a readout. */
+        object Absent : FanReadout()
+    }
 
     // ---------------------------------------------------------------- polling
 
@@ -1049,6 +1155,11 @@ object MachineLink {
         // transport swap would let an honest console vouch for the register of the one that
         // replaced it.
         everReportedMotion = false
+        // A different transport is a different machine, so what the old one said about having a fan
+        // is not evidence about the new one. Deliberately not tied to the presets generation below:
+        // clearing this changes a cell's visibility inside an existing window, not the set of
+        // windows, so it must not drag the whole chrome through a rebuild.
+        fanSeen = false
         // Only announce a preset change when there was something to lose.
         //
         // The overlay rebuilds its entire chrome whenever this generation moves, which is correct
@@ -1104,6 +1215,9 @@ object MachineLink {
                 // belt moving now" — that is what the snapshot is for — but "does this console's
                 // speed register ever say anything but zero". See everReportedMotion and issue #34.
                 if ((read.speedMph ?: 0.0) > BELT_MOVING_MPH) everReportedMotion = true
+                // Positive evidence only, and latched: see [fanSeen]. Either answer proves a fan
+                // exists, and neither can be un-proved by a poll that failed to reach the console.
+                if (read.fanWritable == true || read.fanState != null) fanSeen = true
                 // A real reading over GlassOS settles the question the probe could not. Without
                 // this, a console whose daemon started *after* an inconclusive probe kept the
                 // unresolved state forever - harmless for the transport, which is already right,

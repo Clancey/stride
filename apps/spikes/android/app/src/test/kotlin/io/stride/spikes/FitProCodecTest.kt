@@ -615,12 +615,40 @@ class FitProCodecTest {
         assertTrue(FitProCodec.WorkoutMode.RUNNING.value != GlassOsCommands.WORKOUT_RUNNING)
     }
 
-    /** Auto is not a level, so it must not be drawn as one. */
+    /**
+     * The wire's fan enum and the shared `FAN_*` numbering, round-tripped.
+     *
+     * They happen to use the same numbers today, which is exactly why the conversion is explicit
+     * rather than a cast: they are different enums reached over different wires, and one firmware
+     * revision renumbering its own would turn a silent cast into a fan running at the wrong speed.
+     */
     @Test
-    fun autoFanReportsNoLevelRatherThanZero() {
-        assertNull(FitProValues.fanLevel(FitProCodec.encodeFanState(FitProCodec.FanState.AUTO)))
-        assertEquals(0, FitProValues.fanLevel(FitProCodec.encodeFanState(FitProCodec.FanState.OFF)))
-        assertEquals(3, FitProValues.fanLevel(FitProCodec.encodeFanState(FitProCodec.FanState.HIGH)))
+    fun fanStatesRoundTripThroughTheSharedNumbering() {
+        listOf(
+            FitProCodec.FanState.OFF,
+            FitProCodec.FanState.LOW,
+            FitProCodec.FanState.MEDIUM,
+            FitProCodec.FanState.HIGH,
+            FitProCodec.FanState.AUTO,
+        ).forEach { state ->
+            val shared = FitProValues.fanStateToGlassOs(state)
+            assertEquals(state, FitProValues.fanStateFromGlassOs(shared!!))
+        }
+        assertEquals(GlassOsCommands.FAN_AUTO, FitProValues.fanStateToGlassOs(FitProCodec.FanState.AUTO))
+    }
+
+    /**
+     * `UNKNOWN` is the wire's word for a byte this revision does not use, and it must not become a
+     * state the overlay can name. Passing it on would let a garbage register value be drawn as a
+     * fan speed.
+     */
+    @Test
+    fun anUnknownFanStateIsNotAState() {
+        assertNull(FitProValues.fanStateToGlassOs(FitProCodec.FanState.UNKNOWN))
+        assertEquals(
+            FitProCodec.FanState.UNKNOWN,
+            FitProCodec.decodeFanState(byteArrayOf(0x7F)),
+        )
     }
 
     @Test

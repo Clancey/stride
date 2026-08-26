@@ -520,8 +520,12 @@ reproducible in a log and in a test, and shared so two consoles in one process c
 
 ## Telemetry parity
 
-Every field of the shared `GlassOsClient.Snapshot` is populated on the direct path. One is actually
-better: `fanLevel` is a real value from `FAN_STATE`, where GlassOS returns null.
+Every field of the shared `GlassOsClient.Snapshot` is populated on the direct path. The fan is read
+on both now — GlassOS answers `FanStateService/GetFanState`, the direct path reads whichever of
+`FAN_STATE` / `FAN_SPEED` the machine listed — and the direct path is still marginally the better
+one: a register read cannot be refused for lack of console ownership the way `CanRead`/`CanWrite`
+can. The snapshot stores `fanState`, the machine's own named state including `AUTO`; `fanLevel` is
+derived from it and drops `AUTO`, because auto is not a position on a 0..3 scale.
 
 Two remain **inferred, not verified**: the unit of `CURRENT_DISTANCE` (assumed metres) and of
 `RUNNING_TIME` (assumed seconds). They are decoded as such and cross-checked by `FitProProbe`, but

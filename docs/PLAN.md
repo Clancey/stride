@@ -659,7 +659,7 @@ The console is 1920x1080 at density 160, so 1 dp is 1 px and every number below 
 
 | Surface | Where | Lives while |
 |---|---|---|
-| Metric strip | top, full width, 186 px | chrome visible; toggleable ("Metrics") |
+| Metric strip | top, full width, 186 px — incline, miles, pace, elapsed, cals, vert gain, [bpm], speed, [fan] | chrome visible; toggleable ("Metrics") |
 | Speed / incline rails | left and right, 132 dp, scrollable presets | chrome visible; toggleable per side |
 | Bottom bar | bottom, 132 px — Back / Home / Recents, timer transport, volume, fan, toggles | always, while chrome visible |
 | Track floor | the whole centre region — everything the strip, bottom bar and rails leave over | a workout exists, no video playing, not over Stride's own launcher; toggleable ("Track") |
@@ -672,6 +672,23 @@ Rules this surface has already had to learn the hard way:
 - **A window is structural.** Anything that adds or removes an overlay window must go through a
   full chrome rebuild; only text may be updated in place. The track floor silently never appeared
   on workout start because a state change was treated as textual.
+- **A cell inside a window is not.** A child of an existing window may be shown and hidden in place
+  with `GONE`, and *must* be when the thing deciding it is an answer from the machine. The fan
+  readout appears only on a treadmill that has a fan, which is something only the console can tell
+  us and something it stops telling us on every missed poll — routing that through a rebuild would
+  recreate the five-second teardown loop `OverlayRebuildTest` exists to prevent. `GONE` children
+  are excluded from `LinearLayout` weight distribution, so a machine with no fan gets the exact
+  layout it had before the cell existed.
+- **Requested is not measured, and neither is unknown.** Three different things, three different
+  looks, everywhere a machine value is drawn. The quick-pick rails fill the pill the machine
+  reached and merely outline the one the rider asked for; the fan readout draws a reading in white
+  like every other metric, a request in the fan's own colour with "requested" written under it, and
+  "Not measured" when nobody has answered. A fan that nobody could ask about is never drawn as
+  "Off" — `FAN_OFF` is a state the fan can really be in, and claiming it on no evidence is the
+  failure the readout exists to avoid.
+- **Amber is incline, cyan is speed, salmon is a machine that will not answer.** A surface that
+  borrows one of those is making a claim about the treadmill it does not mean. The fan is violet
+  for that reason, in the top strip and in the menu sheet alike.
 - **Decorative surfaces set `FLAG_NOT_TOUCHABLE`; interactive ones must not.** The now-playing card
   is therefore *added and removed*, never merely hidden, so a stale touchable window cannot eat
   taps meant for the app underneath.
