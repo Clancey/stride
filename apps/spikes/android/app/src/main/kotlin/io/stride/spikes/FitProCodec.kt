@@ -402,22 +402,34 @@ object FitProCodec {
         /**
          * Field 95 in FitPro1's own `BitField` enum (`Sindarin.FitPro1.Bits.BitField`, decompiled
          * from `ifit-standalone.apk`'s Xamarin assemblies). GlassOS/FitPro2 has no binding for it —
-         * this device never saw it before this investigation. iFit writes it unconditionally right
-         * after unlock, from `!IsBitFieldSupported(RequireStartRequested) || !IsBeltBasedMachine()`.
-         * EXPERIMENTAL: not yet confirmed this write is required or has this effect on real hardware.
+         * this device never saw it before this investigation. `FitPro1Console.InitializeConsole`
+         * writes it right after unlock, from `!IsBitFieldSupported(RequireStartRequested) ||
+         * !IsBeltBasedMachine()`, in its own `ReadWriteDataCmd` after [REQUIRE_START_REQUESTED]'s.
+         *
+         * `DeviceExtensions.IsBeltBasedMachine` is true for `Treadmill` and `InclineTrainer` alike,
+         * taken from the primary device in `DeviceInfoCmd` rather than from a capability bit — see
+         * [DirectMachineSession.BELT_BASED_MACHINE] for why Stride assumes it instead of reading it.
+         *
+         * Worth noting the contrast: FitPro2's own initialization sets the idle lockout and nothing
+         * else, which is why [REQUIRE_START_REQUESTED] has no GlassOS equivalent at all.
          */
         IDLE_MODE_LOCKOUT(95, 1, readOnly = false),
         START_REQUESTED(96, 1, readOnly = true),
 
         /**
-         * Field 108, same source as [IDLE_MODE_LOCKOUT]. iFit's `FitPro1Console` writes this
-         * (echoing whatever the console's own supported-fields bitmap already says about it)
-         * immediately after unlock and before anything else that touches workout state — see
-         * `FitPro1Console.cs`: `SetRequireStartRequested(IsBitFieldSupported(RequireStartRequested))`.
-         * Candidate explanation for why `WORKOUT_MODE = RUNNING` was refused with a clean `FAILED`
-         * on the X22i even after every other precondition (unlock, supported-field checks) held:
-         * this console may simply never have been told to leave whatever state it starts in.
-         * EXPERIMENTAL: not yet confirmed this write is required or has this effect on real hardware.
+         * Field 108, same source as [IDLE_MODE_LOCKOUT], and FitPro1-only.
+         * `FitPro1Console.InitializeConsole` writes it (echoing whatever the console's own
+         * supported-fields bitmap already says about it) immediately after unlock and before
+         * anything else that touches workout state:
+         * `SetRequireStartRequested(IsBitFieldSupported(RequireStartRequested))`.
+         *
+         * This is why `WORKOUT_MODE = RUNNING` was refused with a clean `FAILED` on the X22i even
+         * after every other precondition (unlock, supported-field checks) held: the console had
+         * never been told to leave whatever state it starts in. Observed once on real hardware —
+         * the belt ran for about two minutes — against an earlier revision that batched this write
+         * with field 95. Stride now sends the two separately and in iFit's order, so that single
+         * observation does not describe the current sequence; see
+         * [DirectMachineSession.initializeStartGate] and `DIRECT_MACHINE_PROTOCOL.md`.
          */
         REQUIRE_START_REQUESTED(108, 1, readOnly = false),
         IS_READY_TO_DISCONNECT(116, 1, readOnly = true),

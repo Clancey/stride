@@ -342,4 +342,258 @@ class DirectWriteSequenceTest {
         commands.setFanState(GlassOsCommands.FAN_HIGH)
         assertNull(commands.autoFanSupported())
     }
+
+    // ---- the FitPro1 start gate ------------------------------------------------------------------
+
+    /**
+     * A console that completes a handshake, so [DirectMachineSession.connect] runs end to end.
+     *
+     * [FakeConsole] above cannot serve here: it answers no `DEVICE_INFO`, so its sessions never run
+     * `connect()` and never reach the start-gate init at all. This one answers the handshake, and —
+     * unlike either existing fake — records **frame boundaries**, which is the whole point. Whether
+     * the two init writes share a frame or not is invisible to a fake that only records registers.
+     */
+    private class StartGateConsole(
+        override val variant: FitProCodec.Variant = FitProCodec.Variant.FITPRO1,
+        /** Field ids this console claims in its `DEVICE_INFO` mask. */
+        private val fields: Set<Int> = FitProCodec.Register.entries.map { it.fieldId }.toSet(),
+    ) : FitProTransport {
+        override val name = "fake fitpro1"
+        override val connected = true
+
+        /** Status to answer a write of this register with. Absent means [FitProCodec.Status.DONE]. */
+        val refuse = mutableMapOf<FitProCodec.Register, FitProCodec.Status>()
+
+        /** Registers whose write frame gets no reply at all — a lost answer, not a refusal. */
+        val silentFor = mutableSetOf<FitProCodec.Register>()
+
+        /** One entry per `READ_WRITE_DATA` frame: the writes it carried, in wire order. */
+        val frames = mutableListOf<List<Pair<FitProCodec.Register, Int>>>()
+
+        /** Only the frames that actually wrote something. */
+        val writeFrames: List<List<Pair<FitProCodec.Register, Int>>>
+            get() = frames.filter { it.isNotEmpty() }
+
+        /** Registers written, flattened across every frame, in the order they went out. */
+        val written: List<Pair<FitProCodec.Register, Int>> get() = frames.flatten()
+
+        private val readValues = mapOf(
+            FitProCodec.Register.ACTUAL_KPH to 0,
+            FitProCodec.Register.ACTUAL_INCLINE to 0,
+            FitProCodec.Register.MIN_KPH to 80,
+            FitProCodec.Register.MAX_KPH to 1930,
+            FitProCodec.Register.MIN_GRADE to 0,
+            FitProCodec.Register.MAX_GRADE to 1500,
+        )
+
+        override fun exchange(frame: ByteArray, command: FitProCodec.Command): ByteArray? = when (command) {
+            FitProCodec.Command.DEVICE_INFO -> deviceInfo()
+            FitProCodec.Command.READ_WRITE_DATA -> readWrite(frame)
+            else -> null
+        }
+
+        private fun deviceInfo(): ByteArray {
+            val maskCount = (fields.maxOrNull() ?: 0) / 8 + 1
+            val total = 13 + maskCount + 1
+            val out = ByteArray(total)
+            out[0] = FitProCodec.ADDRESS_MAIN.toByte()
+            out[1] = total.toByte()
+            out[2] = FitProCodec.Command.DEVICE_INFO.value.toByte()
+            out[3] = FitProCodec.Status.DONE.value.toByte()
+            // At the threshold, not above it, so connect() skips the security handshake.
+            out[4] = FitProCodec.SECURITY_REQUIRED_ABOVE.toByte()
+            out[5] = 1
+            out[12] = maskCount.toByte()
+            for (id in fields) {
+                val at = 13 + id / 8
+                out[at] = (out[at].toInt() or (1 shl (id % 8))).toByte()
+            }
+            out[total - 1] = FitProCodec.checksum(out, total - 1)
+            return out
+        }
+
+        private fun readWrite(frame: ByteArray): ByteArray? {
+            val body = frame.copyOfRange(3, frame.size - 1)
+            var i = 0
+            val writeMaskLen = body[i].toInt() and 0xFF
+            i++
+            val writtenHere = fieldsIn(body, i, writeMaskLen)
+            i += writeMaskLen
+            val values = mutableListOf<Pair<FitProCodec.Register, Int>>()
+            for (register in writtenHere) {
+                values += register to (body[i].toInt() and 0xFF)
+                i += register.width
+            }
+            frames += values
+
+            if (writtenHere.any { it in silentFor }) return null
+            val status = writtenHere.firstNotNullOfOrNull { refuse[it] } ?: FitProCodec.Status.DONE
+
+            val readMaskLen = body[i].toInt() and 0xFF
+            i++
+            val out = ArrayList<Byte>()
+            if (status == FitProCodec.Status.DONE) {
+                for (register in fieldsIn(body, i, readMaskLen)) {
+                    val v = readValues[register] ?: 0
+                    for (b in 0 until register.width) out += ((v shr (8 * b)) and 0xFF).toByte()
+                }
+            }
+            return reply(out.toByteArray(), status)
+        }
+
+        private fun fieldsIn(body: ByteArray, from: Int, len: Int): List<FitProCodec.Register> {
+            val ids = mutableListOf<Int>()
+            for (b in 0 until len) {
+                val mask = body[from + b].toInt() and 0xFF
+                for (bit in 0 until 8) if (mask and (1 shl bit) != 0) ids += b * 8 + bit
+            }
+            return ids.sorted().mapNotNull { id -> FitProCodec.Register.entries.find { it.fieldId == id } }
+        }
+
+        private fun reply(values: ByteArray, status: FitProCodec.Status): ByteArray {
+            val total = FitProCodec.FRAME_OVERHEAD + 1 + values.size
+            val out = ByteArray(total)
+            out[0] = FitProCodec.ADDRESS_MAIN.toByte()
+            out[1] = total.toByte()
+            out[2] = FitProCodec.Command.READ_WRITE_DATA.value.toByte()
+            out[3] = status.value.toByte()
+            values.copyInto(out, 4)
+            out[total - 1] = FitProCodec.checksum(out, total - 1)
+            return out
+        }
+
+        override fun close() = Unit
+    }
+
+    private val requireStart = FitProCodec.Register.REQUIRE_START_REQUESTED
+    private val idleLockout = FitProCodec.Register.IDLE_MODE_LOCKOUT
+
+    /**
+     * The gate-arming write goes out first, and in a frame of its own.
+     *
+     * The frame boundary is the assertion that matters. `registerBlock` sorts by field id, so
+     * batching these two would put `IDLE_MODE_LOCKOUT` (95) ahead of `REQUIRE_START_REQUESTED`
+     * (108) — the reverse of iFit's sequence, and the reverse of the safe one, since 108 arms a gate
+     * and 95 removes one. `DIRECT_MACHINE_PROTOCOL.md` records the same trap for `KPH` overtaking
+     * `WORKOUT_MODE`, which is why `startWorkout` splits its frames too.
+     */
+    @Test
+    fun `the start gate arms before it clears the idle lockout, in separate frames`() {
+        val wire = StartGateConsole()
+        val result = DirectMachineSession(wire).connect()
+
+        assertEquals(
+            "each init write needs its own frame, or the order is whatever field id sorting says",
+            listOf(listOf(requireStart to 1), listOf(idleLockout to 0)),
+            wire.writeFrames,
+        )
+        assertEquals(
+            DirectMachineSession.StartGate.Ready(idleModeLockoutCleared = true),
+            result.startGate,
+        )
+    }
+
+    /**
+     * Nothing is written until the probe has confirmed the peer.
+     *
+     * `FitProProbe` exists to establish that this device is the motor controller and implements this
+     * register table "before anything is allowed to write to it" — which is exactly what fields 108
+     * and 95 assume. The first revision of this ran the init writes before `probe.confirm`.
+     */
+    @Test
+    fun `the start gate writes nothing before the probe has confirmed the link`() {
+        val wire = StartGateConsole()
+        DirectMachineSession(wire).connect()
+
+        val firstWrite = wire.frames.indexOfFirst { it.isNotEmpty() }
+        val firstRead = wire.frames.indexOfFirst { it.isEmpty() }
+        assertTrue("the probe's read must come first", firstRead in 0 until firstWrite)
+    }
+
+    /**
+     * A refused arming write stops the sequence — the idle lockout is never cleared.
+     *
+     * This is the property that makes every failure mode leave the console *more* gated than it
+     * started rather than less. Clearing the lockout after failing to arm the gate is the one
+     * combination that must never reach the wire.
+     */
+    @Test
+    fun `a refused arming write prevents the idle lockout from being cleared`() {
+        val wire = StartGateConsole()
+        wire.refuse[requireStart] = FitProCodec.Status.FAILED
+        val result = DirectMachineSession(wire).connect()
+
+        assertEquals("only the arming attempt may have gone out", listOf(listOf(requireStart to 1)), wire.writeFrames)
+        assertTrue("the gate's state is unknown, not ready", result.startGateIncomplete)
+    }
+
+    /**
+     * And so does a silent one. A lost reply is not a refusal.
+     *
+     * `FitProTransport.exchange` documents that a command whose reply was lost "may still have
+     * landed", so silence leaves the gate unknown — it must not be read as "the write did nothing"
+     * and it must not license clearing the lockout.
+     */
+    @Test
+    fun `a silent arming write also prevents the idle lockout from being cleared`() {
+        val wire = StartGateConsole()
+        wire.silentFor += requireStart
+        val result = DirectMachineSession(wire).connect()
+
+        assertEquals(listOf(listOf(requireStart to 1)), wire.writeFrames)
+        assertTrue("silence is not an answer", result.startGateIncomplete)
+    }
+
+    /**
+     * An unfinished start gate refuses control, the same way an unconfirmed probe does.
+     *
+     * Without this the session reports itself connected and accepts speed and mode commands against
+     * a console whose interlocks are in a state nobody established.
+     */
+    @Test
+    fun `an incomplete start gate refuses commands that move the belt`() {
+        val wire = StartGateConsole()
+        wire.refuse[requireStart] = FitProCodec.Status.FAILED
+        val session = DirectMachineSession(wire)
+        session.connect()
+
+        val ack = DirectMachineCommands(session).startWorkout()
+        assertTrue("control must be refused, not attempted", ack is MachineAck.Refused)
+        assertTrue(
+            "no workout mode may reach a console in this state",
+            wire.written.none { it.first == FitProCodec.Register.WORKOUT_MODE },
+        )
+    }
+
+    /**
+     * A console that never claims field 108 is untouched — the Commercial 1750 guard.
+     *
+     * This is the only thing standing between the one machine this project is actually tested on and
+     * a pair of writes whose meaning was recovered from a different console generation.
+     */
+    @Test
+    fun `a console that does not report the start gate field is left alone`() {
+        val wire = StartGateConsole(
+            fields = FitProCodec.Register.entries.map { it.fieldId }.toSet() - requireStart.fieldId,
+        )
+        val result = DirectMachineSession(wire).connect()
+
+        assertTrue("no init writes belong on a console that never claimed the field", wire.writeFrames.isEmpty())
+        assertEquals(DirectMachineSession.StartGate.NotApplicable, result.startGate)
+    }
+
+    /**
+     * Neither is a FitPro2 board that happens to set the bit.
+     *
+     * These field semantics come from `Sindarin.FitPro1` and have no GlassOS/FitPro2 binding, so
+     * capability alone is not enough to license the write — the generation has to match too.
+     */
+    @Test
+    fun `a FitPro2 console is left alone even when it claims the field`() {
+        val wire = StartGateConsole(variant = FitProCodec.Variant.FITPRO2)
+        val result = DirectMachineSession(wire).connect()
+
+        assertTrue("FitPro1-only semantics must not be written to a FitPro2 board", wire.writeFrames.isEmpty())
+        assertEquals(DirectMachineSession.StartGate.NotApplicable, result.startGate)
+    }
 }

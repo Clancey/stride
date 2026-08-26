@@ -313,8 +313,10 @@ those were misread in the previous revision of this document.
 | `CURRENT_CALORIES` | 21 | 4 | read |
 | `MAX_GRADE` / `MIN_GRADE` | 27 / 28 | 2 | read |
 | `MAX_KPH` / `MIN_KPH` | 30 / 31 | 2 | read |
+| `IDLE_MODE_LOCKOUT` | 95 | 1 | write |
 | `START_REQUESTED` | 96 | 1 | read |
 | `FAN_STATE` | 98 | 1 | write |
+| `REQUIRE_START_REQUESTED` | 108 | 1 | write |
 
 `MIN_KPH`/`MAX_KPH` and `MIN_GRADE`/`MAX_GRADE` are what answer "what speeds and inclines are
 available" on the direct path — the machine's own limits, read from the machine, rather than a table
@@ -508,9 +510,65 @@ that look alike" above rather than here, because the trap is that it looks wrong
   That every attempt produces the same clean, immediate `FAILED` — never a crash, never a different
   status, never silence — rules out a framing bug, points at a real firmware-side precondition this
   protocol surface doesn't expose, and is not something visible from GlassOS's decompiled behaviour
-  (GlassOS is FitPro2-only). The belt never moved in any of the four attempts. Needs either FitPro1's
-  own `Sindarin.FitPro1` implementation (Xamarin IL, not available to this investigation) or a
-  `usbmon`/hardware capture of iFit actually starting a workout on this console generation.
+  (GlassOS is FitPro2-only). The belt never moved in any of the four attempts.
+
+  **This has since been answered, and the entry above is kept only so nobody re-tests those four.**
+  `Sindarin.FitPro1` is no longer out of reach: `ifit-standalone.apk` bundles it as Xamarin/.NET
+  assemblies (`assemblies/assemblies.blob`, an LZ4-block-compressed `XABA` AssemblyStore), and
+  `Sindarin.FitPro1.Core` unpacks with `ilspycmd`. `FitPro1Console` writes two fields after unlock,
+  before it treats a console as initialized for control, and Stride had never sent either:
+
+  ```csharp
+  bool flag = IsBitFieldSupported(BitField.RequireStartRequested);  // field 108
+  SetRequireStartRequested(flag);
+  bool idleModeLockout = !flag || !PrimaryDevice.Device.IsBeltBasedMachine();
+  SetIdleModeLockout(idleModeLockout);                              // field 95
+  ```
+
+  Neither field has a GlassOS/FitPro2 binding, which is why every earlier pass over this protocol was
+  blind to them. Field 96 (`START_REQUESTED`, read-only) already sat in this repo's table at the
+  number that decompiled enum gives it, which is the cross-check that the numbering is the real wire
+  numbering. `DirectMachineSession.initializeStartGate` now sends both, and the fifth avenue is the
+  one that worked: the author's X22i accepted the init writes and the next `startWorkout()` drove the
+  belt for about two minutes.
+
+  Three things about that result are worth stating plainly rather than filing as settled:
+
+  1. **It is a single live observation**, and it was taken against an earlier revision that sent both
+     fields in *one* frame. It therefore no longer describes what Stride sends.
+  2. **The writes are ordered, and the order is load-bearing.** Field 108 arms a gate; field 95
+     removes one. Values inside one register block are ordered by field id (see the `startWorkout`
+     note above), so batching them puts 95 *ahead* of 108 — backwards. They now go out as two frames,
+     108 first, and 95 is only sent once 108 has been acknowledged, so every way the sequence can
+     fail leaves the console more gated rather than less.
+
+     This is what iFit does too, and the binary is unusually clear about it. Each setter goes through
+     `FitnessConsoleBase.SetValue`, which starts its own `SetValueAsync`, and
+     `FitPro1Console.SetValidatedValuesAsync` wraps that single value in its own `ReadWriteDataCmd`:
+     two commands, two frames. `ReadWriteDataCmd` *does* sort ascending when several fields share one
+     command (`OrderBy((int)x.BitField)`) — the same behaviour as `registerBlock` — so batching these
+     two would reverse them in either implementation, and iFit declines to batch them.
+     `FitProCommunicationGroup.CreateMessages` only chunks already-built bytes into 20-byte
+     messages; it does no reordering.
+
+     Two things Stride does here that iFit does **not**, both deliberate rather than copied:
+     `InitializeConsole` awaits neither setter and aborts for neither, whereas Stride waits for the
+     arming write before sending the lockout write; and iFit discards both results, whereas Stride
+     propagates the outcome into `ConnectResult` and refuses control while the gate's state is
+     unknown. Both are choices appropriate to a reimplementation that can move a belt, not
+     reproductions of iFit's behaviour.
+  3. **`IsBeltBasedMachine()` is assumed, not read.** `DeviceExtensions.IsBeltBasedMachine` answers
+     it from the primary device in `DeviceInfoCmd`, and accepts `Treadmill` **and**
+     `InclineTrainer` — the X22i is an incline trainer, so hardcoding true is right for this console
+     and wrong in general. Stride has no primary device to consult: `DeviceInfo.address` is the bus
+     address a reply was stamped with (5 on the X22i), not a device type, and `SUPPORTED_DEVICES` is
+     never requested (see the separate entry above). `DirectMachineSession.BELT_BASED_MACHINE` names
+     the assumption; FitPro1 equipment that is not belt-based needs the real conditional and would
+     send `IDLE_MODE_LOCKOUT = 1`.
+
+  The init is gated on `Variant.FITPRO1` *and* on the console reporting field 108, so it is a
+  structural no-op on GlassOS-era consoles including the Commercial 1750. Re-confirmation on an X22i
+  against the two-frame sequence is still wanted.
 - The preset **ladder step** (1.0) is invented. No preset register exists in FitPro, so the direct
   path must synthesise the quick picks; the endpoints come from the machine's own MIN/MAX registers,
   but nothing corroborates the spacing between them.
