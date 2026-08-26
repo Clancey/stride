@@ -398,7 +398,40 @@ object FitProCodec {
         // ---- lifetime counters and console flags ----
         MOTOR_TOTAL_DISTANCE(69, 4, readOnly = true),
         TOTAL_TIME(70, 4, readOnly = true),
+
+        /**
+         * Field 95 in FitPro1's own `BitField` enum (`Sindarin.FitPro1.Bits.BitField`, decompiled
+         * from `ifit-standalone.apk`'s Xamarin assemblies). GlassOS/FitPro2 has no binding for it —
+         * this device never saw it before this investigation. `FitPro1Console.InitializeConsole`
+         * writes it right after unlock, from `!IsBitFieldSupported(RequireStartRequested) ||
+         * !IsBeltBasedMachine()`, in its own `ReadWriteDataCmd` after [REQUIRE_START_REQUESTED]'s.
+         *
+         * `DeviceExtensions.IsBeltBasedMachine` is true for `Treadmill` and `InclineTrainer` alike,
+         * taken from the primary device in `DeviceInfoCmd` rather than from a capability bit — see
+         * [DirectMachineSession.BELT_BASED_MACHINE] for why Stride assumes it instead of reading it.
+         *
+         * Worth noting the contrast: FitPro2's own initialization sets the idle lockout and nothing
+         * else, which is why [REQUIRE_START_REQUESTED] has no GlassOS equivalent at all.
+         */
+        IDLE_MODE_LOCKOUT(95, 1, readOnly = false),
         START_REQUESTED(96, 1, readOnly = true),
+
+        /**
+         * Field 108, same source as [IDLE_MODE_LOCKOUT], and FitPro1-only.
+         * `FitPro1Console.InitializeConsole` writes it (echoing whatever the console's own
+         * supported-fields bitmap already says about it) immediately after unlock and before
+         * anything else that touches workout state:
+         * `SetRequireStartRequested(IsBitFieldSupported(RequireStartRequested))`.
+         *
+         * This is why `WORKOUT_MODE = RUNNING` was refused with a clean `FAILED` on the X22i even
+         * after every other precondition (unlock, supported-field checks) held: the console had
+         * never been told to leave whatever state it starts in. Observed once on real hardware —
+         * the belt ran for about two minutes — against an earlier revision that batched this write
+         * with field 95. Stride now sends the two separately and in iFit's order, so that single
+         * observation does not describe the current sequence; see
+         * [DirectMachineSession.initializeStartGate] and `DIRECT_MACHINE_PROTOCOL.md`.
+         */
+        REQUIRE_START_REQUESTED(108, 1, readOnly = false),
         IS_READY_TO_DISCONNECT(116, 1, readOnly = true),
         ;
 
@@ -486,6 +519,19 @@ object FitProCodec {
      * VERIFIED (`uh/d.h`, with `uh/c` fixing the width at 4).
      */
     fun decodeInt(bytes: ByteArray): Int = leToInt(bytes, bytes.size)
+
+    /**
+     * Decodes `CURRENT_CALORIES`: a raw 4-byte count scaled by `1024 / 100,000,000`, not a plain
+     * integer. VERIFIED against iFit's own `CaloriesConverter` (decompiled from
+     * `ifit-standalone.apk`): `(double)(uint)raw * 1024.0 / 100000000.0`.
+     *
+     * This register was previously read with the generic [decodeInt], which is right for most
+     * 4-byte fields and wrong here specifically. The raw value genuinely does climb by a few
+     * thousand per second while a workout runs — that is correct, granular firmware behaviour —
+     * and reading it as whole calories rather than applying this scale is exactly what produced
+     * calorie counts in the millions.
+     */
+    fun decodeCalories(bytes: ByteArray): Double = decodeInt(bytes) * 1024.0 / 100_000_000.0
 
     /** Serialises [value] into [length] little-endian bytes. VERIFIED primitive (`uh/d.g`). */
     fun intToLe(value: Int, length: Int): ByteArray {

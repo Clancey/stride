@@ -112,6 +112,18 @@ class DirectMachineSession(
         private set
 
     /**
+     * How far [initializeStartGate] got on this console, and therefore whether control is trustworthy.
+     *
+     * Read by [authorisedWrite] the same way [FitProProbe.refusalReason] is: a console whose start
+     * gate was attempted and did not complete is one whose gate state we do not know, and issuing
+     * speed or mode commands to it would be commanding a machine whose interlocks are in an
+     * unknown configuration. [StartGate.NotApplicable] is the ordinary case and refuses nothing.
+     */
+    @Volatile
+    var startGate: StartGate = StartGate.NotApplicable
+        private set
+
+    /**
      * Whether this console accepted `AUTO` as a fan state, once we have actually tried it.
      *
      * Null until the question has been settled by a write. There is deliberately no inference behind
@@ -168,6 +180,35 @@ class DirectMachineSession(
 
         /** The console demanded security and we could not assemble the request. */
         data class Unavailable(val reason: String) : SecurityState
+    }
+
+    /**
+     * How far [initializeStartGate] got with a FitPro1 console's start gate.
+     *
+     * Three states rather than a boolean because "we never needed to" and "we tried and cannot say"
+     * are opposite answers for control: the first is every console Stride has ever driven, the
+     * second is a machine whose interlocks are in a configuration nobody knows.
+     */
+    sealed interface StartGate {
+        /**
+         * Never attempted: not a FitPro1 console, or one that does not implement field 108.
+         * The ordinary case, including every GlassOS-era console. Refuses nothing.
+         */
+        data object NotApplicable : StartGate
+
+        /**
+         * Every write this console needed was acknowledged.
+         *
+         * [idleModeLockoutCleared] is false on a console that implements field 108 but not field 95,
+         * which is a complete initialization for that console rather than a partial one.
+         */
+        data class Ready(val idleModeLockoutCleared: Boolean) : StartGate
+
+        /**
+         * Attempted and did not complete, so the gate's state is unknown. [reason] is rider-visible
+         * and is what [authorisedWrite] refuses control with.
+         */
+        data class Incomplete(val reason: String) : StartGate
     }
 
     /** The security outcome of the most recent [connect]. */
@@ -259,9 +300,31 @@ class DirectMachineSession(
     fun authorisedWrite(
         label: String,
         gate: List<FitProCodec.Register>,
+        /**
+         * Whether this command may go out while [startGate] is [StartGate.Incomplete].
+         *
+         * False for everything that asks the belt to move. True only for a stop: `PLAN.md` §3.1 has
+         * stop preemption "*never* rate-limited or ramp-delayed" and §5.2 ramp-limits acceleration
+         * "but **never on deceleration or stop**", and a start gate we could not finish initialising
+         * is exactly the kind of thing a stop must not be queued behind. The asymmetry is safe in
+         * the direction that matters: refusing a start on a console in an unknown state costs a
+         * rider a workout, while refusing a stop on a belt that is already moving — a rider can
+         * start one from the console's own panel — is the failure this project exists to avoid.
+         *
+         * Note this does not bypass [FitProProbe]'s refusal, which is a different question: that one
+         * says we have not established the peer is the motor controller at all, and writing a stop
+         * to a device that may not be a treadmill is not a stop.
+         */
+        startGateExempt: Boolean = false,
         build: (DirectMachineSession) -> List<FitProCodec.Write>,
     ): MachineAck = synchronized(wire) {
         probe.refusalReason()?.let { return MachineAck.Refused(it) }
+        // Same shape of gate as the probe's, and for the same reason. The probe answers "is this
+        // peer the machine we think it is"; this answers "are its interlocks in the state we think
+        // they are". Both have to hold before a frame that asks a belt to move goes out.
+        if (!startGateExempt) {
+            (startGate as? StartGate.Incomplete)?.let { return MachineAck.Refused(it.reason) }
+        }
 
         val info = deviceInfo
         val missing = gate.filter { info != null && !info.supports(it) }
@@ -340,6 +403,7 @@ class DirectMachineSession(
         replyAddress = null
         supportedCommands = emptySet()
         fanRegister = null
+        startGate = StartGate.NotApplicable
         probe.reset()
         forgetSecurity()
 
@@ -412,12 +476,211 @@ class DirectMachineSession(
             address,
             expectAddress = replyAddress ?: address,
         ) { info.supports(it) }
+
+        // Only after the probe, because what follows are register *writes*. FitProProbe exists to
+        // establish that this peer is the motor controller and "implements the same register table
+        // as the console this protocol was recovered from" before anything writes to it — which is
+        // precisely the assumption fields 108 and 95 rest on. This ran before probe.confirm when it
+        // was first written, justified as being like the SYSTEM_INFO/VERSION_INFO exchanges above;
+        // those are commandFrame interrogations that write no register, so they were never a
+        // precedent for it. The probe is reads-only, so deferring past it costs one read round-trip
+        // and leaves the post-unlock ordering these writes depend on otherwise intact.
+        startGate = initializeStartGate(info)
+
         return ConnectResult(
             deviceInfo = info,
             supportedCommands = supportedCommands,
             probe = probeResult,
+            startGate = startGate,
             detail = describe(info, probeResult),
         ).also { lastConnect = it }
+    }
+
+    /**
+     * Reproduce `FitPro1Console`'s post-unlock initialization writes, which the X22i needs before it
+     * will accept `WORKOUT_MODE = RUNNING` at all — see `DIRECT_MACHINE_PROTOCOL.md`'s "What is
+     * still open" for the four start strategies that were ruled out before this one.
+     *
+     * `FitPro1Console.InitializeConsole` writes two fields, in this order:
+     *
+     * ```
+     * SetRequireStartRequested(IsBitFieldSupported(RequireStartRequested));   // field 108
+     * SetIdleModeLockout(!flag || !PrimaryDevice.Device.IsBeltBasedMachine()); // field 95
+     * ```
+     *
+     * ## Why two frames rather than one
+     *
+     * Because one frame cannot express the order, and because iFit does not use one. Each setter
+     * goes through `FitnessConsoleBase.SetValue`, which starts its own `SetValueAsync`, and
+     * `FitPro1Console.SetValidatedValuesAsync` wraps that single value in its own `ReadWriteDataCmd`
+     * — two commands, two frames, 108 then 95.
+     *
+     * The clinching detail is that `ReadWriteDataCmd` *does* sort ascending when several fields
+     * share one command (`OrderBy((int)x.BitField)`), which is precisely what
+     * [FitProCodec.registerBlock] does here. So batching these two would put field 95 on the wire
+     * *ahead* of field 108 in either implementation — and iFit declines to batch them. This repo
+     * already records the same trap for `KPH` (0) overtaking `WORKOUT_MODE` (12), which is why
+     * [DirectMachineCommands.startWorkout] splits its frames too.
+     *
+     * The order is the safety-relevant part, not a fidelity nicety. Field 108 *arms* a gate ("this
+     * console requires an explicit start request"); field 95 *removes* one. A single frame carries a
+     * single status byte and no per-register acknowledgement, so a `FAILED`, a timeout or a lost
+     * reply cannot distinguish "neither applied" from "only the lockout was cleared" — and that
+     * second state is the least gated of the three.
+     *
+     * Stated precisely, because the loose version of this claim is wrong: the guarantee is **not**
+     * that every failure leaves the console more gated than it started. If the lockout write's own
+     * reply is lost after it landed, the result is the ordinary `(108=1, 95=0)` state. The guarantee
+     * is the one that matters — *the lockout is never cleared unless the gate was armed first* —
+     * because "lockout cleared, gate not armed" is the only combination that is worse than doing
+     * nothing at all, and sending 95 only after 108 is acknowledged is what excludes it.
+     *
+     * ## Where this is deliberately stricter than iFit
+     *
+     * Two places, both chosen rather than copied:
+     *
+     * - **The gate write is awaited.** `InitializeConsole` does not await either setter and does not
+     *   abort if one fails; both are fired and initialization continues regardless. Waiting for the
+     *   arming write means every way this sequence can fail leaves the console *more* gated than it
+     *   started, never less, which is worth one round-trip on a machine with a belt.
+     * - **The outcome is propagated.** iFit discards it. Here it becomes [StartGate], reaches
+     *   [ConnectResult], and makes [authorisedWrite] refuse control — because a console whose gate
+     *   state is unknown is not one to send speed or mode commands to. That is the same discipline
+     *   [authorisedWrite] already applies to a reply with a bad checksum.
+     * - **The console is asked whether a start is already pending** before the lockout is cleared,
+     *   and the lockout is left alone if it cannot answer. iFit clears it unconditionally. See
+     *   [startIsPending].
+     */
+    private fun initializeStartGate(info: FitProCodec.DeviceInfo): StartGate {
+        // Field semantics come from `Sindarin.FitPro1`, and by this codebase's own account
+        // "GlassOS/FitPro2 has no binding" for either one. A FitPro2 board that happens to set bit
+        // 108 would mean something we have never verified, so restrict this by generation as well as
+        // by capability. Note the generation half only bites over USB, where `variantOf` reads the
+        // product id: `BleTransport.variant` is hardcoded FITPRO1, so a BLE-attached console is held
+        // by the capability check alone.
+        if (transport.variant != FitProCodec.Variant.FITPRO1) return StartGate.NotApplicable
+        if (!info.supports(FitProCodec.Register.REQUIRE_START_REQUESTED)) return StartGate.NotApplicable
+        // Nothing was attempted, so nothing is unknown — and the probe already refuses control on
+        // its own account, which is the more accurate reason to show the rider.
+        if (!probe.confirmed) return StartGate.NotApplicable
+
+        // Step one: arm the gate. Its own frame — see [sendStartGateWrite].
+        val armed = sendStartGateWrite(FitProCodec.Register.REQUIRE_START_REQUESTED, 1)
+        if (armed != null) return StartGate.Incomplete(armed)
+
+        if (!info.supports(FitProCodec.Register.IDLE_MODE_LOCKOUT)) {
+            Log.i(TAG, "start-gate init: armed; this console has no IDLE_MODE_LOCKOUT to clear")
+            return StartGate.Ready(idleModeLockoutCleared = false)
+        }
+
+        // Step two, before clearing anything: establish that the console is not already holding a
+        // start request. See [startIsPending] for why an acknowledgement alone is not enough.
+        startIsPending(info)?.let { return StartGate.Incomplete(it) }
+
+        val lockout = if (BELT_BASED_MACHINE) 0 else 1
+        val cleared = sendStartGateWrite(FitProCodec.Register.IDLE_MODE_LOCKOUT, lockout)
+        if (cleared != null) return StartGate.Incomplete(cleared)
+
+        Log.i(TAG, "start-gate init: REQUIRE_START_REQUESTED=1 then IDLE_MODE_LOCKOUT=$lockout, both accepted")
+        return StartGate.Ready(idleModeLockoutCleared = true)
+    }
+
+    /**
+     * Whether anything stops [IDLE_MODE_LOCKOUT] being cleared right now. Null means go ahead.
+     *
+     * Two questions, answered by one read frame.
+     *
+     * **Is a start already pending?** This is the auto-start question, and it is the reason this
+     * read exists. Clearing the idle lockout does not command motion — nothing here writes `KPH` or
+     * `WORKOUT_MODE`, and [Register.START_REQUESTED] is read-only so Stride cannot ask for a start
+     * even if it wanted to. But `connect()` runs unattended, from launch and from every reconnect,
+     * and "we command no motion" is not the same claim as "no motion can result". A console already
+     * holding a start request — a rider pressed Start on its own panel — is the case where removing
+     * an interlock could let motion follow, and `PLAN.md` §5 admits no auto-start from launch or
+     * boot. So the lockout is cleared only against a console that says no start is pending, and a
+     * console that cannot be asked is treated as one that might be.
+     *
+     * **Did the arming write actually take?** FitPro carries no request id, so [parseResponse] can
+     * only correlate a reply by address and command — which this file already notes is how "a late
+     * reply to a previous frame" gets mistaken for an acknowledgement. Reading field 108 back turns
+     * an acknowledgement into an observation. It is advisory rather than required: a console that
+     * declines to read the field back has not contradicted its own ack, and failing initialization
+     * on that would be inventing a precondition iFit never had. A field that reads back as *zero* is
+     * a contradiction, and is treated as one.
+     */
+    private fun startIsPending(info: FitProCodec.DeviceInfo): String? {
+        val pendingRegister = FitProCodec.Register.START_REQUESTED
+        if (!info.supports(pendingRegister)) {
+            Log.w(TAG, "start-gate init: console does not report START_REQUESTED; not clearing the lockout")
+            return "Stride couldn't confirm this console isn't already waiting to start, so it left" +
+                " its idle lockout alone."
+        }
+
+        val reads = listOf(pendingRegister, FitProCodec.Register.REQUIRE_START_REQUESTED)
+        val response = runCatching { exchange(reads = reads) }.getOrNull()
+        if (response == null || !response.accepted || !response.checksumValid) {
+            Log.w(TAG, "start-gate init: could not read START_REQUESTED back ($response)")
+            return "Stride couldn't confirm this console isn't already waiting to start, so it left" +
+                " its idle lockout alone."
+        }
+
+        // Advisory, per the note above: only a definite zero is evidence against the ack.
+        val armedValue = response.value(FitProCodec.Register.REQUIRE_START_REQUESTED)
+            ?.firstOrNull()?.toInt()?.and(0xFF)
+        if (armedValue == 0) {
+            Log.w(TAG, "start-gate init: REQUIRE_START_REQUESTED acknowledged but reads back 0")
+            return "This console accepted Stride's start-gate setting and then reported it unset."
+        }
+
+        val pending = response.value(pendingRegister)?.firstOrNull()?.toInt()?.and(0xFF)
+        if (pending == null) {
+            Log.w(TAG, "start-gate init: START_REQUESTED missing from the reply")
+            return "Stride couldn't confirm this console isn't already waiting to start, so it left" +
+                " its idle lockout alone."
+        }
+        if (pending != 0) {
+            Log.w(TAG, "start-gate init: START_REQUESTED=$pending; not clearing the idle lockout")
+            return "This console is already holding a start request, so Stride left its idle lockout" +
+                " in place rather than releasing it on your behalf."
+        }
+        return null
+    }
+
+    /**
+     * Send one start-gate field in a frame of its own. Returns null on acknowledgement, or a
+     * rider-visible reason.
+     *
+     * **This is where the start gate's frame layout is decided.** One field per frame, because a
+     * single frame cannot express an order: [FitProCodec.registerBlock] sorts by field id, so
+     * batching `REQUIRE_START_REQUESTED` (108) with `IDLE_MODE_LOCKOUT` (95) would put the lockout
+     * *first*, reversing the sequence. iFit does not batch them either — each setter gets its own
+     * `ReadWriteDataCmd` — and its `ReadWriteDataCmd` carries the same ascending sort, so batching
+     * would reverse them in either implementation.
+     *
+     * `MachineAck.NoAnswer` counts as a failure: per [FitProTransport.exchange], a command whose
+     * reply was lost "may still have landed", so silence makes a field's state unknown rather than
+     * unchanged.
+     */
+    private fun sendStartGateWrite(register: FitProCodec.Register, value: Int): String? {
+        val label = "start-gate ${register.name.lowercase().replace('_', ' ')}"
+        val ack = authorisedWrite(label, gate = listOf(register)) {
+            listOf(FitProCodec.writeOf(register, byteArrayOf(value.toByte())))
+        }
+        if (ack !is MachineAck.Ok) {
+            Log.w(TAG, "start-gate init: ${register.name}=$value not acknowledged ($ack)")
+            return startGateRefusal(ack)
+        }
+        return null
+    }
+
+    /** Phrase a failed start-gate write for a rider, keeping the machine's own words where it gave any. */
+    private fun startGateRefusal(ack: MachineAck): String {
+        val because = when (ack) {
+            is MachineAck.Refused -> "the machine refused it (${ack.detail})"
+            is MachineAck.NoAnswer -> "the machine didn't answer (${ack.reason})"
+            MachineAck.Ok -> "it succeeded"
+        }
+        return "Stride couldn't put this console into a state it will accept a start from: $because."
     }
 
     /**
@@ -567,7 +830,14 @@ class DirectMachineSession(
                 }
             SecurityState.NotRequired -> ""
         }
-        return "Found a $brand machine on ${transport.name}. ${probeResult.detail}.$caveat$securityNote"
+        // Worth saying whenever it applies, because it is the difference between "this machine will
+        // not take a start" and "Stride will not send one". Without it the refusal from
+        // authorisedWrite has no explanation anywhere the rider can see.
+        val startGateNote = when (val gate = startGate) {
+            is StartGate.Incomplete -> " ${gate.reason}"
+            is StartGate.Ready, StartGate.NotApplicable -> ""
+        }
+        return "Found a $brand machine on ${transport.name}. ${probeResult.detail}.$caveat$securityNote$startGateNote"
     }
 
     /**
@@ -631,6 +901,7 @@ class DirectMachineSession(
             deviceInfo = null
             supportedCommands = emptySet()
             fanRegister = null
+            startGate = StartGate.NotApplicable
             address = FitProCodec.ADDRESS_MAIN
             replyAddress = null
             forgetSecurity()
@@ -644,6 +915,7 @@ class DirectMachineSession(
             deviceInfo = null
             supportedCommands = emptySet()
             fanRegister = null
+            startGate = StartGate.NotApplicable
             address = FitProCodec.ADDRESS_MAIN
             replyAddress = null
             forgetSecurity()
@@ -675,12 +947,48 @@ class DirectMachineSession(
         val supportedCommands: Set<FitProCodec.Command>,
         val probe: FitProProbe.Result,
         val detail: String,
+        /**
+         * How far the FitPro1 start-gate initialization got. Defaults to [StartGate.NotApplicable]
+         * because the handshake-failure result never reaches the point of attempting it.
+         */
+        val startGate: StartGate = StartGate.NotApplicable,
     ) {
         val connected: Boolean get() = deviceInfo != null
+
+        /**
+         * Whether the console answered but its start gate is in an unknown state.
+         *
+         * Deliberately not folded into [connected]: the console *is* answering, and reporting it as
+         * disconnected would send a rider to power-cycle a treadmill that is working. Control is
+         * refused in [authorisedWrite] instead, which is the same shape the probe's refusal takes.
+         */
+        val startGateIncomplete: Boolean get() = startGate is StartGate.Incomplete
     }
 
     companion object {
         const val TAG = "DirectMachine"
+
+        /**
+         * Whether the machine underneath this console drives a belt.
+         *
+         * iFit computes the idle-mode lockout as `!requireStartRequested || !IsBeltBasedMachine()`,
+         * so on a console that supports field 108 the value reduces to "is this a belt machine".
+         * `DeviceExtensions.IsBeltBasedMachine` answers that from the primary device reported by
+         * `DeviceInfoCmd`, and accepts **both** `Treadmill` and `InclineTrainer`. The X22i is an
+         * incline trainer, so `true` is correct for it — but correct for a narrower reason than
+         * "Stride only drives treadmills", which is why the distinction is recorded here.
+         *
+         * It is an assumption rather than a reading because Stride has no primary device to consult.
+         * [FitProCodec.DeviceInfo.address] is the bus address a reply was stamped with — 5 on the
+         * X22i — not a device-type enum, and the device list that `SUPPORTED_DEVICES` would carry is
+         * never requested: `parseSupportedDevices` has no callers, which
+         * `DIRECT_MACHINE_PROTOCOL.md`'s "What is still open" already tracks as its own item.
+         * Wiring that command up is a larger change than this one, so the assumption is named here
+         * rather than written as a bare literal at its one call site. FitPro1 equipment that is not
+         * belt-based — a bike, a rower, an elliptical — needs the real conditional, and would send
+         * `IDLE_MODE_LOCKOUT = 1` instead.
+         */
+        const val BELT_BASED_MACHINE = true
 
         /** Preferred first: see [fanRegister]. */
         val FAN_REGISTERS = listOf(FitProCodec.Register.FAN_STATE, FitProCodec.Register.FAN_SPEED)
@@ -878,7 +1186,7 @@ class DirectMachineClient(private val session: DirectMachineSession) {
             elapsedSeconds = response.value(FitProCodec.Register.RUNNING_TIME)
                 ?.let { FitProCodec.decodeInt(it).toLong() },
             calories = response.value(FitProCodec.Register.CURRENT_CALORIES)
-                ?.let { FitProCodec.decodeInt(it).toDouble() },
+                ?.let(FitProCodec::decodeCalories),
             speedWritable = duringWorkout && session.supports(FitProCodec.Register.KPH) != false,
             inclineWritable = duringWorkout && session.supports(FitProCodec.Register.GRADE) != false,
             fanWritable = writable && session.fanRegister != null,
@@ -1148,31 +1456,81 @@ class DirectMachineCommands(private val session: DirectMachineSession) : Machine
     }
 
     /**
-     * Stop the belt and end the session in a single frame.
+     * Stop the belt, then end the session, as two separate writes.
      *
-     * Both writes ride in one request because the protocol supports multiple writes per frame and
-     * ordering them as two round-trips introduces a window where the workout has ended but the belt
-     * is still commanded to a speed. The write block is emitted in ascending field order —
-     * `KPH` (0) then `WORKOUT_MODE` (12) — by [FitProCodec.readWriteBody], not by this list.
+     * They used to ride in one frame — that was true of the original `KPH` + `WORKOUT_MODE = IDLE`
+     * write, and stayed true of the first fix that changed only the mode value to `RESULTS` (see
+     * below). Combined, it is refused: live on the X22i, `KPH = 0` bundled with
+     * `WORKOUT_MODE = RESULTS` in one frame came back `Refused`, from a console sitting in `PAUSE`.
+     * iFit's own `WorkoutFacade.EndWorkoutAsync` (decompiled from `ifit-standalone.apk`) explains
+     * why: it calls `SetValueAsync(WorkoutMode, WorkoutResults)` — one value, alone, never bundled
+     * with a speed write the way `StartWorkoutAsync` bundles `WorkoutMode` with `Kph`/`Grade`. Ending
+     * a workout is a mode-only transition on this protocol; only starting one carries a setpoint
+     * alongside it. Sent as two round-trips instead, in the order that matters most for safety: the
+     * belt first, the session state second, since a caller that only gets one of the two should get
+     * the one that stops the belt.
      *
-     * `WORKOUT_MODE` is included only when the machine implements it. Sending an unsupported field
-     * risks the console rejecting the *whole* frame, which would take the `KPH = 0` down with it —
-     * failing to stop because we also asked for something optional is not an acceptable trade.
+     * The mode written is `RESULTS`, not `IDLE`. It used to be `IDLE`, which is wrong: ending a
+     * workout means transitioning to `RESULTS`, full stop — `EndWorkoutAsync` never asks for `IDLE`
+     * at all. Asking this console for `IDLE` directly from `RUNNING`/`PAUSE` was refused outright on
+     * the X22i, and retrying the same wrong write while `clearWorkout` looped drove the console
+     * through a second unintended state before this was understood.
+     *
+     * `RESULTS` is not the end of it, though — see the third write below.
+     *
+     * Every write in this path is [DirectMachineSession.authorisedWrite]'s `startGateExempt`. None
+     * of them can increase belt motion — one commands zero speed and the other two end the session —
+     * and a start gate Stride could not finish initialising is exactly what a stop must not be
+     * queued behind. Leaving a console parked in `RESULTS` for that reason would be its own bug.
      */
-    override fun stop(): MachineAck =
-        write("stop", FitProCodec.Register.KPH) { session ->
+    override fun stop(): MachineAck {
+        val speedAck = write("stop speed", FitProCodec.Register.KPH, startGateExempt = true) {
+            listOf(FitProCodec.writeOf(FitProCodec.Register.KPH, FitProCodec.encodeSpeed(0.0)))
+        }
+        if (speedAck !is MachineAck.Ok) {
+            Log.w(TAG, "stop: speed-to-zero was not accepted: $speedAck")
+        }
+        if (session.supports(FitProCodec.Register.WORKOUT_MODE) == false) return speedAck
+        val resultsAck = write("end workout", FitProCodec.Register.WORKOUT_MODE, startGateExempt = true) {
+            listOf(
+                FitProCodec.writeOf(
+                    FitProCodec.Register.WORKOUT_MODE,
+                    FitProCodec.encodeWorkoutMode(FitProCodec.WorkoutMode.RESULTS),
+                ),
+            )
+        }
+        if (resultsAck !is MachineAck.Ok) return resultsAck
+        return cleanUpWorkout()
+    }
+
+    /**
+     * The write that actually gets a console from `RESULTS` back to `IDLE`.
+     *
+     * Not a firmware timeout, and not guessed: `Sindarin.Core.Console.FitnessConsoleBase` (shared
+     * across every equipment type, decompiled from `ifit-standalone.apk`) subscribes to its own
+     * console-state stream, and on every transition *into* `RESULTS` — regardless of what caused
+     * it — waits 200ms and then calls `CleanUpWorkout()`, which writes `WorkoutMode = Idle` and
+     * `Grade = 0.0` together, in one frame, unconditionally. That 200ms figure is iFit's own
+     * constant, not a value tuned here. Confirmed: `clearWorkout`'s previous approach — waiting up
+     * to 18s for the console to leave `RESULTS` on its own with no further write — never once
+     * succeeded live: nothing was ever going to leave RESULTS without this.
+     */
+    private fun cleanUpWorkout(): MachineAck {
+        Thread.sleep(RESULTS_CLEANUP_DELAY_MS)
+        return write("clean up workout", FitProCodec.Register.WORKOUT_MODE, startGateExempt = true) { session ->
             buildList {
-                add(FitProCodec.writeOf(FitProCodec.Register.KPH, FitProCodec.encodeSpeed(0.0)))
-                if (session.supports(FitProCodec.Register.WORKOUT_MODE) != false) {
-                    add(
-                        FitProCodec.writeOf(
-                            FitProCodec.Register.WORKOUT_MODE,
-                            FitProCodec.encodeWorkoutMode(FitProCodec.WorkoutMode.IDLE),
-                        ),
-                    )
+                add(
+                    FitProCodec.writeOf(
+                        FitProCodec.Register.WORKOUT_MODE,
+                        FitProCodec.encodeWorkoutMode(FitProCodec.WorkoutMode.IDLE),
+                    ),
+                )
+                if (session.supports(FitProCodec.Register.GRADE) != false) {
+                    add(FitProCodec.writeOf(FitProCodec.Register.GRADE, FitProCodec.encodeIncline(0.0)))
                 }
             }
         }
+    }
 
     /**
      * Attach to the machine, and report the console state — the direct path's whole handshake.
@@ -1334,11 +1692,19 @@ class DirectMachineCommands(private val session: DirectMachineSession) : Machine
     private inline fun write(
         label: String,
         vararg gate: FitProCodec.Register,
+        startGateExempt: Boolean = false,
         noinline build: (DirectMachineSession) -> List<FitProCodec.Write>,
-    ): MachineAck = session.authorisedWrite(label, gate.toList(), build)
+    ): MachineAck = session.authorisedWrite(label, gate.toList(), startGateExempt, build)
 
     private companion object {
         const val TAG = "DirectMachine"
+
+        /**
+         * How long to wait after `RESULTS` before [cleanUpWorkout]'s follow-up write. iFit's own
+         * constant (`FitnessConsoleBase`'s `Delay(TimeSpan.FromMilliseconds(200))`), not a value
+         * tuned here.
+         */
+        const val RESULTS_CLEANUP_DELAY_MS = 200L
 
         /**
          * What a new workout opens at, matching GlassOS measured on the real machine: the belt runs
