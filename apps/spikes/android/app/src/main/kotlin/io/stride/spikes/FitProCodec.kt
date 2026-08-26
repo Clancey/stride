@@ -846,10 +846,15 @@ object FitProCodec {
         val declared = bytes[1].toInt() and 0xFF
         if (declared < FRAME_OVERHEAD + 1 || declared > bytes.size) return null
 
-        // Reject a reply that is not the answer to the question we asked. FitPro carries no request
-        // id, so the address and command bytes are the only correlation available, and without this
-        // check a late reply to a previous frame — the one thing a shared wire guarantees will
-        // happen eventually — is indistinguishable from an acknowledgement of this one.
+        // Reject a reply that did not come from the device this session is talking to. This is peer
+        // validation, not request/reply correlation, and the difference is worth stating because the
+        // stronger claim was written here once: FitPro carries no request id, and two answers from
+        // the *same* console to two successive READ_WRITE_DATA frames carry an identical address
+        // byte and an identical command byte — so a late reply to an earlier frame is exactly what
+        // these bytes cannot separate. On a console that stamps every reply with its own address
+        // (see DirectMachineSession.replyAddress) that is every frame it sends. What this does buy
+        // is that another device on the same wire cannot answer for the console we handshook with,
+        // which is what licenses the write in DirectMachineSession.authorisedWrite.
         if (expectAddress != null && (bytes[0].toInt() and 0xFF) != (expectAddress and 0xFF)) return null
         if (expectCommand != null && Command.fromValue(bytes[2].toInt()) != expectCommand) return null
 
@@ -1041,7 +1046,15 @@ object FitProCodec {
      * no way to answer that question except by trying; now it can be asked.
      */
     data class DeviceInfo(
-        /** The address to use for every subsequent frame. */
+        /**
+         * The address byte this reply carried.
+         *
+         * Not necessarily the address to send to: [DirectMachineSession.handshake] overwrites this
+         * with the address it *asked*, matching GlassOS, and keeps the reply's own address in
+         * [DirectMachineSession.replyAddress] for validating what comes back. On a console that
+         * stamps its replies with its own bus address the two differ, and treating this field as an
+         * outgoing address would send every later frame to a device iFit never addresses.
+         */
         val address: Int,
         val softwareVersion: Int,
         val hardwareVersion: Int,
@@ -1086,9 +1099,22 @@ object FitProCodec {
      * correct costs nothing; the mask, which is not informational, is byte-for-byte identical.
      */
     fun parseDeviceInfo(bytes: ByteArray): DeviceInfo? {
-        if (bytes.size < 13) return null
+        // Checked before a single field is read, because this is the reply the session learns an
+        // address *from*: everything downstream validates its replies against what this one said,
+        // so a frame accepted here on nothing but its length decides who the peer is for the rest
+        // of the session. [replyMatches] is the check GlassOS runs over every frame — command byte,
+        // declared length, checksum, a non-zero address and the all-0xFF unwritten buffer. It costs
+        // nothing on the live path, where [DirectMachineSession.handshake] has already run it.
+        if (!replyMatches(bytes, Command.DEVICE_INFO)) return null
+        val declared = bytes[1].toInt() and 0xFF
+        if (declared < 13) return null
         val maskCount = bytes[12].toInt() and 0xFF
-        if (bytes.size < 13 + maskCount) return null
+        // Bounded by the frame the console declared, not by the array: a reply is zero-padded to the
+        // transport's packet size, so measuring against `bytes.size` lets a console that
+        // under-declares have its own checksum byte and that padding decoded as supported-field
+        // bits — inventing registers the machine never claimed, which is how a rider gets an incline
+        // control that writes into nothing.
+        if (13 + maskCount > declared - 1) return null
 
         val fields = HashSet<Int>()
         for (i in 0 until maskCount) {
@@ -1141,7 +1167,12 @@ object FitProCodec {
         if (bytes.size < FRAME_OVERHEAD) null else Status.fromValue(bytes[3].toInt() and 0xFF)
 
     /**
-     * Whether [reply] is a well-formed answer to [command] from [address].
+     * Whether [reply] is a well-formed answer to [command] — right shape, right command byte, sound
+     * checksum, and from *some* device rather than from an unwritten buffer.
+     *
+     * Note what it does not check: which device. The address byte is only required to be non-zero,
+     * for the reason spelled out below. Deciding that a reply came from the console this session
+     * handshook with is [parseResponse]'s `expectAddress` and [DirectMachineSession.replyAddress].
      *
      * Transcribed from `ai/b.a`, which GlassOS runs over **every** frame before anything reads a
      * status out of it. Stride was reading the status straight off byte 3 with no such check, and on

@@ -283,7 +283,7 @@ class FitProCodecTest {
             0x04, 0x00, // brand 4 = NORDIC_TRACK
             0x03, // three mask bytes
             0x03, 0x00, 0x03, // fields 0,1 and 16,17
-            0x4B, // checksum
+            0xD6, // checksum: 2+17+129+2+5+7+229+66+4+3+3+3 = 470, mod 256
         )
         val info = FitProCodec.parseDeviceInfo(reply)
         assertNotNull(info)
@@ -323,6 +323,11 @@ class FitProCodecTest {
                 0x03,
                 0x00,
             )
+            // Stamped rather than pinned, unlike every other frame in this file: the two bytes under
+            // test are arguments, so a hand-written checksum here would be three constants that say
+            // nothing about the version bytes. The checksum's own value is pinned in the framing
+            // tests above; `parseDeviceInfo` merely refuses a frame that fails it.
+            reply[reply.size - 1] = FitProCodec.checksum(reply, reply.size - 1)
             return requireNotNull(FitProCodec.parseDeviceInfo(reply))
         }
 
@@ -337,9 +342,65 @@ class FitProCodecTest {
         )
     }
 
+    /**
+     * A frame too short to hold a device record, rejected for its length rather than its content.
+     *
+     * The checksum is deliberately correct: `parseDeviceInfo` runs [FitProCodec.replyMatches] first
+     * now, so a fixture with a bad checksum would be thrown out before the length guard was ever
+     * reached — and that guard is what stands between a short frame and a read past the end of it.
+     * The BLE path can hand up a frame exactly as long as it declares (`stripFitPro2Envelope`
+     * returns `copyOfRange(4, 4 + declared)`), so this case is reachable.
+     */
     @Test
     fun parseDeviceInfoRejectsAShortReply() {
-        assertNull(FitProCodec.parseDeviceInfo(bytes(0x02, 0x06, 0x81, 0x02, 0x05, 0x07)))
+        // 2 + 6 + 0x81 + 2 + 5 = 0x90.
+        assertNull(FitProCodec.parseDeviceInfo(bytes(0x02, 0x06, 0x81, 0x02, 0x05, 0x90)))
+    }
+
+    /**
+     * `DEVICE_INFO` is the reply the session learns an address *from*, and every later reply is
+     * validated against what it said — so a frame accepted here decides who the peer is for the rest
+     * of the session. It is held to the same well-formedness rules GlassOS applies to every frame.
+     */
+    @Test
+    fun parseDeviceInfoRejectsAFrameThatIsNotADeviceInfoReply() {
+        /** A valid `DEVICE_INFO` reply, with [mutate] applied before the checksum is stamped. */
+        fun reply(mutate: (ByteArray) -> Unit = {}): ByteArray {
+            val out = bytes(
+                0x02, 0x0F, 0x81, 0x02,
+                0x53, 0x01, // software 83, hardware 1 — an X22i
+                0xE5, 0x42, 0x00, 0x00,
+                0x04, 0x00,
+                0x01, // one mask byte
+                0x03, // fields 0 and 1
+                0x00,
+            )
+            mutate(out)
+            out[out.size - 1] = FitProCodec.checksum(out, out.size - 1)
+            return out
+        }
+
+        assertNotNull("the fixture itself must parse", FitProCodec.parseDeviceInfo(reply()))
+
+        // Answering a different command. Without this, a stale SYSTEM_INFO reply left in the pipe
+        // decodes as a device record — including the address every later reply is checked against.
+        assertNull(
+            "a reply to another command is not a device record",
+            FitProCodec.parseDeviceInfo(reply { it[2] = FitProCodec.Command.SYSTEM_INFO.value.toByte() }),
+        )
+
+        // A corrupted frame, checksum stamped and then broken.
+        val corrupted = reply()
+        corrupted[corrupted.size - 1] = (corrupted[corrupted.size - 1] + 1).toByte()
+        assertNull("a frame that fails its own checksum proves nothing", FitProCodec.parseDeviceInfo(corrupted))
+
+        // A mask that runs past the length the console declared. Replies are zero-padded to the
+        // transport's packet size, so measuring the mask against the buffer instead of the declared
+        // frame turns the checksum byte and that padding into registers the machine never claimed.
+        assertNull(
+            "the mask cannot extend past the frame it was sent in",
+            FitProCodec.parseDeviceInfo(reply { it[12] = 0x04 } + ByteArray(8)),
+        )
     }
 
     /** A command with no body is still a full frame: header, no payload, checksum. */

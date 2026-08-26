@@ -16,6 +16,12 @@ package io.stride.spikes
  * table as the console this protocol was recovered from. A single read answers all three, and reads
  * cannot move the belt.
  *
+ * The peer question does not stop at "a device answered", which is why [confirm] takes the address
+ * the answer must come *from*. On a shared bus the console that introduced itself during the
+ * handshake and the device that answers this read need not be the same one, and this exchange is
+ * what licenses writing to whichever of them the session goes on to address — including the limits
+ * cached in [MachineLimits], which feed the clamp.
+ *
  * ## Why a read frame cannot accidentally be a write
  *
  * This was the real hazard while the framing was unknown, and it is worth recording why it is gone.
@@ -95,6 +101,13 @@ class FitProProbe {
     /**
      * Read [PROBE_READS] once and decide how far to trust the link.
      *
+     * [expectAddress] is the address the answer must come *from*, which is not always the [address]
+     * it is sent *to* — an X22i is asked at MAIN and answers as 5. It defaults to [address] because
+     * that is the only address a caller who has not handshaken yet can know; [DirectMachineSession]
+     * passes the address `DEVICE_INFO` actually replied from. Validating it here is what stops this
+     * probe — the one exchange that licenses writing at all — from being satisfied by a device that
+     * is not the one the session handshook with.
+     *
      * Blocking; call off the main thread. Never throws — a probe that threw would be a probe that
      * could take down the machine thread it is meant to protect.
      */
@@ -102,9 +115,10 @@ class FitProProbe {
         transport: FitProTransport,
         reference: Reference? = null,
         address: Int = FitProCodec.ADDRESS_MAIN,
+        expectAddress: Int = address,
         supports: ((FitProCodec.Register) -> Boolean?)? = null,
     ): Result {
-        val outcome = runCatching { attempt(transport, reference, address, supports) }
+        val outcome = runCatching { attempt(transport, reference, address, expectAddress, supports) }
             .getOrElse { Result(Stage.UNCONFIRMED, "check failed: ${it.message ?: it::class.java.simpleName}") }
         stage = outcome.stage
         detail = outcome.detail
@@ -116,6 +130,7 @@ class FitProProbe {
         transport: FitProTransport,
         reference: Reference?,
         address: Int,
+        expectAddress: Int,
         supports: ((FitProCodec.Register) -> Boolean?)?,
     ): Result {
         // Ask only for registers this console said it has. Values come back packed with nothing to
@@ -130,11 +145,42 @@ class FitProProbe {
         }
 
         val body = FitProCodec.readWriteBody(writes = emptyList(), reads = reads)
-        val reply = transport.exchange(FitProCodec.frame(body, address = address))
-            ?: return Result(Stage.UNCONFIRMED, "the machine didn't answer")
+        val frame = FitProCodec.frame(body, address = address)
 
-        val response = FitProCodec.parseResponse(reply, reads)
-            ?: return Result(Stage.UNCONFIRMED, "the reply wasn't a valid frame")
+        var answered: FitProCodec.Response? = null
+        var refusal = "the machine didn't answer"
+        // Two attempts, and only ever for one failure: a well-formed answer from a device other than
+        // the one this session handshook with. Nothing re-runs the probe once `connect` has
+        // succeeded — `DirectMachineCommands.connect` re-handshakes only when `deviceInfo` is null —
+        // so a single crossed frame on a shared wire would otherwise leave a console that is
+        // answering perfectly stuck at UNCONFIRMED for the life of the transport, refusing every
+        // write with no route back. Retrying is free of consequence because the frame is a pure read
+        // (see the class note on why a read frame cannot be a write), and a second reply from the
+        // wrong device is no longer a coincidence, so the probe still fails closed.
+        for (round in 1..PROBE_ATTEMPTS) {
+            val reply = transport.exchange(frame)
+            if (reply == null) {
+                refusal = "the machine didn't answer"
+                break
+            }
+            val parsed = FitProCodec.parseResponse(reply, reads, expectAddress = expectAddress)
+            if (parsed != null) {
+                answered = parsed
+                break
+            }
+            // Parsing again without the address check is what tells the two failures apart: a frame
+            // that parses only this way is a sound reply from the wrong device, and anything else is
+            // a broken frame. Worth the second parse because these call for opposite responses from
+            // a rider — one is another device on the bus, the other is a bad link — and
+            // `parseResponse` returns the same null for both.
+            val from = FitProCodec.parseResponse(reply, reads)?.address
+            if (from == null) {
+                refusal = "the reply wasn't a valid frame"
+                break
+            }
+            refusal = "another device answered (address $from, not $expectAddress)"
+        }
+        val response = answered ?: return Result(Stage.UNCONFIRMED, refusal)
 
         if (response.status != FitProCodec.Status.DONE) {
             return Result(Stage.UNCONFIRMED, "the machine answered ${response.status.name.lowercase().replace('_', ' ')}")
@@ -251,6 +297,16 @@ class FitProProbe {
         )
 
         const val KPH_PER_MPH = 1.609344
+
+        /**
+         * How many times one [confirm] will read before giving up.
+         *
+         * Two, and the second is spent only on a reply from an unexpected device — see [attempt].
+         * Higher would be a console-shaped denial of service against a rider waiting to connect;
+         * one is what leaves a good console permanently unable to write after a single crossed
+         * frame, because nothing re-runs the probe while the handshake still stands.
+         */
+        private const val PROBE_ATTEMPTS = 2
 
         private val PLAUSIBLE_MAX_KPH = 4.0..40.0
         private val PLAUSIBLE_MAX_GRADE = 0.5..60.0
