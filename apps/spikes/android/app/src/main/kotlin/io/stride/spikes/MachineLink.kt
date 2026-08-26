@@ -148,6 +148,16 @@ object MachineLink {
     private const val EMPTY_PRESET_RETRY_MS = 10_000L
 
     /**
+     * How long a freshly opened link may report "no treadmill" before it counts as a fault.
+     *
+     * Measured on a Commercial 1750 from cold: `Connect` sat out the full 12-second command timeout
+     * three times before the console attached, about 40 seconds after Stride started. Two minutes is
+     * comfortably past that without being so long that a genuinely detached console goes unreported
+     * — and the window closes early anyway, the instant the console attaches for the first time.
+     */
+    private const val CONSOLE_BOOT_GRACE_MS = 120_000L
+
+    /**
      * How often the poll retries a heart rate strap that is enabled but not connected.
      *
      * Longer than [REOPEN_INTERVAL_MS] because the failure is far more likely to be permanent — most
@@ -167,12 +177,38 @@ object MachineLink {
     private const val REDETECT_INTERVAL_MS = 5_000L
 
     /**
+     * What a control says while the console is still on its way up.
+     *
+     * A booting console reports [GlassOsClient.ConsoleState.DISCONNECTED] for the same reason a
+     * broken one does — the head unit has not attached the lower board yet — and on this hardware
+     * that lasts the best part of a minute, with each `Connect` sitting out the full 12-second
+     * command timeout before the machine finally answers. Showing
+     * [CONSOLE_DETACHED_NOTICE] through that window tells a rider their treadmill is broken and
+     * sends them to the wall socket, every single time the console is switched on.
+     *
+     * Deliberately still a warning rather than a reassurance. Stride genuinely cannot read the belt
+     * here, so the safety line has to keep saying so; what changes is that it names a cause that
+     * resolves on its own instead of one that needs the mains pulled.
+     */
+    const val CONSOLE_STARTING_NOTICE: String =
+        "The treadmill is still starting up. Stride can't read it yet, and the belt may be moving."
+
+    /** The same, in the longer form the settings screen shows. */
+    const val CONSOLE_STARTING_REASON: String =
+        "The console is still starting up and hasn't attached its treadmill yet. This takes about a " +
+            "minute from cold, and speed and incline come back on their own — there is nothing to fix."
+
+    /**
      * What a control says when GlassOS is answering but has no machine attached to it.
      *
      * Its own state, not a guess: the console reports [GlassOsClient.ConsoleState.DISCONNECTED]
      * and every RPC that would move something blocks until it times out. Distinct from
      * [CONTROL_LOCKED_NOTICE] because the fix is different — nothing about Stride or the app will
      * recover this, only the machine coming back will.
+     *
+     * Only said once the console has had time to start, and only when it has never attached — see
+     * [consoleStarting]. Said too early it is simply wrong, and safety copy that is wrong in the
+     * ordinary case is not believed in the case that matters.
      */
     const val CONSOLE_DETACHED_NOTICE: String =
         "The console has lost its connection to the treadmill. Nothing can reach the belt until " +
@@ -197,6 +233,7 @@ object MachineLink {
      */
     val metricsNotice: String
         get() = when {
+            consoleStarting -> CONSOLE_STARTING_NOTICE
             consoleDetached -> CONSOLE_DETACHED_NOTICE
             status == Status.LINKED -> SAFETY_KEY_NOTICE
             else -> CANNOT_READ_NOTICE
@@ -260,6 +297,17 @@ object MachineLink {
     @Volatile private var connectFailures: Int = 0
     @Volatile private var nextConnectAt: Long = 0L
     @Volatile private var lastAttachedAt: Long = 0L
+
+    /**
+     * When this link was opened, and whether the console has ever attached across it.
+     *
+     * The pair is what [consoleStarting] is built from: a console that has never attached and was
+     * only asked a moment ago is starting up, and one that has attached even once is not. Both are
+     * reset by [closeTransport], because a new transport is a new question.
+     */
+    @Volatile private var linkOpenedAt: Long = 0L
+
+    @Volatile private var everAttached: Boolean = false
 
     /**
      * Whether a handshake is already queued or running.
@@ -392,6 +440,26 @@ object MachineLink {
         get() = fresh()?.consoleState == GlassOsClient.ConsoleState.DISCONNECTED_NAME
 
     /**
+     * True when the console says it has no treadmill, but has not yet had time to find one.
+     *
+     * A booting console and a broken one report the same thing, and telling them apart is the whole
+     * point: one resolves itself in about a minute, the other needs the mains pulled. The evidence
+     * used is deliberately narrow — a link that has **never** seen the console attached, within
+     * [CONSOLE_BOOT_GRACE_MS] of that link opening.
+     *
+     * "Never attached" is what keeps this honest. The moment the console attaches once, the grace is
+     * spent for good ([everAttached] is never cleared while the link lives), so a treadmill that
+     * genuinely drops out mid-session gets the real warning immediately rather than a minute of
+     * reassurance. And after the window, an unattached console gets the real warning too.
+     */
+    val consoleStarting: Boolean
+        get() {
+            if (!consoleDetached || everAttached) return false
+            val opened = linkOpenedAt
+            return opened != 0L && SystemClock.elapsedRealtime() - opened < CONSOLE_BOOT_GRACE_MS
+        }
+
+    /**
      * Why we are in this state, in words a person on the machine can act on — not an error code.
      * This used to lead with what Stride would *not* do, which was the honest thing to say when
      * nothing here could move a belt. Stride drives the machine now, so saying otherwise would
@@ -399,6 +467,7 @@ object MachineLink {
      */
     val reason: String
         get() = when {
+            consoleStarting -> CONSOLE_STARTING_REASON
             consoleDetached -> CONSOLE_DETACHED_REASON
             status == Status.LINKED ->
                 "Stride is linked to this machine. " +
@@ -556,6 +625,10 @@ object MachineLink {
         // Opening the transport is blocking I/O — USB enumeration, a BLE connect, and a multi-frame
         // handshake — so it happens on the link thread rather than on whoever called attach.
         h.post {
+            // Stamped before the open, not after: the point of reference is when Stride started
+            // asking, and on a cold console the open itself is part of the wait.
+            linkOpenedAt = SystemClock.elapsedRealtime()
+            everAttached = false
             openTransport(app)
             armReopen()
         }
@@ -975,6 +1048,9 @@ object MachineLink {
             connectFailures = 0
             nextConnectAt = 0L
             lastAttachedAt = 0L
+            // A new transport is a new question: it has not attached yet, and its grace starts now.
+            everAttached = false
+            linkOpenedAt = SystemClock.elapsedRealtime()
             // Any handshake still in flight belongs to a link that no longer exists. Clearing
             // the flag here rather than waiting for it to finish means a re-attach is never
             // blocked by the tail of the previous one.
@@ -1107,6 +1183,10 @@ object MachineLink {
         }
         if (result is ConnectResult.Attached) {
             lastAttachedAt = done
+            // Latched for the life of the link. Once a console has attached even once, a later
+            // DISCONNECTED is a real fault rather than a slow start, and must be reported as one
+            // immediately instead of being excused for another minute.
+            everAttached = true
             connectFailures = 0
             nextConnectAt = 0L
         } else {
@@ -1424,6 +1504,7 @@ object MachineLink {
         val detail = machineDetail
         if (!canCommand() && detail != null) return detail
         return when {
+            consoleStarting -> CONSOLE_STARTING_NOTICE
             consoleDetached -> CONSOLE_DETACHED_NOTICE
             canCommand() -> CONTROL_NEEDS_WORKOUT_NOTICE
             else -> CONTROL_LOCKED_NOTICE
