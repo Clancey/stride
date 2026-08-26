@@ -274,6 +274,23 @@ its parser builds the device record from the address it *asked* (`this.f16654a`)
 reader then takes its address from that same record (`vh/f`'s `super(bVar.f18899a)`). A hardcoded
 treadmill address would be talking to a device iFit never talks to.
 
+**That covers outgoing frames only, and confusing it with reply validation was a real bug on real
+hardware.** `parseResponse`'s `expectAddress` check requires an *incoming* reply's own address byte
+to equal the address the request was sent to — a guard against a late reply from an earlier frame
+being mistaken for this one's answer. On a NordicTrack X22i (FitPro1, software 83), every reply
+observed — `DEVICE_INFO`, `SYSTEM_INFO`, `VERSION_INFO`, and every register read/write — came back
+stamped with the console's own bus address (**5**) instead of the address asked (MAIN/2). GlassOS-era
+hardware apparently echoes the address it was asked, closely enough that this was never seen to
+fail; this console does not. Because `expectAddress` used the *outgoing* address for both directions,
+every read and write after the handshake was silently rejected as a malformed/unanswering reply,
+producing an unbreakable reconnect loop that looked identical to "no console attached."
+
+Fixed by keeping the reply's own address from `DEVICE_INFO`'s un-overridden parse in a separate
+`DirectMachineSession.replyAddress`, and validating subsequent replies against that instead of the
+outgoing address. Outgoing frames are unaffected — they still go to MAIN, matching the paragraph
+above. Confirmed live on that same X22i: the handshake now completes and `MachineLink` holds a
+stable `Attached` connection with live telemetry, where it previously looped `NoAnswer` forever.
+
 ## Register map — VERIFIED (`sh/a.java:145`)
 
 **The ordinal is not the field id** past `ACTUAL_INCLINE`, and the trailing `4`/`8`/`12` in the
@@ -443,11 +460,14 @@ that look alike" above rather than here, because the trap is that it looks wrong
 
 ## What is still open
 
-- **None of this has been run against real hardware.** The remaining step is a sanity readback, not
-  a search — the format is recovered, not guessed.
+- **Now run against real hardware — a NordicTrack X22i (FitPro1, software 83, hardware 1).**
+  `DEVICE_INFO`, `SYSTEM_INFO`, `VERSION_INFO`, `SUPPORTED_COMMANDS`, `VERIFY_SECURITY`, and every
+  register read confirmed working end to end after the addressing fix above. The remaining open item
+  is starting a workout — see below.
 - Distance and elapsed-time units are inferred (above).
-- `SUPPORTED_DEVICES` is requested during the handshake but the reply is not checked, so there is no
-  model or device-type allowlist before commands are bound.
+- `SUPPORTED_DEVICES` is never requested — `connect` sends `SUPPORTED_COMMANDS` and then only
+  `SYSTEM_INFO`, `VERSION_INFO` and `SERIAL_NUMBER`, and `parseSupportedDevices` has no callers — so
+  there is no model or device-type allowlist before commands are bound.
 - **Whether GlassOS's `StartNewWorkout` moves the belt by itself.** It does — measured on the real
   machine, it drove the console `IDLE → WARM_UP → WORKOUT` and started the belt at **1.0 mph** with
   no speed command sent by Stride, on a flat deck. `DirectMachineCommands.startWorkout` now
@@ -461,6 +481,33 @@ that look alike" above rather than here, because the trap is that it looks wrong
   it was measured on (17125) reports a 1.0 mph minimum, so one observation fits both readings. The
   implementation coerces 1 mph into the reported range, which agrees with both wherever they agree
   and sends an acceptable speed on a machine whose floor is higher.
+
+  **On the X22i, `WORKOUT_MODE = RUNNING` is refused outright — `FAILED` (status 4), not
+  `SECURITY_BLOCK`.** The console is genuinely answering, not silent: `DEVICE_INFO` and `VERIFY_SECURITY`
+  succeed on the same connection, security key was attached, and `MachineLink` shows a stable `Attached`
+  connection at the time of the attempt. Four candidate causes were tested live and each was ruled out
+  by an *identical* `FAILED` reply — worth recording so nobody re-tests them:
+
+  1. **Combined write.** `KPH` + `GRADE` + `WORKOUT_MODE` sent together in one frame, against the
+     reasoning two paragraphs up — same refusal as mode alone.
+  2. **An explicit session command.** `Command.CONNECT` (4) sent once after the handshake, on the
+     theory that FitPro1 needs a step FitPro2/GlassOS's own client never sends (see "Command types"
+     above — `CONNECT`/`DISCONNECT` are dead code in GlassOS). The console does not answer it at all —
+     a timeout, not a refusal — so this console doesn't implement it either.
+  3. **`WARM_UP` instead of `RUNNING`.** On the theory that FitPro1 wants the `IDLE → WARM_UP →
+     WORKOUT` progression GlassOS observes automatically driven explicitly by the caller. Refused
+     identically — never even reached the follow-up `RUNNING` write.
+  4. **A stale security grant.** `authorisedWrite` only re-unlocks on an explicit `SECURITY_BLOCK`
+     reply, so a security-related refusal reported as generic `FAILED` on this console generation
+     would never trigger it. Forced a fully fresh `DEVICE_INFO` + `VERIFY_SECURITY` handshake
+     immediately before the mode write — same refusal.
+
+  That every attempt produces the same clean, immediate `FAILED` — never a crash, never a different
+  status, never silence — rules out a framing bug, points at a real firmware-side precondition this
+  protocol surface doesn't expose, and is not something visible from GlassOS's decompiled behaviour
+  (GlassOS is FitPro2-only). The belt never moved in any of the four attempts. Needs either FitPro1's
+  own `Sindarin.FitPro1` implementation (Xamarin IL, not available to this investigation) or a
+  `usbmon`/hardware capture of iFit actually starting a workout on this console generation.
 - The preset **ladder step** (1.0) is invented. No preset register exists in FitPro, so the direct
   path must synthesise the quick picks; the endpoints come from the machine's own MIN/MAX registers,
   but nothing corroborates the spacing between them.

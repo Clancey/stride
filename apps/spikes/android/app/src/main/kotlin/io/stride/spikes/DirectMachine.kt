@@ -74,6 +74,25 @@ class DirectMachineSession(
         private set
 
     /**
+     * The address this console's own replies are actually stamped with, learned from `DEVICE_INFO`'s
+     * reply rather than assumed to equal [address].
+     *
+     * [handshake] deliberately keeps [address] pinned to the address asked, matching GlassOS
+     * (see [address]'s note) — outgoing frames are unaffected by this field. But [parseResponse]
+     * also checks that *incoming* replies carry the address they were sent to, as a guard against a
+     * late reply from an earlier frame being mistaken for the answer to this one. GlassOS-era
+     * hardware happens to echo the address it was asked, so that check was never seen to fail. This
+     * X22i (FitPro1, not GlassOS) does not: every reply observed on real hardware — DEVICE_INFO,
+     * SYSTEM_INFO, VERSION_INFO, and register reads alike — comes back stamped with the console's
+     * own bus address instead (5, when asked at [FitProCodec.ADDRESS_MAIN]/2), which made every
+     * read and write after the handshake look like a silent, unanswering machine. Null until
+     * `DEVICE_INFO` has answered once.
+     */
+    @Volatile
+    var replyAddress: Int? = null
+        private set
+
+    /**
      * Which register this console's fan actually answers on, once we've found out.
      *
      * `ai/c.java` binds GlassOS's `FAN_STATE` metric to field **98**, while field 8 (`FAN_SPEED`)
@@ -215,7 +234,7 @@ class DirectMachineSession(
     ): FitProCodec.Response? = synchronized(wire) {
         val body = FitProCodec.readWriteBody(writes, reads)
         val reply = transport.exchange(FitProCodec.frame(body, address = address)) ?: return null
-        FitProCodec.parseResponse(reply, reads, expectAddress = address)
+        FitProCodec.parseResponse(reply, reads, expectAddress = replyAddress ?: address)
     }
 
     /**
@@ -264,7 +283,7 @@ class DirectMachineSession(
                 return MachineAck.NoAnswer("$label failed: ${t.message}")
             } ?: return MachineAck.NoAnswer("the machine didn't answer the $label command")
 
-            val response = FitProCodec.parseResponse(reply, emptyList(), expectAddress = address)
+            val response = FitProCodec.parseResponse(reply, emptyList(), expectAddress = replyAddress ?: address)
                 ?: return MachineAck.NoAnswer("the $label reply was malformed")
 
             // Telemetry tolerates a bad checksum because GlassOS does and a wrong number is visibly
@@ -311,6 +330,7 @@ class DirectMachineSession(
     fun connect(reference: FitProProbe.Reference? = null): ConnectResult = synchronized(wire) {
         lastConnect = null
         deviceInfo = null
+        replyAddress = null
         supportedCommands = emptySet()
         fanRegister = null
         probe.reset()
@@ -415,8 +435,12 @@ class DirectMachineSession(
                 Log.i(TAG, "address $candidate answered ${FitProCodec.statusOf(reply)} to DEVICE_INFO")
                 continue
             }
-            // The address we asked, not the one in the reply: see [address].
-            val info = FitProCodec.parseDeviceInfo(reply)?.copy(address = candidate) ?: continue
+            val parsed = FitProCodec.parseDeviceInfo(reply) ?: continue
+            // The address we asked, not the one in the reply, for outgoing frames: see [address].
+            // The reply's own address is kept separately, in [replyAddress], for validating the
+            // replies that come back to those frames: see its note for why the two can differ.
+            replyAddress = parsed.address
+            val info = parsed.copy(address = candidate)
             Log.i(
                 TAG,
                 "device at $candidate: ${info.brand} serial ${info.serialNumber} " +
@@ -518,6 +542,7 @@ class DirectMachineSession(
             supportedCommands = emptySet()
             fanRegister = null
             address = FitProCodec.ADDRESS_MAIN
+            replyAddress = null
             forgetSecurity()
         }
     }
@@ -530,6 +555,7 @@ class DirectMachineSession(
             supportedCommands = emptySet()
             fanRegister = null
             address = FitProCodec.ADDRESS_MAIN
+            replyAddress = null
             forgetSecurity()
             runCatching { transport.close() }
                 .onFailure { Log.w(TAG, "closing direct transport failed", it) }
