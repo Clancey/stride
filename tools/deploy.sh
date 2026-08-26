@@ -12,7 +12,9 @@
 #
 # The wireless-debugging port changes on every reboot, so there is no address worth hardcoding.
 # With no argument this uses the console already connected to adb, and failing that asks the
-# network for one -- wireless debugging advertises itself over mDNS as _adb-tls-connect._tcp.
+# network for one. Two adb services are advertised -- classic _adb._tcp and the pairing endpoint
+# _adb-tls-connect._tcp -- and either can be advertised while refusing connections, so console.sh
+# tries both and confirms one actually attached before handing back an address.
 
 set -euo pipefail
 

@@ -100,6 +100,7 @@ for bad, why in [
     ('github.com/Clancey/stride/', 'link to the private source repo'),
     ('SIGNING.md',                 'file that does not exist in the public repo'),
     ('deploy.sh',                  'tooling that does not exist in the public repo'),
+    ('console.sh',                 'tooling that does not exist in the public repo'),
     ('keystore.sh',                'release keystore tooling'),
     ('192.168.',                   'a development machine address'),
 ]:

@@ -95,6 +95,16 @@ Two things to know before relying on it:
   needs a dialog on the console — exactly the lockout this is meant to prevent.
 - **It is a fixed, always-open ADB port on your LAN**, authenticated only by that key. Fine for a
   treadmill on a home network; think about it before doing it on a shared one.
+- **The console now advertises two adb services over mDNS, and one of them lies.** With
+  `persist.adb.tcp.port` set you get `_adb._tcp` on 5555 *and* `_adb-tls-connect._tcp` on the
+  rotating pairing port. Observed on a GlassOS console (`EwayMediatekXenon1`): the
+  `_adb-tls-connect` record was still being published, and `dns-sd -L` resolved it happily, while
+  every connection to that port was refused — 5555 worked the whole time. So if discovery hands you
+  a port that refuses, do not conclude the console is unreachable: browse `_adb._tcp` as well, and
+  try 5555 directly. Prefer the classic service when both answer, because its port is pinned and so
+  survives the next daemon restart. Confirm with `adb devices` rather than `adb connect`'s exit
+  status — `connect` can report success for a host that accepts the TCP connection and then fails
+  the adb handshake.
 
 Set a static DHCP lease at the same time. A fixed port on a moving IP is only half an answer.
 
