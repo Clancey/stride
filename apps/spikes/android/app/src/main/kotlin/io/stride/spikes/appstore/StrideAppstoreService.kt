@@ -68,7 +68,7 @@ class StrideAppstoreService : Service() {
      * When a workout ends, anything parked by the safety gate becomes installable. Without this the
      * rider would have to notice and retry by hand, which in practice means the update never lands.
      */
-    private val workoutListener: (WorkoutSession.State) -> Unit = { state ->
+    private val workoutListener = WorkoutSession.Listener { state, _ ->
         if (state == WorkoutSession.State.IDLE) {
             worker.execute { runCatching { installHeldItems() } }
         }

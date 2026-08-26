@@ -17,7 +17,7 @@ object WorkoutMediaCoupling {
     private var attached = false
 
     private var lastState = WorkoutSession.state
-    private var listener: ((WorkoutSession.State) -> Unit)? = null
+    private var listener: WorkoutSession.Listener? = null
     private var loggedListenerUnavailable = false
 
     @Synchronized
@@ -25,7 +25,7 @@ object WorkoutMediaCoupling {
         if (attached) return
         val appContext = context.applicationContext
         lastState = WorkoutSession.state
-        val stateListener: (WorkoutSession.State) -> Unit = { next ->
+        val stateListener = WorkoutSession.Listener { next, _ ->
             onWorkoutTransition(appContext, next)
         }
         listener = stateListener

@@ -217,6 +217,25 @@ object WorkoutMachineCoupling {
     }
 
     /**
+     * Leave the machine in a known-safe state, at the moment a workout is definitively over.
+     *
+     * The counterpart to [restoreFan], and it exists because there was not one: Stride turned the
+     * fan on at the start of every workout and never turned it off, so a console left alone after a
+     * run kept blowing indefinitely (issue #29).
+     *
+     * Called **after** [MachineCoordinator.stop], never instead of it and never before it. The stop
+     * empties the queue and takes the front of it; these only ever append, so they cannot delay,
+     * reorder ahead of, or queue in front of the one command that stops a belt.
+     *
+     * Zero first, fan second. If the stop frame was lost, the re-assert is what actually stops the
+     * treadmill, and the fan is a comfort control that can wait behind it.
+     */
+    private fun settleAfterEnd() {
+        MachineCoordinator.reassertZero()
+        MachineCoordinator.stopFan()
+    }
+
+    /**
      * What to do once the machine has answered a start.
      *
      * Stride's clock used to start regardless of the answer. On a console that had lost its link to
@@ -241,8 +260,14 @@ object WorkoutMachineCoupling {
                 clearWatchdog(token)
                 // The belt is moving, so this is the instant the workout began. Everything
                 // downstream — the clock, the goal, the media coupling — hangs off this transition.
-                WorkoutSession.confirmStart()
-                restoreFan()
+                //
+                // Gated on the transition actually happening, not merely on having decided to make
+                // it. The decision above was taken against a sample of the session state, and the
+                // rider can abandon in the window between: confirmStart then no-ops, and restoring
+                // the fan anyway would turn it on *behind* the stop that abandon just sent — a
+                // console blowing away over a workout that never happened, which is the same
+                // complaint issue #29 opened with, reached from the other end.
+                if (WorkoutSession.confirmStart()) restoreFan()
             }
 
             StartSettlement.ABANDON -> {
@@ -298,7 +323,7 @@ object WorkoutMachineCoupling {
         OverlayService.reportStartRefused("The treadmill did not answer.")
     }
 
-    private fun onTransition(next: WorkoutSession.State) {
+    private fun onTransition(next: WorkoutSession.State, ending: WorkoutSession.Ending?) {
         val previous = synchronized(this) {
             val state = lastState
             lastState = next
@@ -314,36 +339,23 @@ object WorkoutMachineCoupling {
         // belt that might be moving is always told to stop.
         if (adopting.get() && next != WorkoutSession.State.IDLE) return
         try {
-            when {
-                // Stop first and unconditionally. If the rider ends a workout we do not care what
-                // state we thought we were in; the belt must be told to stop. This covers an
-                // abandoned start too: a refusal can be a reply that was lost rather than a command
-                // that never landed, so a belt that might be moving still gets told to stop.
-                next == WorkoutSession.State.IDLE && previous != WorkoutSession.State.IDLE -> {
-                    // Retire the attempt before anything else. Any answer still in flight belongs
-                    // to a start the rider has left behind, and the token is what tells the two
-                    // apart — without this bump a slow reply could land after a retry had begun and
-                    // be mistaken for that newer attempt's answer.
-                    val retired = synchronized(this) {
-                        ++startToken
-                        pendingWatchdog.also { pendingWatchdog = null }
-                    }
-                    retired?.let { watchdog.removeCallbacks(it) }
-                    MachineCoordinator.stop()
+            when (endFollowUp(previous, next, ending)) {
+                // Not an end. The session is still alive, so this is a start, a pause or a resume —
+                // and in particular a pause gets its pause command and nothing else.
+                EndFollowUp.NOTHING -> onLiveTransition(previous, next)
+
+                // Stop, and only stop. An abandoned start still gets this unconditionally: a
+                // refusal can be a reply that was lost rather than a command that never landed, so
+                // a belt that might be moving is always told to stop.
+                EndFollowUp.STOP -> stopOnMachine()
+
+                EndFollowUp.STOP_AND_SETTLE -> {
+                    // In this order, always. The stop preempts the queue; the settling writes only
+                    // append to it. Calling them the other way round would put a fan write in front
+                    // of the command that stops a treadmill.
+                    stopOnMachine()
+                    settleAfterEnd()
                 }
-
-                previous == WorkoutSession.State.IDLE &&
-                    next == WorkoutSession.State.STARTING -> {
-                    val token = synchronized(this) { ++startToken }
-                    armWatchdog(token)
-                    MachineCoordinator.startWorkout { outcome -> onStartSettled(token, outcome) }
-                }
-
-                previous == WorkoutSession.State.RUNNING && next == WorkoutSession.State.PAUSED ->
-                    MachineCoordinator.pause()
-
-                previous == WorkoutSession.State.PAUSED && next == WorkoutSession.State.RUNNING ->
-                    MachineCoordinator.resume()
             }
         } catch (t: Throwable) {
             // A failure to command must never take down the timer or the overlay. The rider still
@@ -351,6 +363,99 @@ object WorkoutMachineCoupling {
             Log.w(TAG, "Machine coupling skipped after a workout state change.", t)
         }
     }
+
+    /**
+     * Tell the belt to stop, and retire any start still waiting to be answered.
+     *
+     * Unconditional for every ending. If the rider is leaving we do not care what state we thought
+     * we were in; the belt must be told to stop.
+     */
+    private fun stopOnMachine() {
+        // Retire the attempt before anything else. Any answer still in flight belongs to a start
+        // the rider has left behind, and the token is what tells the two apart — without this bump
+        // a slow reply could land after a retry had begun and be mistaken for that newer attempt's
+        // answer.
+        val retired = synchronized(this) {
+            ++startToken
+            pendingWatchdog.also { pendingWatchdog = null }
+        }
+        retired?.let { watchdog.removeCallbacks(it) }
+        MachineCoordinator.stop()
+    }
+
+    /** The transitions that happen while a session is still alive. */
+    private fun onLiveTransition(previous: WorkoutSession.State, next: WorkoutSession.State) {
+        when {
+            previous == WorkoutSession.State.IDLE &&
+                next == WorkoutSession.State.STARTING -> {
+                val token = synchronized(this) { ++startToken }
+                armWatchdog(token)
+                MachineCoordinator.startWorkout { outcome -> onStartSettled(token, outcome) }
+            }
+
+            previous == WorkoutSession.State.RUNNING && next == WorkoutSession.State.PAUSED ->
+                MachineCoordinator.pause()
+
+            previous == WorkoutSession.State.PAUSED && next == WorkoutSession.State.RUNNING ->
+                MachineCoordinator.resume()
+        }
+    }
+}
+
+/** What a transition into IDLE asks of the machine. */
+internal enum class EndFollowUp {
+    /** Not an end. Includes a pause, which is resumable and must be left alone. */
+    NOTHING,
+
+    /** Tell the belt to stop, and nothing more. */
+    STOP,
+
+    /** Tell the belt to stop, then put the machine back into a known-safe state. */
+    STOP_AND_SETTLE,
+}
+
+/**
+ * Decide what a transition owes the machine, and in particular whether a workout has *ended*.
+ *
+ * Pulled out as a pure function for the same reason [startSettlement] and [consoleFollowUp] are:
+ * this one decides whether Stride shuts a rider's fan down and moves their deck, and every branch
+ * of it has to be checkable without a treadmill.
+ *
+ * ## The distinction this exists to make
+ *
+ * Three different things used to arrive here as the same transition, and only one of them is an
+ * end:
+ *
+ * - **A pause** is [WorkoutSession.State.PAUSED]. It is resumable — the rider stepped off, the belt
+ *   is expected to move again, and the console's own Stop button is adopted as one too
+ *   ([observeConsole]). Shutting the fan down or flattening the deck here would be Stride deciding
+ *   their session is over on their behalf. It gets [NOTHING] from this function; the existing pause
+ *   command is issued elsewhere.
+ * - **An abandoned start** is [WorkoutSession.Ending.ABANDONED]: a start the machine refused, the
+ *   rider cancelled, or the watchdog gave up on. It gets [STOP] — exactly what it got before — and
+ *   deliberately no more. It is the retry path (`retryStart`), `WorkoutSession.abandon` keeps the
+ *   goal precisely because it is "not a workout they completed", and the settling writes cost round
+ *   trips on the one path where a rider is standing on a belt waiting to be told whether their
+ *   start worked. Nothing established the belt ever moved, so there is no known-safe state to
+ *   return the deck to.
+ * - **An ended workout** is [WorkoutSession.Ending.ENDED]: the rider pressed End. That is a
+ *   deliberate, final, non-resumable action, and it is the one that gets [STOP_AND_SETTLE].
+ *
+ * A transition that is already IDLE asks for nothing: `WorkoutSession.stop` and `abandon` both
+ * no-op from IDLE and never reach a listener, so this is belt and braces against a duplicate.
+ */
+internal fun endFollowUp(
+    previous: WorkoutSession.State,
+    next: WorkoutSession.State,
+    ending: WorkoutSession.Ending?,
+): EndFollowUp = when {
+    next != WorkoutSession.State.IDLE -> EndFollowUp.NOTHING
+    previous == WorkoutSession.State.IDLE -> EndFollowUp.NOTHING
+    ending == WorkoutSession.Ending.ENDED -> EndFollowUp.STOP_AND_SETTLE
+    // Abandoned, or a null this build did not expect. Both get the stop and nothing more: an
+    // unrecognised ending is not a licence to start moving a deck, but a belt that might be moving
+    // is always told to stop.
+    else -> EndFollowUp.STOP
 }
 
 /** What to do with a start the machine has answered. */

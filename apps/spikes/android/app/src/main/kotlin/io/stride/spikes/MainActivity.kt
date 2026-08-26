@@ -67,7 +67,7 @@ class MainActivity : FlutterActivity() {
 
     private val mainHandler = Handler(Looper.getMainLooper())
     private var channel: MethodChannel? = null
-    private var workoutStateListener: ((WorkoutSession.State) -> Unit)? = null
+    private var workoutStateListener: WorkoutSession.Listener? = null
 
     override fun configureFlutterEngine(flutterEngine: FlutterEngine) {
         super.configureFlutterEngine(flutterEngine)
@@ -187,7 +187,7 @@ class MainActivity : FlutterActivity() {
 
     private fun registerWorkoutStateListener(activeChannel: MethodChannel) {
         removeWorkoutStateListener()
-        val listener: (WorkoutSession.State) -> Unit = { state ->
+        val listener = WorkoutSession.Listener { state, _ ->
             mainHandler.post {
                 if (channel === activeChannel) {
                     activeChannel.invokeMethod("onWorkoutStateChanged", state.channelName())

@@ -1,6 +1,7 @@
 package io.stride.spikes
 
 import android.os.SystemClock
+import android.util.Log
 
 /**
  * The workout state Stride genuinely owns, as opposed to [MachineLink], which owns what the machine
@@ -27,6 +28,8 @@ import android.os.SystemClock
  */
 object WorkoutSession {
 
+    private const val TAG = "WorkoutSession"
+
     /**
      * IDLE → STARTING → RUNNING ⇄ PAUSED → IDLE.
      *
@@ -41,7 +44,41 @@ object WorkoutSession {
      */
     enum class State { IDLE, STARTING, RUNNING, PAUSED }
 
-    private val listeners = mutableListOf<(State) -> Unit>()
+    /**
+     * Why a session returned to [State.IDLE].
+     *
+     * The state machine used to collapse these two, and that was the gap behind issue #29: a
+     * treadmill needs to tell "the rider is done" from "the machine never started", and both land
+     * in IDLE. [State] alone cannot express the difference, so anything that wants to act on a
+     * *definitive* end — shutting the fan off, re-asserting zero — had no way to ask.
+     *
+     * Note what is deliberately absent: a pause. A pause is [State.PAUSED], it is resumable, and it
+     * must never be mistaken for either of these. Keeping the resumable case out of this enum
+     * entirely is what makes that mistake unrepresentable rather than merely unlikely.
+     */
+    enum class Ending {
+        /** [stop]: the rider ended a workout. Not resumable, and the goal is cleared. */
+        ENDED,
+
+        /** [abandon]: a start that never began. The rider is expected to try again. */
+        ABANDONED,
+    }
+
+    /**
+     * Notified on every transition, synchronously, on the thread that made it.
+     *
+     * [ending] is non-null only on a transition into [State.IDLE], and it is passed as an argument
+     * rather than read back off this object on purpose. A listener is free to make its own
+     * transition while it is being notified, and a shared field would then be overwritten under the
+     * listeners that had not run yet — which on this path means the machine coupling reading
+     * "abandoned" for a workout the rider ended, and silently skipping the end-of-workout writes.
+     * An argument cannot be clobbered by anybody.
+     */
+    fun interface Listener {
+        fun onTransition(next: State, ending: Ending?)
+    }
+
+    private val listeners = mutableListOf<Listener>()
 
     @Volatile
     var state: State = State.IDLE
@@ -80,12 +117,19 @@ object WorkoutSession {
      * Separate from [start] so the gap between asking and being answered belongs to nobody: it is
      * not exercise, and it is not paused time either. A console that takes a moment to spin up
      * costs the rider nothing.
+     *
+     * **Returns whether it actually started the clock**, which callers need rather than merely
+     * find convenient. A start is answered asynchronously, so the rider may have cancelled — or the
+     * watchdog given up — between the answer being judged and this being called. Acting on the
+     * answer regardless is how a fan came on for a workout that had already been abandoned, behind
+     * the stop that was sent on the way out.
      */
     @Synchronized
-    fun confirmStart() {
-        if (state != State.STARTING) return
+    fun confirmStart(): Boolean {
+        if (state != State.STARTING) return false
         runningSinceMs = SystemClock.elapsedRealtime()
         transition(State.RUNNING)
+        return true
     }
 
     /** Banks the current stretch and holds. No-op unless RUNNING. */
@@ -118,7 +162,7 @@ object WorkoutSession {
         // The goal belongs to the workout, not to the app. Carrying it into the next session
         // silently would hand the rider a target they never chose this time.
         WorkoutGoal.clear()
-        transition(State.IDLE)
+        transition(State.IDLE, Ending.ENDED)
         return total
     }
 
@@ -139,16 +183,16 @@ object WorkoutSession {
         if (state == State.IDLE) return
         accumulatedMs = 0L
         runningSinceMs = 0L
-        transition(State.IDLE)
+        transition(State.IDLE, Ending.ABANDONED)
     }
 
     @Synchronized
-    fun addListener(listener: (State) -> Unit) {
+    fun addListener(listener: Listener) {
         listeners.add(listener)
     }
 
     @Synchronized
-    fun removeListener(listener: (State) -> Unit) {
+    fun removeListener(listener: Listener) {
         listeners.remove(listener)
     }
 
@@ -165,10 +209,22 @@ object WorkoutSession {
         else String.format("%02d:%02d", minutes, seconds)
     }
 
-    private fun transition(next: State) {
+    private fun transition(next: State, ending: Ending? = null) {
         state = next
         // Copy before notifying: a listener that removes itself would otherwise mutate the list
         // mid-iteration, and the media coupling does exactly that on teardown.
-        listeners.toList().forEach { it(next) }
+        //
+        // Guarded individually, which is load-bearing rather than tidy. A single listener throwing
+        // used to abort the whole loop, and the machine coupling is registered *last* — so a media
+        // controller that went away, or an overlay view that had been torn down, could take out the
+        // one listener whose job is to tell the belt to stop. A failure to update a screen must
+        // never cost a treadmill its stop command.
+        listeners.toList().forEach {
+            try {
+                it.onTransition(next, ending)
+            } catch (t: Throwable) {
+                Log.w(TAG, "A workout listener failed on the way to $next.", t)
+            }
+        }
     }
 }

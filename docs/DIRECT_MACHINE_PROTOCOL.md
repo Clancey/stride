@@ -420,6 +420,64 @@ side, which maps RESUME to `WORKOUT_RUNNING`.
 `resume()` now writes RESUME and falls back to RUNNING only if the console refuses, so a machine that
 does not implement the mode still resumes.
 
+### Ending a workout writes zero twice — deliberately
+
+`stop()` is one frame carrying `KPH = 0` and `WORKOUT_MODE = IDLE` together, and that has not
+changed. What has is what follows it, and only at a definitive **End workout** — never at a pause.
+An end now sends, in this order and each as its own queued job behind the stop:
+
+| Order | Write | Sent when |
+|---|---|---|
+| 1 | `KPH = 0`, `WORKOUT_MODE = IDLE` | always — the stop itself, preempting the queue |
+| 2 | `KPH = 0` | always |
+| 3 | `GRADE = 0` | only when telemetry shows the belt at rest **and** this console has proved its speed register reports motion |
+| 4 | `FAN_STATE = OFF` | always |
+
+The second zero looks redundant and is the point. If the stop frame landed, the console is idle, it
+will most likely refuse 2, and the cost is a log line. If the stop frame was **lost** — a dropped
+BLE chunk, a USB board that left the bus (see the hazard below) — then the console is still in a
+workout, it accepts 2, and that is the write that stops the treadmill. The trade is one round trip
+on the ending path against a belt left running under an app showing "Start workout".
+
+`GRADE` is gated on **observed** speed, from `ACTUAL_KPH` (16), and not on 2 being acknowledged.
+That distinction was a bug before it was a rule: an ack means a console took a register write, and
+by the argument above it is precisely the *lost-stop* branch where 2 is accepted — so an ack-gated
+deck movement would fire only while the belt was still running. A null reading (stale snapshot, or
+a machine that could not be asked) is not permission either. The deck therefore stays put unless
+Stride can see a stopped belt, which after a pause it normally can, and mid-run it cannot.
+
+**A zero from `ACTUAL_KPH` is not automatically permission either — see issue #34.** On the X22i
+that register reads exactly `0x0000` on every poll while a rider walks at 4 mph, with
+`CURRENT_DISTANCE` accumulating the real pace beside it. It is a confident, well-formed, entirely
+plausible zero — so a null check does not catch it, and a gate built only on "speed reads zero"
+flattens the deck under a moving belt on that machine.
+
+Two things make it unrepairable by asking differently. **iFit never reads that register on a
+treadmill**: `SpeedMetric` selects `Kph` (field 0, the commanded setpoint) for belt-based consoles
+and `ActualKph` (16) only for non-belt ones, so iFit showing a correct speed there says nothing
+about whether field 16 works. And **there is no per-field validity marker** — `SetResponseBytes`
+checks only command status and total length, then consumes raw bytes in field order, so "the value
+is zero" and "I do not have this value" are the same bytes.
+
+The gate therefore also requires that this console has, at some point on this link, reported a
+speed above the moving threshold at all. Until it has, its zero is indistinguishable from a
+register stuck at zero and is treated as worth nothing. On an X22i exhibiting #34 the deck is never
+flattened, which is exactly where it sat before any of this existed.
+
+`Rpm` (field 5) is the obvious next avenue for a real motion signal on such a console: it is
+**read-only**, so it is a machine measurement rather than a setpoint, and it may carry roller or
+motor movement where field 16 is dead. Nobody has checked whether the X22i populates it, so nothing
+depends on it yet. Corroborating against `CURRENT_DISTANCE` failing to advance would serve too.
+Either would let that condition be strengthened — it must not be dropped.
+
+`GRADE = 0` is clamped like any other incline, so a machine whose reported grade range excludes
+zero gets as flat as it goes rather than a value it would refuse — the same coercion `startWorkout`
+applies on the way in.
+
+None of this is stop *confirmation*. A stop is done on ack plus observed deceleration in telemetry
+(`docs/PLAN.md` §5.4). Commanded `KPH` (0) and observed `ACTUAL_KPH` (16) are different fields, and
+no amount of writing the first is evidence about the second.
+
 ## `workoutId` — VERIFIED, and synthesised on the direct path
 
 Every GlassOS metric response carries a `workoutID` in field 1 (`nb/r3` — `GetSpeedResponse`:
