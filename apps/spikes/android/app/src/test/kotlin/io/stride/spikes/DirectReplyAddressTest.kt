@@ -273,7 +273,16 @@ class DirectReplyAddressTest {
 
         assertEquals(FitProProbe.Stage.LINK_CONFIRMED, session.probe.stage)
         assertNotNull(session.probe.limits)
-        assertEquals("the retry must be one extra read, not a storm", 2, wire.readWriteFrames.size)
+        // Counted by pure reads (an empty write mask, byte 3 of the body) rather than by every
+        // READ_WRITE_DATA frame: this fake claims every register the codec models, including
+        // REQUIRE_START_REQUESTED/IDLE_MODE_LOCKOUT, so once the probe confirms,
+        // DirectMachineSession.initializeStartGate legitimately sends two write frames of its own —
+        // a real interaction between two features, not a storm this assertion is meant to catch.
+        assertEquals(
+            "the retry must be one extra read, not a storm",
+            2,
+            wire.readWriteFrames.count { it[3].toInt() == 0 },
+        )
     }
 
     /** The console this file is about must still be able to control its machine. */
