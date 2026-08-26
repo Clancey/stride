@@ -520,6 +520,19 @@ object FitProCodec {
      */
     fun decodeInt(bytes: ByteArray): Int = leToInt(bytes, bytes.size)
 
+    /**
+     * Decodes `CURRENT_CALORIES`: a raw 4-byte count scaled by `1024 / 100,000,000`, not a plain
+     * integer. VERIFIED against iFit's own `CaloriesConverter` (decompiled from
+     * `ifit-standalone.apk`): `(double)(uint)raw * 1024.0 / 100000000.0`.
+     *
+     * This register was previously read with the generic [decodeInt], which is right for most
+     * 4-byte fields and wrong here specifically. The raw value genuinely does climb by a few
+     * thousand per second while a workout runs — that is correct, granular firmware behaviour —
+     * and reading it as whole calories rather than applying this scale is exactly what produced
+     * calorie counts in the millions.
+     */
+    fun decodeCalories(bytes: ByteArray): Double = decodeInt(bytes) * 1024.0 / 100_000_000.0
+
     /** Serialises [value] into [length] little-endian bytes. VERIFIED primitive (`uh/d.g`). */
     fun intToLe(value: Int, length: Int): ByteArray {
         require(length in 1..4) { "length must be 1..4, got $length" }

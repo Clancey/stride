@@ -345,6 +345,15 @@ object MachineCoordinator {
             return@submit Outcome.Failed("The console did not report its workout state")
         }
 
+        // Tried and disproven live on the X22i, kept as a note rather than silently forgotten: a
+        // direct `WorkoutMode = Running` write from `RESULTS`, skipping the wait for `IDLE`
+        // entirely — matching iFit's own `WorkoutFacade.StartWorkoutAsync`, which never checks
+        // console state before writing. iFit's own code not gating on state turned out not to mean
+        // the console accepts it from any state: asked directly from `RESULTS` here, it came back
+        // `Rejected(reason=failed)`, cleanly. Whatever lets iFit's client get away with an
+        // unconditional write is something upstream of the wire protocol — its own UI probably
+        // never offers Start until the console has already gone idle in real usage timing — not a
+        // console-side allowance this app can rely on. `IDLE` really is required.
         val cleared = clearWorkout(it, state)
         if (!cleared) return@submit Outcome.Failed("The console would not end its previous workout")
         // Re-checked immediately before the one command here that can set the belt in motion.
@@ -358,8 +367,8 @@ object MachineCoordinator {
     }
 
     /** Wait out a console state transition. Returns false if the wait was interrupted. */
-    private fun settle(): Boolean = try {
-        Thread.sleep(CLEAR_SETTLE_MS)
+    private fun settle(durationMs: Long = CLEAR_SETTLE_MS): Boolean = try {
+        Thread.sleep(durationMs)
         true
     } catch (t: InterruptedException) {
         Thread.currentThread().interrupt()

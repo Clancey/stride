@@ -1079,7 +1079,7 @@ class DirectMachineClient(private val session: DirectMachineSession) {
             elapsedSeconds = response.value(FitProCodec.Register.RUNNING_TIME)
                 ?.let { FitProCodec.decodeInt(it).toLong() },
             calories = response.value(FitProCodec.Register.CURRENT_CALORIES)
-                ?.let { FitProCodec.decodeInt(it).toDouble() },
+                ?.let(FitProCodec::decodeCalories),
             speedWritable = duringWorkout && session.supports(FitProCodec.Register.KPH) != false,
             inclineWritable = duringWorkout && session.supports(FitProCodec.Register.GRADE) != false,
             fanWritable = writable && session.fanRegister != null,
@@ -1349,31 +1349,76 @@ class DirectMachineCommands(private val session: DirectMachineSession) : Machine
     }
 
     /**
-     * Stop the belt and end the session in a single frame.
+     * Stop the belt, then end the session, as two separate writes.
      *
-     * Both writes ride in one request because the protocol supports multiple writes per frame and
-     * ordering them as two round-trips introduces a window where the workout has ended but the belt
-     * is still commanded to a speed. The write block is emitted in ascending field order —
-     * `KPH` (0) then `WORKOUT_MODE` (12) — by [FitProCodec.readWriteBody], not by this list.
+     * They used to ride in one frame — that was true of the original `KPH` + `WORKOUT_MODE = IDLE`
+     * write, and stayed true of the first fix that changed only the mode value to `RESULTS` (see
+     * below). Combined, it is refused: live on the X22i, `KPH = 0` bundled with
+     * `WORKOUT_MODE = RESULTS` in one frame came back `Refused`, from a console sitting in `PAUSE`.
+     * iFit's own `WorkoutFacade.EndWorkoutAsync` (decompiled from `ifit-standalone.apk`) explains
+     * why: it calls `SetValueAsync(WorkoutMode, WorkoutResults)` — one value, alone, never bundled
+     * with a speed write the way `StartWorkoutAsync` bundles `WorkoutMode` with `Kph`/`Grade`. Ending
+     * a workout is a mode-only transition on this protocol; only starting one carries a setpoint
+     * alongside it. Sent as two round-trips instead, in the order that matters most for safety: the
+     * belt first, the session state second, since a caller that only gets one of the two should get
+     * the one that stops the belt.
      *
-     * `WORKOUT_MODE` is included only when the machine implements it. Sending an unsupported field
-     * risks the console rejecting the *whole* frame, which would take the `KPH = 0` down with it —
-     * failing to stop because we also asked for something optional is not an acceptable trade.
+     * The mode written is `RESULTS`, not `IDLE`. It used to be `IDLE`, which is wrong: ending a
+     * workout means transitioning to `RESULTS`, full stop — `EndWorkoutAsync` never asks for `IDLE`
+     * at all. Asking this console for `IDLE` directly from `RUNNING`/`PAUSE` was refused outright on
+     * the X22i, and retrying the same wrong write while `clearWorkout` looped drove the console
+     * through a second unintended state before this was understood.
+     *
+     * `RESULTS` is not the end of it, though — see the third write below.
      */
-    override fun stop(): MachineAck =
-        write("stop", FitProCodec.Register.KPH) { session ->
+    override fun stop(): MachineAck {
+        val speedAck = write("stop speed", FitProCodec.Register.KPH) {
+            listOf(FitProCodec.writeOf(FitProCodec.Register.KPH, FitProCodec.encodeSpeed(0.0)))
+        }
+        if (speedAck !is MachineAck.Ok) {
+            Log.w(TAG, "stop: speed-to-zero was not accepted: $speedAck")
+        }
+        if (session.supports(FitProCodec.Register.WORKOUT_MODE) == false) return speedAck
+        val resultsAck = write("end workout", FitProCodec.Register.WORKOUT_MODE) {
+            listOf(
+                FitProCodec.writeOf(
+                    FitProCodec.Register.WORKOUT_MODE,
+                    FitProCodec.encodeWorkoutMode(FitProCodec.WorkoutMode.RESULTS),
+                ),
+            )
+        }
+        if (resultsAck !is MachineAck.Ok) return resultsAck
+        return cleanUpWorkout()
+    }
+
+    /**
+     * The write that actually gets a console from `RESULTS` back to `IDLE`.
+     *
+     * Not a firmware timeout, and not guessed: `Sindarin.Core.Console.FitnessConsoleBase` (shared
+     * across every equipment type, decompiled from `ifit-standalone.apk`) subscribes to its own
+     * console-state stream, and on every transition *into* `RESULTS` — regardless of what caused
+     * it — waits 200ms and then calls `CleanUpWorkout()`, which writes `WorkoutMode = Idle` and
+     * `Grade = 0.0` together, in one frame, unconditionally. That 200ms figure is iFit's own
+     * constant, not a value tuned here. Confirmed: `clearWorkout`'s previous approach — waiting up
+     * to 18s for the console to leave `RESULTS` on its own with no further write — never once
+     * succeeded live: nothing was ever going to leave RESULTS without this.
+     */
+    private fun cleanUpWorkout(): MachineAck {
+        Thread.sleep(RESULTS_CLEANUP_DELAY_MS)
+        return write("clean up workout", FitProCodec.Register.WORKOUT_MODE) { session ->
             buildList {
-                add(FitProCodec.writeOf(FitProCodec.Register.KPH, FitProCodec.encodeSpeed(0.0)))
-                if (session.supports(FitProCodec.Register.WORKOUT_MODE) != false) {
-                    add(
-                        FitProCodec.writeOf(
-                            FitProCodec.Register.WORKOUT_MODE,
-                            FitProCodec.encodeWorkoutMode(FitProCodec.WorkoutMode.IDLE),
-                        ),
-                    )
+                add(
+                    FitProCodec.writeOf(
+                        FitProCodec.Register.WORKOUT_MODE,
+                        FitProCodec.encodeWorkoutMode(FitProCodec.WorkoutMode.IDLE),
+                    ),
+                )
+                if (session.supports(FitProCodec.Register.GRADE) != false) {
+                    add(FitProCodec.writeOf(FitProCodec.Register.GRADE, FitProCodec.encodeIncline(0.0)))
                 }
             }
         }
+    }
 
     /**
      * Attach to the machine, and report the console state — the direct path's whole handshake.
@@ -1540,6 +1585,13 @@ class DirectMachineCommands(private val session: DirectMachineSession) : Machine
 
     private companion object {
         const val TAG = "DirectMachine"
+
+        /**
+         * How long to wait after `RESULTS` before [cleanUpWorkout]'s follow-up write. iFit's own
+         * constant (`FitnessConsoleBase`'s `Delay(TimeSpan.FromMilliseconds(200))`), not a value
+         * tuned here.
+         */
+        const val RESULTS_CLEANUP_DELAY_MS = 200L
 
         /**
          * What a new workout opens at, matching GlassOS measured on the real machine: the belt runs
