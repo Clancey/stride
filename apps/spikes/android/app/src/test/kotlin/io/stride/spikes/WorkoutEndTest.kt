@@ -31,7 +31,7 @@ class WorkoutEndTest {
             EndFollowUp.STOP_AND_SETTLE,
             endFollowUp(
                 previous = WorkoutSession.State.PAUSED,
-                next = WorkoutSession.State.IDLE,
+                next = WorkoutSession.State.STOPPING,
                 ending = WorkoutSession.Ending.ENDED,
             ),
         )
@@ -49,7 +49,45 @@ class WorkoutEndTest {
             EndFollowUp.STOP_AND_SETTLE,
             endFollowUp(
                 previous = WorkoutSession.State.RUNNING,
-                next = WorkoutSession.State.IDLE,
+                next = WorkoutSession.State.STOPPING,
+                ending = WorkoutSession.Ending.ENDED,
+            ),
+        )
+    }
+
+    /**
+     * **Issue #39.** The settle that follows a stop commands nothing.
+     *
+     * `STOPPING → IDLE` is the confirmation arriving, not a new ending. The stop it is settling
+     * went out when the session *entered* STOPPING; asking for another here would re-send a stop
+     * and re-run the tidy-up for a workout that finished seconds ago — and worse, it would do so
+     * from the callback of the very watcher that was judging the first one.
+     */
+    @Test
+    fun `the settle after a stop asks the machine for nothing`() {
+        for (ending in listOf(null, WorkoutSession.Ending.ENDED, WorkoutSession.Ending.ABANDONED)) {
+            assertEquals(
+                "stopping -> idle ($ending) must ask for nothing",
+                EndFollowUp.NOTHING,
+                endFollowUp(WorkoutSession.State.STOPPING, WorkoutSession.State.IDLE, ending),
+            )
+        }
+    }
+
+    /**
+     * Pressing End again while a stop is still unconfirmed sends another one.
+     *
+     * The one case that must *not* be swallowed by the rule above. A rider pressing a stop control
+     * twice is asking harder, and the honest answer to "I am not sure it stopped" is another stop —
+     * not a no-op because the app is already in the state it entered when the first one went out.
+     */
+    @Test
+    fun `pressing End again while stopping re-sends the stop`() {
+        assertEquals(
+            EndFollowUp.STOP_AND_SETTLE,
+            endFollowUp(
+                previous = WorkoutSession.State.STOPPING,
+                next = WorkoutSession.State.STOPPING,
                 ending = WorkoutSession.Ending.ENDED,
             ),
         )
@@ -99,6 +137,10 @@ class WorkoutEndTest {
      * stop. The settling is deliberately withheld: this is the retry path, nothing established the
      * belt ever moved, and the round trips would land on the one screen where a rider is standing
      * on a treadmill waiting to hear whether their start worked.
+     *
+     * **It also goes straight to IDLE rather than through STOPPING (#39).** Holding the retry path
+     * behind a stop confirmation would lock the rider out of pressing Start again for as long as a
+     * confirmation takes, on that same screen. Byte for byte what it did before.
      */
     @Test
     fun `an abandoned start stops the belt without settling the machine`() {

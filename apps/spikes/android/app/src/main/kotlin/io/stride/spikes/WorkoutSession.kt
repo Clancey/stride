@@ -31,7 +31,7 @@ object WorkoutSession {
     private const val TAG = "WorkoutSession"
 
     /**
-     * IDLE → STARTING → RUNNING ⇄ PAUSED → IDLE.
+     * IDLE → STARTING → RUNNING ⇄ PAUSED → STOPPING → IDLE.
      *
      * [STARTING] is the rider's intent, recorded before the machine has agreed to it. It exists
      * because Stride used to go straight to RUNNING and start counting the moment the button was
@@ -41,8 +41,24 @@ object WorkoutSession {
      *
      * The clock does not run in STARTING. That is the whole point of the state: it is honest about
      * having asked and not yet been answered.
+     *
+     * [STOPPING] is the same honesty at the other end, and it is issue #39. [stop] used to publish
+     * IDLE — and notify every listener — *before* the coupling had so much as called
+     * `MachineCoordinator.stop()`, so the app showed "Start workout" over a belt nothing had asked
+     * to stop yet, let alone confirmed stopped. A stop is done on ack **plus** observed
+     * deceleration (`docs/PLAN.md` §5.4), and STOPPING is the state that exists while neither has
+     * arrived.
+     *
+     * **STOPPING cannot delay a stop.** It is published on the way *into* the same listener
+     * notification that issues the stop command, on the same thread, in the same call. It is a
+     * label applied as the stop goes past, never a gate the stop waits behind.
+     *
+     * [abandon] deliberately does **not** pass through it. An abandon is the retry path — a start
+     * that was refused, cancelled, or never answered — and holding it in STOPPING would lock the
+     * rider out of pressing Start again for as long as a confirmation takes, on the one screen
+     * where they are standing on a treadmill waiting to hear whether their start worked.
      */
-    enum class State { IDLE, STARTING, RUNNING, PAUSED }
+    enum class State { IDLE, STARTING, RUNNING, PAUSED, STOPPING }
 
     /**
      * Why a session returned to [State.IDLE].
@@ -67,12 +83,13 @@ object WorkoutSession {
     /**
      * Notified on every transition, synchronously, on the thread that made it.
      *
-     * [ending] is non-null only on a transition into [State.IDLE], and it is passed as an argument
-     * rather than read back off this object on purpose. A listener is free to make its own
-     * transition while it is being notified, and a shared field would then be overwritten under the
-     * listeners that had not run yet — which on this path means the machine coupling reading
-     * "abandoned" for a workout the rider ended, and silently skipping the end-of-workout writes.
-     * An argument cannot be clobbered by anybody.
+     * [ending] is non-null only on a transition that ends a session — into [State.STOPPING] for an
+     * end, and into [State.IDLE] for an abandon or for the settle that follows a stop — and it is
+     * passed as an argument rather than read back off this object on purpose. A listener is free to
+     * make its own transition while it is being notified, and a shared field would then be
+     * overwritten under the listeners that had not run yet — which on this path means the machine
+     * coupling reading "abandoned" for a workout the rider ended, and silently skipping the
+     * end-of-workout writes. An argument cannot be clobbered by anybody.
      */
     fun interface Listener {
         fun onTransition(next: State, ending: Ending?)
@@ -152,6 +169,14 @@ object WorkoutSession {
     /**
      * Ends the session and returns its total duration, so a caller can record a summary before the
      * counters reset. Returns 0 and does nothing when already IDLE.
+     *
+     * Lands in [State.STOPPING], not IDLE. The belt has been asked to stop and nothing has yet
+     * confirmed it did; publishing IDLE here is what issue #39 is about, because IDLE is the state
+     * the whole app reads as "no workout, offer Start". [settle] is the only way out.
+     *
+     * Pressing End again from STOPPING deliberately re-enters STOPPING rather than no-oping, which
+     * re-notifies the listeners and so sends the belt another stop. A rider pressing a stop control
+     * twice means it harder, not less.
      */
     @Synchronized
     fun stop(): Long {
@@ -162,8 +187,26 @@ object WorkoutSession {
         // The goal belongs to the workout, not to the app. Carrying it into the next session
         // silently would hand the rider a target they never chose this time.
         WorkoutGoal.clear()
-        transition(State.IDLE, Ending.ENDED)
+        transition(State.STOPPING, Ending.ENDED)
         return total
+    }
+
+    /**
+     * The stop has settled, one way or the other. Return to IDLE.
+     *
+     * Called with the verdict rather than deciding it: whether the belt is confirmed at rest is a
+     * question about a machine, and this class is a clock. **The session goes IDLE either way** —
+     * there is nothing left for it to do, and holding it in STOPPING would be a state a rider could
+     * not get out of. What keeps the app from cheerfully offering to start a belt it could not
+     * confirm stopped is [StopEscalation]'s latch, not this.
+     *
+     * No-op unless STOPPING, so a late verdict from a stop the rider has already followed with
+     * another action cannot drag a live session to idle.
+     */
+    @Synchronized
+    fun settle() {
+        if (state != State.STOPPING) return
+        transition(State.IDLE, Ending.ENDED)
     }
 
     /**

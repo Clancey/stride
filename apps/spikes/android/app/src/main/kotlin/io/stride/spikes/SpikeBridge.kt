@@ -148,6 +148,13 @@ class SpikeBridge(private val context: Context) : MethodChannel.MethodCallHandle
                 "workoutResume" -> result.success(workoutResume())
                 "workoutStop" -> result.success(workoutStop())
                 "workoutCancelStart" -> result.success(workoutCancelStart())
+                // The one state that means "do not assume the belt has stopped". Exposed so a
+                // launcher with no overlay up can still say so, and so the rider has somewhere to
+                // acknowledge it from — a latch nothing can clear would be worse than no latch.
+                "stopEscalation" -> result.success(stopEscalation())
+                "stopEscalationAcknowledge" -> result.success(StopEscalation.active.also {
+                    StopEscalation.acknowledge()
+                })
                 "volumeGet" -> result.success(systemAudio.snapshot())
                 "volumeSet" -> result.success(volumeSet(call))
                 "machineSnapshot" -> result.success(machineSnapshot())
@@ -576,6 +583,11 @@ class SpikeBridge(private val context: Context) : MethodChannel.MethodCallHandle
 
     private fun workoutStart(): Boolean {
         if (WorkoutSession.state != WorkoutSession.State.IDLE) return false
+        // Withheld while a stop is outstanding and unexplained, and it is the same rule the overlay
+        // holds itself to. Setting a belt moving that Stride could not confirm had stopped is the
+        // same mistake as reporting it stopped, one screen later — and this entry point has no rider
+        // looking at a card, so the guard has to be here rather than only in the UI.
+        if (StopEscalation.active) return false
         WorkoutSession.start()
         return true
     }
@@ -733,6 +745,16 @@ class SpikeBridge(private val context: Context) : MethodChannel.MethodCallHandle
                 "consequence" to it.consequence,
             )
         }
+
+    private fun stopEscalation(): Map<String, Any?> = mapOf(
+        "active" to StopEscalation.active,
+        "reason" to StopEscalation.lastReason?.name,
+        // Resolved here rather than in Dart, for the reason machineSnapshot gives: MachineLink and
+        // StopEscalation own every safety sentence in this app, and a second copy of the wording in
+        // Dart is a second thing to get wrong on the one screen where wording matters most.
+        "detail" to StopEscalation.explain(StopEscalation.lastReason),
+        "instruction" to StopEscalation.INSTRUCTION,
+    )
 
     private fun machineSnapshot(): Map<String, Any?> = mapOf(
         "status" to MachineLink.status.name.lowercase(Locale.US),

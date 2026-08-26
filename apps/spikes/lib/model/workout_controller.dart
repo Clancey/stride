@@ -5,21 +5,70 @@ import 'package:flutter/services.dart';
 
 import '../bridge.dart';
 
-abstract class WorkoutBridgeClient {
-  Future<String> workoutState();
+/// The "USE THE SAFETY KEY" latch, as the host reports it.
+///
+/// Stride told the belt to stop and could not confirm it did — a stop is done
+/// on an ack *plus* telemetry showing the belt at rest (`docs/PLAN.md` §5.4),
+/// and this is the state where one or both never arrived.
+///
+/// Every string here is resolved on the host. `MachineLink` and
+/// `StopEscalation` own the safety wording, and a second copy of it in Dart is
+/// a second thing to get wrong on the one screen where wording matters most.
+@immutable
+class StopEscalationState {
+  const StopEscalationState({
+    required this.active,
+    this.reason,
+    this.detail = '',
+    this.instruction = '',
+  });
+
+  const StopEscalationState.clear()
+    : active = false,
+      reason = null,
+      detail = '',
+      instruction = '';
+
+  factory StopEscalationState.fromMap(Map<String, dynamic> map) {
+    return StopEscalationState(
+      // Absent must read as "not raised", never as raised: this value gates a
+      // modal warning, and a bridge that failed to answer must not manufacture
+      // an alarm out of nothing. The host is the only thing that raises it.
+      active: map['active'] == true,
+      reason: map['reason'] as String?,
+      detail: (map['detail'] as String?) ?? '',
+      instruction: (map['instruction'] as String?) ?? '',
+    );
+  }
+
+  final bool active;
+
+  /// Which check failed, as a `StopUnconfirmed` name. For display only.
+  final String? reason;
+
+  /// What the host saw, in a sentence.
+  final String detail;
+
+  /// What to do about it. Identical on every branch, because there is only one
+  /// thing to do about any of them.
+  final String instruction;
+}
+
+abstract class WorkoutBridgeClient {  Future<String> workoutState();
   Future<int> workoutElapsedMs();
   Future<bool> workoutStart();
   Future<bool> workoutPause();
   Future<bool> workoutResume();
   Future<int> workoutStop();
   Future<bool> workoutCancelStart();
+  Future<StopEscalationState> stopEscalation();
+  Future<bool> stopEscalationAcknowledge();
   Future<WorkoutVolume> volumeGet();
   Future<bool> volumeSet(int level);
   Future<MachineSnapshot> machineSnapshot();
 }
 
-class MethodChannelWorkoutBridge implements WorkoutBridgeClient {
-  const MethodChannelWorkoutBridge();
+class MethodChannelWorkoutBridge implements WorkoutBridgeClient {  const MethodChannelWorkoutBridge();
 
   @override
   Future<String> workoutState() => SpikeBridge.workoutState();
@@ -41,6 +90,14 @@ class MethodChannelWorkoutBridge implements WorkoutBridgeClient {
 
   @override
   Future<bool> workoutCancelStart() => SpikeBridge.workoutCancelStart();
+
+  @override
+  Future<StopEscalationState> stopEscalation() async =>
+      StopEscalationState.fromMap(await SpikeBridge.stopEscalation());
+
+  @override
+  Future<bool> stopEscalationAcknowledge() =>
+      SpikeBridge.stopEscalationAcknowledge();
 
   @override
   Future<WorkoutVolume> volumeGet() async =>
@@ -195,6 +252,7 @@ class WorkoutController extends ChangeNotifier {
   int _elapsedMs = 0;
   WorkoutVolume _volume = WorkoutVolume.unavailable;
   MachineSnapshot _machine = MachineSnapshot.unavailable();
+  StopEscalationState _stopEscalation = const StopEscalationState.clear();
   String? _lastError;
 
   String get state => _state;
@@ -202,6 +260,28 @@ class WorkoutController extends ChangeNotifier {
   WorkoutVolume get volume => _volume;
   MachineSnapshot get machine => _machine;
   String? get lastError => _lastError;
+
+  /// The "USE THE SAFETY KEY" latch. Non-dismissible while [
+  /// StopEscalationState.active], and the host refuses to start a workout while
+  /// it is up, so a screen that did not draw it would leave a rider with a dead
+  /// Start button and no explanation.
+  StopEscalationState get stopEscalation => _stopEscalation;
+
+  /// Clear the latch, because the rider says they have dealt with it.
+  Future<void> acknowledgeStopEscalation() async {
+    await _safe(() => _bridge.stopEscalationAcknowledge(), false);
+    await refreshStopEscalation();
+  }
+
+  Future<void> refreshStopEscalation() async {
+    _stopEscalation = await _safe(
+      () => _bridge.stopEscalation(),
+      // A bridge that could not answer is not evidence of a raised latch. The
+      // host is the only thing that raises one.
+      const StopEscalationState.clear(),
+    );
+    _notify();
+  }
 
   bool get isRunning => _state == 'running';
   bool get isPaused => _state == 'paused';
@@ -213,10 +293,18 @@ class WorkoutController extends ChangeNotifier {
   /// the clock has not begun, and the only honest thing to show is that we are waiting.
   bool get isStarting => _state == 'starting';
 
+  /// A stop has been sent and nothing has confirmed the belt is at rest.
+  ///
+  /// The mirror of [isStarting], and issue #39. A stop is done on ack *plus* observed deceleration,
+  /// and this is the state in which neither has arrived — so it is emphatically **not** idle, and
+  /// anything that would offer to start a belt must treat it as such.
+  bool get isStopping => _state == 'stopping';
+
   Future<void> load() async {
     await _refreshWorkout();
     await refreshVolume();
     await refreshMachine();
+    await refreshStopEscalation();
   }
 
   Future<bool> startWorkout() async {
@@ -265,7 +353,11 @@ class WorkoutController extends ChangeNotifier {
   Future<int?> finishWorkout() async {
     final total = await _safe<int?>(() async => _bridge.workoutStop(), null);
     if (total == null) return null;
-    _state = 'idle';
+    // Not 'idle', for the same reason [startWorkout] is not 'running'. The stop has been sent and
+    // nothing has confirmed the belt is at rest; the host owns that answer and announces it on the
+    // state channel. Claiming idle here would be the launcher telling a rider their treadmill has
+    // stopped on the strength of having asked it to — issue #39.
+    _state = 'stopping';
     _elapsedMs = total;
     _syncTicker();
     _notify();
@@ -321,13 +413,20 @@ class WorkoutController extends ChangeNotifier {
     _notify();
     unawaited(_refreshWorkout());
     unawaited(refreshMachine());
+    // Every path that can raise the latch ends in a state change — a stop that
+    // settled unconfirmed, or an abandoned start whose stop could not be
+    // confirmed either. This is what makes the warning appear on a launcher
+    // with no overlay up.
+    unawaited(refreshStopEscalation());
   }
 
   void _syncTicker() {
-    // Also ticks while starting. The host owns this state and announces the change, but a missed
-    // event would otherwise leave the launcher showing "Starting…" forever with no poll to correct
-    // it — so the pending state re-reads the host rather than trusting one notification.
-    if (_state != 'running' && _state != 'starting') {
+    // Also ticks while starting and while stopping. The host owns both states and announces the
+    // change, but a missed event would otherwise leave the launcher showing "Starting…" or
+    // "Stopping…" forever with no poll to correct it — so the pending states re-read the host
+    // rather than trusting one notification. Stopping matters more than starting here: the state
+    // it is waiting to leave is the one that withholds the Start control.
+    if (_state != 'running' && _state != 'starting' && _state != 'stopping') {
       _ticker?.cancel();
       _ticker = null;
       return;
@@ -339,14 +438,20 @@ class WorkoutController extends ChangeNotifier {
     if (_tickInFlight) return;
     _tickInFlight = true;
     try {
-      if (_state == 'starting') {
-        // The one thing worth knowing while starting is whether it still is.
+      if (_state == 'starting' || _state == 'stopping') {
+        // The one thing worth knowing while starting or stopping is whether it still is.
         final hostState = await _safe(() => _bridge.workoutState(), _state);
         if (_disposed) return;
         final next = _normalizeState(hostState);
         if (next != _state) {
+          final wasStopping = _state == 'stopping';
           _state = next;
           _syncTicker();
+          // Leaving "Stopping…" is the moment the verdict landed, and an
+          // unconfirmed one has just raised the latch. Read it now rather than
+          // waiting for the next state change, because there may not be one:
+          // the session is idle and the ticker has just stopped.
+          if (wasStopping) unawaited(refreshStopEscalation());
         }
       }
       final nextElapsed = await _safe(
@@ -402,6 +507,11 @@ String _normalizeState(String state) {
     'starting' => 'starting',
     'running' => 'running',
     'paused' => 'paused',
+    // The host says this while a stop is on the wire and nothing has confirmed the belt is at
+    // rest. Folding it into 'idle' — which is what the catch-all below used to do to it — would
+    // put "Start workout" back on screen over exactly the belt this state exists to be honest
+    // about. See WorkoutSession.State.STOPPING and issue #39.
+    'stopping' => 'stopping',
     _ => 'idle',
   };
 }

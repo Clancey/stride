@@ -434,6 +434,43 @@ Afterwards, capture what happened:
 adb logcat -d > ~/stride-incident-$(date +%s).log
 ```
 
+### Stride is showing "USE THE SAFETY KEY"
+
+**Do what it says, and do it before you decide whether it is right.**
+
+This card is Stride working, not Stride crashing. It appears when Stride told the belt to stop and
+could **not confirm** it did — a stop is only "done" on an ack *plus* telemetry showing the belt
+actually at rest (`docs/PLAN.md` §5.4), and this is the state in which one or both of those never
+arrived. It is deliberately the only card in the app you cannot dismiss by tapping the background,
+and the Start control stays withheld until you clear it.
+
+It does **not** mean the belt is definitely still moving. It means Stride does not know, and the
+whole design of this feature is that "I do not know" must never be shown as "stopped".
+
+The line above the instruction says which check failed:
+
+| What it says | What Stride saw |
+|---|---|
+| the console never accepted the stop | the write was refused, timed out, or there was no link at all |
+| the machine is still reporting that the belt is moving | telemetry Stride has reason to believe still shows motion |
+| the machine went on recording distance afterwards | `CURRENT_DISTANCE` advanced after the belt should have been still — the strongest of these |
+| this machine has never reported a belt speed above zero | the speed register has never said anything but zero on this link, so its zero proves nothing (issue #34) |
+| no telemetry came back to show the belt slowing | the console accepted the stop and then went quiet |
+
+The last two are the ones most likely to be a *reporting* problem rather than a *belt* problem — a
+console whose speed register is dead cannot confirm a stop even when the stop worked perfectly.
+Check the belt anyway. That is the entire point.
+
+**To clear it:** stop the belt, satisfy yourself it is stopped, then tap **"I've stopped the belt"**
+on the card, or the same action on the launcher. Nothing else clears it — not a reconnect, not a
+later successful stop, not restarting the app, and not killing the process: the latch is written to
+`stride.settings` precisely so a low-memory kill cannot quietly drop a safety warning and bring the
+app back up offering "Start workout".
+
+If it appears on every single workout you end, that is worth an issue rather than a shrug: it most
+likely means this console publishes no usable telemetry once a workout ends, which is a fact about
+the machine that belongs in the docs. Include the reason line from the card and a logcat capture.
+
 ---
 
 ## 6. Permission grants used by the spike harness

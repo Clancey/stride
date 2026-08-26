@@ -105,6 +105,25 @@ object MachineCoordinator {
     /** Stops sent to clear a stale console session before a new workout. */
     private const val MAX_CLEAR_ATTEMPTS = 3
 
+    /**
+     * How long a stop may take to be positively confirmed before it is reported unconfirmed.
+     *
+     * Sized against the poll, not against a guess at how long a belt takes to stop: a confirmation
+     * needs two agreeing readings, [MachineLink] polls every 500 ms while a stop is pending, and a
+     * console that has stopped answering has to be given long enough that a single dropped reply is
+     * not mistaken for a treadmill that ignored us.
+     *
+     * Its purpose is not to be exactly right. It is that there has to be one — a confirmation that
+     * could wait forever would leave a rider looking at "Stopping…" with nothing to release it.
+     */
+    private const val STOP_CONFIRM_TIMEOUT_MS = 6_000L
+
+    /**
+     * How often the watcher looks. Faster than the poll on purpose, so a reading is picked up in
+     * the tick after it arrives rather than up to a whole poll later.
+     */
+    private const val STOP_CONFIRM_SAMPLE_MS = 200L
+
     /** Pause after a clearing stop, so the console's state read reflects it. */
     private const val CLEAR_SETTLE_MS = 300L
 
@@ -197,6 +216,17 @@ object MachineCoordinator {
     private val speedGeneration = AtomicInteger(0)
     private val worker = Executors.newSingleThreadExecutor { r ->
         Thread(r, "machine-coordinator").apply { isDaemon = true }
+    }
+
+    /**
+     * Where stop confirmations are watched.
+     *
+     * Deliberately **not** [worker]. A confirmation waits on a treadmill for seconds, and the
+     * command queue is the one thing in this app that must never be waiting on anything: putting a
+     * watcher on it would mean the next stop queues behind the previous stop's confirmation.
+     */
+    private val confirmations = Executors.newSingleThreadScheduledExecutor { r ->
+        Thread(r, "stop-confirmation").apply { isDaemon = true }
     }
 
     @Volatile private var commands: MachineCommands? = null
@@ -504,16 +534,181 @@ object MachineCoordinator {
      * Bumps the generation first so anything already queued is discarded rather than executed after
      * the stop, then jumps the queue. This is the one command that is never rate-limited and never
      * ramped.
+     *
+     * ## What [onSettled] is, and what it is not
+     *
+     * A stop is "done" only on ack **plus** observed deceleration in telemetry (plan §5.4). The
+     * command's [Outcome] is the ack half and nothing more — it says a console took a register
+     * write, not that a motor slowed. [onSettled] delivers the other half: a [StopVerdict] reached
+     * by watching telemetry after the write, on a separate thread.
+     *
+     * **The watcher cannot delay, weaken or reorder the stop.** It is armed *after* the job is
+     * queued, it runs on its own scheduler, and everything it does is a read of a volatile field.
+     * The queue never waits for it. Confirmation happens after and alongside a stop; a stop never
+     * waits on a confirmation.
+     *
+     * Sampling begins the moment the stop is queued rather than when the ack lands, and that is
+     * load-bearing on GlassOS: the belt decelerates while the console is still inside the workout,
+     * and GlassOS only publishes telemetry while a workout is live
+     * ([GlassOsTelemetry.reading] returns null once no `workoutId` is stamped). Waiting for the ack
+     * can mean waiting past the only window in which the deceleration is visible.
      */
-    fun stop() {
+    fun stop(onSettled: ((StopVerdict) -> Unit)? = null) {
         val gen = generation.incrementAndGet()
         queue.clear()
+        // Sampled on the caller's thread, before the job can possibly run, so "readings newer than
+        // the stop" is anchored to the instant the rider asked for it rather than to whenever the
+        // worker got round to it.
+        val watcher = onSettled?.let {
+            StopConfirmation(gen, MachineLink.readingSeq, MachineLink.observation(), it)
+        }
         queue.addFirst(
-            Job(gen, STOP_LABEL) {
+            Job(
+                gen,
+                STOP_LABEL,
+                onDone = { outcome -> watcher?.onAck(outcome is Outcome.Ok) },
+            ) {
                 val c = commands ?: return@Job Outcome.Failed("No link to the console")
                 c.stop().toOutcome()
             },
         )
+        watcher?.start()
+    }
+
+    /**
+     * True while a stop is waiting to be confirmed.
+     *
+     * Read by [MachineLink]'s poll, which speeds up for it. A console that has walked to
+     * `WORKOUT_RESULTS` reports a belt that may not be moving and would otherwise drop the poll to
+     * one reading every two seconds — so the two agreeing readings a confirmation needs would take
+     * four, which is long enough to time out and escalate a stop that worked perfectly.
+     */
+    val stopConfirmationPending: Boolean get() = pendingConfirmations.get() > 0
+
+    private val pendingConfirmations = AtomicInteger(0)
+
+    /**
+     * Watches telemetry after one stop and produces a verdict, exactly once.
+     *
+     * Everything it decides lives in [stopVerdict], which is pure. This class is only the plumbing:
+     * when to look, what to keep, and when to give up.
+     *
+     * **It always settles.** Confirmed, timed out, or retired by a newer stop — [onSettled] runs
+     * once on every path. A watcher that could finish without answering would leave the session
+     * that is waiting on it stuck in [WorkoutSession.State.STOPPING] with nothing left to release
+     * it, which is a wedge on the ending path.
+     */
+    private class StopConfirmation(
+        private val generation: Int,
+        /** The poll count when the stop was queued. Only readings past this are evidence. */
+        private val seqAtStop: Long,
+        /**
+         * The belt as it read when the stop went out, or null if nothing was fresh.
+         *
+         * May complete the pair of agreeing at-rest readings a confirmation needs, and may never be
+         * the whole of it — see [stopVerdict], which enforces that rather than trusting this to.
+         */
+        private val beforeStop: MachineLink.Observation?,
+        private val onSettled: (StopVerdict) -> Unit,
+    ) {
+        private val settled = java.util.concurrent.atomic.AtomicBoolean(false)
+
+        /** Written and read only on the confirmation thread. */
+        private val observations = mutableListOf<MachineLink.Observation>()
+
+        @Volatile private var acked: Boolean? = null
+
+        private var deadlineAt = 0L
+
+        /**
+         * Volatile because [start] publishes it *after* the first sample may already have run, and
+         * [finish] reads it from the confirmation thread. Without it a watcher that was superseded
+         * before its first tick could cancel a `null` and leave its 200 ms sampler running for the
+         * life of the process. It never affected settling — [settled] guarantees that — but a leaked
+         * repeating task on the one confirmation thread is still a leak.
+         */
+        @Volatile private var task: java.util.concurrent.ScheduledFuture<*>? = null
+
+        fun onAck(ok: Boolean) {
+            acked = ok
+        }
+
+        fun start() {
+            pendingConfirmations.incrementAndGet()
+            // System.nanoTime rather than SystemClock.elapsedRealtime. Both are monotonic and
+            // immune to a wall-clock correction, which is the property that matters; this one is
+            // also real under a JVM unit test, where the Android stub returns a constant zero and
+            // a deadline built on it never arrives. A safety timeout that silently never fires off
+            // a real device is not a timeout worth having.
+            deadlineAt = System.nanoTime() + TimeUnit.MILLISECONDS.toNanos(STOP_CONFIRM_TIMEOUT_MS)
+            val future = confirmations.scheduleWithFixedDelay(
+                ::sample,
+                0L,
+                STOP_CONFIRM_SAMPLE_MS,
+                TimeUnit.MILLISECONDS,
+            )
+            task = future
+            // Re-checked here because the first sample can run — and settle — before the line
+            // above publishes the handle it would have cancelled. A watcher superseded on its first
+            // tick would otherwise leave its sampler running for the life of the process. Settling
+            // was never at risk; the leak was.
+            if (settled.get()) future.cancel(false)
+        }
+
+        private fun sample() {
+            if (settled.get()) return
+            try {
+                // A newer stop, a rebind, or a transport swap has retired this. Settle rather than
+                // vanish: something is waiting for an answer, and the newer stop's own watcher is
+                // the one that will speak for the machine now.
+                if (generation != MachineCoordinator.generation.get()) {
+                    finish(StopVerdict.Unconfirmed(StopUnconfirmed.SUPERSEDED))
+                    return
+                }
+                MachineLink.observation()
+                    ?.takeIf { it.seq > seqAtStop && observations.lastOrNull()?.seq != it.seq }
+                    ?.let { observations.add(it) }
+                val ack = acked
+                if (ack != null) {
+                    val verdict = stopVerdict(ack, MachineLink.everReportedMotion, beforeStop, observations)
+                    if (verdict is StopVerdict.Confirmed) {
+                        finish(verdict)
+                        return
+                    }
+                    // A stop the console refused or never answered is not going to become
+                    // confirmed by waiting, and the rider needs to hear about it now.
+                    if (!ack) {
+                        finish(verdict)
+                        return
+                    }
+                }
+                if (System.nanoTime() >= deadlineAt) {
+                    finish(stopVerdict(acked ?: false, MachineLink.everReportedMotion, beforeStop, observations))
+                }
+            } catch (t: Throwable) {
+                // A watcher that throws must not leave the ending path waiting forever, and must
+                // not be quietly cancelled by the scheduler either — which is what
+                // scheduleWithFixedDelay does to a task that throws.
+                Log.w(TAG, "stop confirmation failed; treating the stop as unconfirmed", t)
+                finish(StopVerdict.Unconfirmed(StopUnconfirmed.NOT_OBSERVED))
+            }
+        }
+
+        private fun finish(verdict: StopVerdict) {
+            if (!settled.compareAndSet(false, true)) return
+            pendingConfirmations.decrementAndGet()
+            // Cancelled through the executor as well as through the handle, because the handle may
+            // not be published yet: a watcher superseded before its first tick can reach here while
+            // start() is still assigning it. Returning true from the task's own run is not an option
+            // with scheduleWithFixedDelay, so the handle is the mechanism — it just has to be there.
+            task?.cancel(false)
+            Log.i(TAG, "stop verdict: $verdict")
+            try {
+                onSettled(verdict)
+            } catch (t: Throwable) {
+                Log.w(TAG, "stop verdict handler failed", t)
+            }
+        }
     }
 
     /**
@@ -852,7 +1047,262 @@ internal fun shouldAdoptWorkout(state: Int?, beltSpeedMph: Double?): Boolean =
 internal const val BELT_MOVING_MPH = 0.1
 
 /**
+ * Whether a stop is "done".
+ *
+ * Two values, not three. Plan §5.4 gives a stop exactly one way to be finished — ack **plus**
+ * observed deceleration — and everything else, including "we could not see the belt", is the same
+ * answer: not confirmed, escalate. A third "probably fine" value is the shape this whole issue
+ * exists to forbid, so it is unrepresentable rather than merely discouraged.
+ */
+sealed interface StopVerdict {
+    /** Ack, plus telemetry that is worth believing showing a belt at rest. */
+    data object Confirmed : StopVerdict
+
+    data class Unconfirmed(val reason: StopUnconfirmed) : StopVerdict
+}
+
+/**
+ * Why a stop could not be confirmed.
+ *
+ * Carried so the escalation can say which failure it saw. "The console never accepted the stop" and
+ * "the console accepted it and the belt is still moving" are the same verdict and very different
+ * sentences to read standing next to a treadmill.
+ */
+enum class StopUnconfirmed {
+    /** The console did not accept the stop: refused, timed out, or no link at all. */
+    NOT_ACKED,
+
+    /**
+     * This console's speed register has never reported motion on this link, so its zero is worth
+     * nothing. Issue #34 — see [MachineLink.everReportedMotion].
+     */
+    NEVER_REPORTED_MOTION,
+
+    /** Telemetry we have reason to believe says the belt is still moving. */
+    STILL_MOVING,
+
+    /** The belt covered ground *after* the console told us it had stopped. */
+    DISTANCE_ADVANCED,
+
+    /** Telemetry never produced two agreeing readings of a belt at rest. */
+    NOT_OBSERVED,
+
+    /** A newer stop took over. This one's answer belongs to a machine state that has moved on. */
+    SUPERSEDED,
+}
+
+/**
+ * Distance change small enough to be floating-point noise rather than travel, in miles.
+ *
+ * Three orders of magnitude below the smallest real quantum any transport reports — the direct path
+ * counts whole metres (`FitProValues.metresToMiles`, 1 m ≈ 6.2e-4 mi) — and far above the ~1e-12
+ * error of the conversions themselves. Erring small is the safe direction: a smaller epsilon vetoes
+ * more confirmations, and a vetoed confirmation escalates.
+ */
+private const val DISTANCE_STILL_MILES = 1e-6
+
+/**
+ * Whether a stop is confirmed, from the ack and the readings taken after it.
+ *
+ * Pure, and separate from [MachineCoordinator], because this is the decision the whole issue turns
+ * on and every branch of it has to be checkable without a treadmill.
+ *
+ * @param beforeStop the observation current when the stop was queued, or null if nothing was fresh.
+ *   It may **complete** the pair of agreeing readings below; it may never be the whole of it.
+ * @param postStop every observation taken *after* the stop was queued, oldest first. Readings from
+ *   before it are not evidence about it and must never appear here — [MachineLink.speedMph] is
+ *   believed for four seconds, so a reading taken before a stop is still "fresh" after it.
+ *
+ * ## Four conditions, all required
+ *
+ * 1. **The console acked.** Necessary and nowhere near sufficient: an ack says a console took a
+ *    register write, which is the exact thing this issue exists because somebody once mistook for a
+ *    stopped belt.
+ * 2. **The speed register has proved it reports motion**, via [MachineLink.everReportedMotion]. On
+ *    the X22i `ACTUAL_KPH` reads a confident, well-formed `0x0000` on every poll while a rider walks
+ *    at 4 mph (issue #34), and there is no per-field validity marker in the protocol that could tell
+ *    that apart from a real zero. A console that has only ever said zero is not saying anything.
+ * 3. **Two agreeing readings say the belt is at rest, at least one of them from after the stop.**
+ *    Two, not one, because a single sample cannot distinguish a belt at rest from a belt passing
+ *    through a reading. At least one from after, by poll count, because otherwise a reading taken
+ *    *before* the stop could confirm it — and readings are believed for four seconds.
+ * 4. **Distance did not advance across those readings.**
+ *
+ * ## Why the pre-stop reading is allowed to be one of the two — measured, not assumed
+ *
+ * The first draft required *both* readings to be post-stop, and a belt run on a GlassOS console
+ * showed that sitting on an unmeasured knife-edge. GlassOS publishes metrics only while a workout
+ * is live: `GlassOsTelemetry.reading` returns **null, not zero**, once no `workoutId` is stamped.
+ * Ending a workout therefore takes the telemetry away, and the trace showed it going:
+ *
+ * ```
+ * 11:28:40.056  Stop -> Ok
+ * 11:28:40.090  Re-assert zero -> Rejected(... WorkoutState IDLE ...)   <- WorkoutService: 34 ms
+ * 11:28:40.542  console=PAUSED speedMph=0.0 distance=0.00555 workoutId=3bbc34e0…   <- still live
+ * 11:28:43.134  console=IDLE   speedMph=null distance=null workoutId=null          <- gone
+ * ```
+ *
+ * So the metric services outlive the workout state by at least half a second and are gone by three,
+ * and nothing narrows that further — the poll was running at two seconds. Requiring two post-stop
+ * readings would make every ordinary end depend on which end of that range is true, and if it is
+ * the near end then **every** end escalates. An alarm that always fires is a worse safety defect
+ * than the gap this issue closes, because it teaches a rider to ignore the one that matters.
+ *
+ * Allowing the pre-stop reading to complete the pair removes that dependence for the case the UI
+ * actually produces — the overlay only offers End from PAUSED, where the belt is already at rest
+ * and both readings agree it is. It does not weaken anything: a *moving* belt cannot produce two
+ * at-rest readings straddling a stop on an honest register, and on a dishonest one the distance
+ * veto below still applies. Ending from RUNNING still needs two readings from after the stop,
+ * because there the pre-stop reading says the belt was moving — and if telemetry goes before those
+ * arrive, we genuinely never saw it stop and the escalation is the honest answer.
+ *
+ * ## Why distance may veto a stop but never grant one
+ *
+ * This asymmetry is what makes the rule safe on a console nobody has characterised.
+ *
+ * Distance *advancing* is monotone positive evidence of travel. It cannot be manufactured by coarse
+ * quantisation — a register that ticks in 10 m steps still only ticks when 10 m have actually
+ * passed — so an increase can be trusted without knowing the quantum. It is therefore allowed to
+ * **refuse** a confirmation.
+ *
+ * Distance *failing to advance* is not evidence of rest. A 10 m quantum at 4 mph is five and a half
+ * seconds of real motion reading as "unchanged". The belt run above measured GlassOS's quantum at
+ * roughly **0.45 m** — increments of 2.8e-4 mi once per second at 1 mph, which is fine enough to be
+ * useful — but the FitPro register path counts whole metres and nobody has measured any other
+ * machine. So it is never allowed to **grant** a confirmation, and a machine that publishes no
+ * distance at all cannot have a stop confirmed here. That is the honest degradation: unconfirmed,
+ * and therefore escalated, rather than reassuring.
+ *
+ * This is the leg that catches the failure a speed register cannot report about itself: one that
+ * reports motion, earns [MachineLink.everReportedMotion], and *then* goes dead while the belt is
+ * still running. On the X22i that is not hypothetical — it is what #34 observed, with
+ * `CURRENT_DISTANCE` accumulating the real pace beside a speed stuck at zero.
+ *
+ * ## Why this is stricter than [mayFlattenDeck], which looks like the same question
+ *
+ * It is not the same question. [mayFlattenDeck] asks whether a deck may be driven flat, and gets
+ * that wrong by leaving a deck on a hill. This asks whether a rider may be told their treadmill has
+ * stopped, and gets that wrong by suppressing the one warning that would have sent them to the
+ * safety key. So this requires everything that one does, and then a post-stop reading, a second
+ * agreeing reading, and a distance veto on top. The shared piece is
+ * [MachineLink.everReportedMotion], not the verdict.
+ */
+internal fun stopVerdict(
+    acked: Boolean,
+    everReportedMotion: Boolean,
+    beforeStop: MachineLink.Observation?,
+    postStop: List<MachineLink.Observation>,
+): StopVerdict {
+    if (!acked) return StopVerdict.Unconfirmed(StopUnconfirmed.NOT_ACKED)
+    if (!everReportedMotion) return StopVerdict.Unconfirmed(StopUnconfirmed.NEVER_REPORTED_MOTION)
+    val last = postStop.lastOrNull() ?: return StopVerdict.Unconfirmed(StopUnconfirmed.NOT_OBSERVED)
+    val lastSpeed = last.speedMph
+    if (lastSpeed != null && lastSpeed > BELT_MOVING_MPH) {
+        return StopVerdict.Unconfirmed(StopUnconfirmed.STILL_MOVING)
+    }
+    // The *trailing* run, so a belt that read at rest and then moved again cannot be confirmed by
+    // its earlier readings. A reading of motion partway through is not a problem on its own — that
+    // is the deceleration, and seeing it is the point — it just has to be behind us.
+    //
+    // The reading taken as the stop went out is allowed to complete the run, but never to be the
+    // whole of it: the check below requires the run to contain something from after the stop.
+    val window = listOfNotNull(beforeStop) + postStop
+    val rest = window.takeLastWhile { it.speedMph != null && it.speedMph <= BELT_MOVING_MPH }
+    if (rest.size < 2) return StopVerdict.Unconfirmed(StopUnconfirmed.NOT_OBSERVED)
+    if (rest.none { it.seq >= (postStop.firstOrNull()?.seq ?: Long.MAX_VALUE) }) {
+        return StopVerdict.Unconfirmed(StopUnconfirmed.NOT_OBSERVED)
+    }
+    val from = rest.first().distanceMiles
+    val to = rest.last().distanceMiles
+    if (from == null || to == null) return StopVerdict.Unconfirmed(StopUnconfirmed.NOT_OBSERVED)
+    if (to - from > DISTANCE_STILL_MILES) {
+        return StopVerdict.Unconfirmed(StopUnconfirmed.DISTANCE_ADVANCED)
+    }
+    return StopVerdict.Confirmed
+}
+
+/**
+ * Why a stop was sent, as far as it bears on whether an unconfirmed one is an alarm.
+ *
+ * Not the same as [WorkoutSession.Ending]. That one says what the *rider* did; this says what
+ * Stride knows about whether a belt could be moving, which is a different question with a different
+ * answer for two endings that look identical to a session.
+ */
+internal enum class StopCause {
+    /** The rider ended a workout. Stride asked this belt to move and it agreed. */
+    ENDED,
+
+    /**
+     * A start the console **explicitly refused**. It said no, in as many words, so nothing was set
+     * moving by us. Distinct from a start that went unanswered, which is not a refusal.
+     */
+    START_REFUSED,
+
+    /**
+     * A start that was never answered — cancelled, timed out, or failed. The reply may have been
+     * lost rather than the command not landing, so the belt may well be moving.
+     */
+    START_UNANSWERED,
+}
+
+/**
+ * Whether an unconfirmed stop should escalate the UI to "USE THE SAFETY KEY".
+ *
+ * Pure, and a single greppable function rather than scattered conditions, because it is the one
+ * place in this change that decides *not* to warn somebody.
+ *
+ * ## Why this is not simply "escalate whenever unconfirmed"
+ *
+ * §5.4's rule is about a stop for a belt that may be moving. Firing the same alarm for a stop that
+ * could not have been stopping anything would be worse than not firing it: an alarm a rider sees on
+ * every refused start, on a console with no treadmill plugged into it, is an alarm they learn to
+ * dismiss without reading — and the one time it means what it says, they dismiss that too. Alarm
+ * fatigue is a safety defect, not a UX complaint.
+ *
+ * So the exceptions are narrow, and both are *positive* statements from the machine rather than
+ * absences of evidence:
+ *
+ * - **[MachineLink.consoleDetached]** — the console explicitly reports that no treadmill is
+ *   attached to it. Positive knowledge only; a stale snapshot or a missed poll does not qualify.
+ * - **[StopCause.START_REFUSED]** — the console explicitly refused the start. It answered, and the
+ *   answer was no.
+ *
+ * A start that merely *went unanswered* escalates, and that is deliberate: an earlier draft of this
+ * suppressed the alarm for every start that never reached RUNNING, which quietly covered the case
+ * where the console accepted the start and the *reply* was lost. That is a moving belt with the
+ * alarm turned off, and it is the exact failure [WorkoutSession.abandon] already warns about —
+ * "the refusal we are reacting to may be a reply that was lost rather than a command that never
+ * landed".
+ *
+ * Neither exception can suppress an alarm for a belt we have actually seen moving: [beltSeenMoving]
+ * and the two verdicts that mean "telemetry says it is still going" are checked first.
+ */
+internal fun shouldEscalate(
+    verdict: StopVerdict,
+    cause: StopCause,
+    consoleDetached: Boolean,
+    beltSeenMoving: Boolean,
+): Boolean {
+    val reason = (verdict as? StopVerdict.Unconfirmed)?.reason ?: return false
+    // A newer stop owns the machine now, and its own watcher will speak for it. Escalating here
+    // would raise an alarm about a state that has already been superseded.
+    if (reason == StopUnconfirmed.SUPERSEDED) return false
+    // Evidence of motion overrides every exception below. Nothing may talk us out of an alarm for a
+    // belt telemetry says is moving.
+    if (beltSeenMoving ||
+        reason == StopUnconfirmed.STILL_MOVING ||
+        reason == StopUnconfirmed.DISTANCE_ADVANCED
+    ) {
+        return true
+    }
+    if (consoleDetached) return false
+    if (cause == StopCause.START_REFUSED) return false
+    return true
+}
+
+/**
  * Whether the deck may be driven to flat as part of ending a workout.
+
  *
  * Pure, and separate from [MachineCoordinator], because getting it wrong moves a physical part
  * under someone stepping off a treadmill and every branch has to be checkable without one.
@@ -895,9 +1345,14 @@ internal const val BELT_MOVING_MPH = 0.1
  * The obvious next avenue, if a real motion signal is wanted on such a console: `Rpm` is field 5
  * and **read-only** on FitPro1, which makes it a machine measurement rather than a setpoint, so it
  * may carry roller or motor movement where field 16 is dead. Nobody has checked whether the X22i
- * populates it, so nothing here builds on it — but that is where to look. Corroborating against
- * `CURRENT_DISTANCE` failing to advance would work too. Either would let this be strengthened. It
- * must not be weakened.
+ * populates it, so nothing here builds on it — but that is where to look.
+ *
+ * Corroborating against `CURRENT_DISTANCE` failing to advance would work too, and issue #39's
+ * [stopVerdict] now does exactly that for the stronger question of whether a *stop* is confirmed —
+ * but only in the one direction that is safe under an unmeasured quantum: distance advancing may
+ * refuse a confirmation, distance standing still may never grant one. The same veto would tighten
+ * this gate and has deliberately been left off it, so that #39 could not change #36's behaviour on
+ * the way past. Either would let this be strengthened. It must not be weakened.
  *
  * **Null is not permission.** [MachineLink.speedMph] is null when the snapshot is stale or the
  * machine could not be asked, and "we cannot see the belt" has to mean "do not move anything",

@@ -64,7 +64,16 @@ object WorkoutMediaCoupling {
 
         try {
             when {
-                next == WorkoutSession.State.IDLE && previous != WorkoutSession.State.IDLE ->
+                // An end now arrives as STOPPING — the rider pressed End, and the stop is on the
+                // wire — so the media stops then rather than a confirmation later. Waiting for IDLE
+                // would leave a film playing over a treadmill the rider has finished with for as
+                // long as it takes to answer for the belt. The IDLE arm still covers an abandon,
+                // which goes straight there; `previous != STOPPING` keeps the settle that follows
+                // an end from asking twice.
+                next == WorkoutSession.State.STOPPING ||
+                    (next == WorkoutSession.State.IDLE &&
+                        previous != WorkoutSession.State.IDLE &&
+                        previous != WorkoutSession.State.STOPPING) ->
                     pausePlayingForStoppedWorkout(context)
 
                 previous == WorkoutSession.State.RUNNING && next == WorkoutSession.State.PAUSED ->

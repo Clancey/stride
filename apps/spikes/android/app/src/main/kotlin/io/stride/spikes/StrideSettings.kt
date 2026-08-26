@@ -26,6 +26,16 @@ object StrideSettings {
     private const val KEY_HR_STRAP = "sensor.heartRateStrap"
     private const val KEY_INCLINE_SPACING = "presets.inclineSpacing"
 
+    /**
+     * Persisted because a safety warning that a low-memory kill can clear is not a latch.
+     *
+     * `docs/PLAN.md` §3.1 says a latched safety state "requires an explicit local reset". If the
+     * overlay service is killed while an unconfirmed stop is outstanding, the app must come back up
+     * still saying "USE THE SAFETY KEY" rather than offering to start a belt it never confirmed had
+     * stopped. See [StopEscalation].
+     */
+    private const val KEY_STOP_ESCALATION = "safety.stopEscalation"
+
     /** How Stride is permitted to reach the machine. */
     enum class Transport {
         /** Through iFit's GlassOS gRPC server. The default, and the only one that is implemented. */
@@ -92,6 +102,25 @@ object StrideSettings {
             requirePrefs().edit().apply {
                 if (value == null) remove(KEY_TRACK_FLOOR) else putBoolean(KEY_TRACK_FLOOR, value)
             }.apply()
+        }
+
+    /**
+     * The unacknowledged stop escalation, as a [StopUnconfirmed] name, or null when there is none.
+     *
+     * Stored as the enum's *name* rather than its ordinal so that reordering the reasons cannot
+     * silently turn one warning into another across an update; [StopEscalation.restore] keeps the
+     * latch raised for a name it does not recognise rather than dropping it.
+     */
+    var stopEscalation: String?
+        get() = requirePrefs().getString(KEY_STOP_ESCALATION, null)
+        set(value) {
+            requirePrefs().edit().apply {
+                if (value == null) remove(KEY_STOP_ESCALATION) else putString(KEY_STOP_ESCALATION, value)
+                // Committed synchronously, unlike every other setting here. This one is written
+                // from the path that has just failed to confirm a treadmill stopped, and the very
+                // next thing that may happen is the process being killed — which is precisely the
+                // case the persistence exists for. An asynchronous apply() can lose that write.
+            }.commit()
         }
 
     /**

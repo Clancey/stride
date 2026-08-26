@@ -531,6 +531,42 @@ Two remain **inferred, not verified**: the unit of `CURRENT_DISTANCE` (assumed m
 `RUNNING_TIME` (assumed seconds). They are decoded as such and cross-checked by `FitProProbe`, but
 no capture confirms them.
 
+### Distance resolution on GlassOS — MEASURED (issue #39)
+
+A belt run at 1.0 mph logged `DistanceService/GetDistance` climbing by a steady **2.78e-4 mi per
+second**, which is **≈0.45 m per tick**. So GlassOS's distance is effectively continuous at this
+scale, not quantised into 10 m steps as a worst-case guess had assumed.
+
+That matters because #39 uses distance as a **veto** on a stop confirmation — distance advancing
+after a stop means the belt covered ground, so the stop is not confirmed. A finer quantum makes the
+veto quicker to notice motion. It does **not** turn absence-of-increase into proof of rest, and
+`MachineCoordinator.stopVerdict` still refuses to treat it that way: an increase is monotone
+positive evidence and can be trusted without knowing the quantum, while no increase is only ever the
+absence of evidence. The FitPro register path counts whole metres and no other machine has been
+measured.
+
+### `WorkoutService` and the metric services are on different clocks — MEASURED (issue #39)
+
+Do not assume one implies the other. In the same run, after a stop:
+
+```
+11:28:40.056  Stop -> Ok
+11:28:40.090  SetIncline refused: "WorkoutState IDLE ... expected [[RUNNING]]"   <- +34 ms
+11:28:40.542  GetSpeed/GetDistance still answering, workoutId still stamped      <- +490 ms
+11:28:43.134  everything null, workoutId gone                                    <- +3.1 s
+```
+
+`WorkoutService` had already moved on while the metric services were still serving the finished
+workout's values, and they went away between half a second and three seconds later — the poll was at
+two seconds, so nothing narrows it further. Anything that correlates a command against telemetry has
+to tolerate that skew rather than treat the two as one state.
+
+### The post-End console state is not stable across runs
+
+Two runs of the same sequence landed differently: one refused the end-of-workout incline write for
+`WorkoutState IDLE`, the other for `WorkoutState RESULTS`. Code that branches on the console's state
+after an end must handle both, and neither should be hardcoded from a single observation.
+
 ## Corrections to the previous revision
 
 Each of these was previously stated as verified and was wrong. They are listed because a wrong value

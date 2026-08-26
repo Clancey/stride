@@ -171,6 +171,17 @@ class OverlayService : Service() {
         private const val CHANNEL_ID = "stride_overlay_v2"
         private const val NOTIFICATION_ID = 4321
 
+        /**
+         * A second channel, at IMPORTANCE_HIGH, for the one thing worth interrupting a rider for.
+         *
+         * Separate rather than raising [CHANNEL_ID] for the same reason [CHANNEL_ID] carries a `v2`:
+         * importance is frozen when a channel is created, so a console that has already run Stride
+         * would keep the old one. And the overlay's own notification *should* stay LOW — it is a
+         * way back to the launcher, not an alarm.
+         */
+        private const val ALERT_CHANNEL_ID = "stride_safety_alert_v1"
+        private const val ALERT_NOTIFICATION_ID = 4322
+
         /** Minimum travel before an edge touch is treated as navigation rather than passed up. */
         private const val SWIPE_THRESHOLD_DP = 48f
 
@@ -534,8 +545,7 @@ class OverlayService : Service() {
         }
     }
 
-    private val elapsedTicker = object : Runnable {
-        override fun run() {
+    private val elapsedTicker = object : Runnable {        override fun run() {
             updateElapsedDisplays()
             if (WorkoutSession.state == WorkoutSession.State.RUNNING) {
                 mainHandler.postDelayed(this, 1000L)
@@ -646,6 +656,25 @@ class OverlayService : Service() {
             WindowManager.LayoutParams.TYPE_PHONE
         }
 
+    /**
+     * Raise or clear the safety-key warning, on every surface this service owns.
+     *
+     * Registered rather than called, so the confirmation thread does not have to know whether an
+     * overlay exists. Posted to the main thread because it adds a window.
+     */
+    private val escalationListener = StopEscalation.Listener { escalationActive ->
+        mainHandler.post {
+            if (escalationActive) {
+                showStopEscalation()
+                raiseEscalationNotification()
+            } else {
+                clearEscalationNotification()
+            }
+            // The primary control changes with it: Start is withheld while this is up.
+            updateTransportButtons()
+        }
+    }
+
     override fun onBind(intent: Intent?): IBinder? = null
 
     override fun onCreate() {
@@ -662,6 +691,12 @@ class OverlayService : Service() {
         windowManager = getSystemService(Context.WINDOW_SERVICE) as WindowManager
         systemAudio = SystemAudio(this)
         WorkoutSession.addListener(workoutListener)
+        StopEscalation.addListener(escalationListener)
+        // After the listener, so a latch that outlived the process raises the card and the alert on
+        // the way past rather than sitting in memory with nothing drawing it. This is the case that
+        // matters most: the service being killed while a stop was unconfirmed is exactly when a
+        // rider needs to be told again, and it is exactly when nothing would otherwise tell them.
+        StopEscalation.restore()
         // Start reading the machine here rather than in the Activity: the overlay outlives the
         // launcher UI, and the metrics on it are exactly what someone mid-run is looking at.
         MachineLink.attach(this)
@@ -685,6 +720,7 @@ class OverlayService : Service() {
 
     override fun onDestroy() {
         WorkoutSession.removeListener(workoutListener)
+        StopEscalation.removeListener(escalationListener)
         mainHandler.removeCallbacks(elapsedTicker)
         hideOverlays()
         isRunning = false
@@ -843,14 +879,25 @@ class OverlayService : Service() {
         }
         when (WorkoutSession.state) {
             WorkoutSession.State.IDLE -> {
+                // Start is withheld while a stop is outstanding and unexplained. Offering to set a
+                // belt moving that Stride could not confirm had stopped is the same mistake as
+                // reporting it stopped, one screen later — and the card over this is telling the
+                // rider to go and use the safety key. It comes back the moment they acknowledge it.
+                val escalated = StopEscalation.active
                 configureActionText(
                     primary,
-                    label = "Start workout",
+                    label = if (escalated) "Use the safety key" else "Start workout",
                     primary = true,
                     enabled = true,
+                    destructive = escalated,
                 ) {
-                    WorkoutSession.start()
-                    lastGesture = "timer started"
+                    if (escalated) {
+                        showStopEscalation()
+                        lastGesture = "safety key warning reopened"
+                    } else {
+                        WorkoutSession.start()
+                        lastGesture = "timer started"
+                    }
                 }
                 // Hidden rather than greyed out. A disabled "End workout" beside "Start workout"
                 // is a control the rider has to read and dismiss every time they glance down.
@@ -870,6 +917,24 @@ class OverlayService : Service() {
                 ) {
                     WorkoutSession.abandon()
                     lastGesture = "start cancelled"
+                }
+                endTransportButton?.visibility = View.GONE
+            }
+
+            WorkoutSession.State.STOPPING -> {
+                // The honest sentence for the gap this state exists to cover: the stop is on the
+                // wire and nothing has confirmed the belt is at rest. It stays tappable, and it
+                // sends the stop again — a rider pressing a stop control twice means it harder.
+                // The one thing it must not say is that the workout is over.
+                configureActionText(
+                    primary,
+                    label = "Stopping…",
+                    primary = true,
+                    enabled = true,
+                    destructive = true,
+                ) {
+                    WorkoutSession.stop()
+                    lastGesture = "stop re-sent"
                 }
                 endTransportButton?.visibility = View.GONE
             }
@@ -1030,17 +1095,27 @@ class OverlayService : Service() {
         where: String?,
         actionLabel: String,
         dismissLabel: String? = "Not now",
+        /**
+         * Whether tapping the scrim closes the card.
+         *
+         * False for the safety-key escalation, and that is the whole difference between a card that
+         * *informs* and one that *warns*. Every other card here can be waved away with a tap
+         * anywhere, which is right when the cost of missing it is a fan left on. It is wrong when
+         * the cost is a rider stepping onto a belt Stride could not confirm had stopped.
+         */
+        dismissible: Boolean = true,
+        accent: Int = Color.rgb(214, 158, 62),
         onAction: () -> Unit,
     ) {
         dismissFixIt()
         val scrim = FrameLayout(this).apply {
             setBackgroundColor(Color.argb(196, 2, 5, 11))
             isClickable = true
-            setOnClickListener { dismissFixIt() }
+            if (dismissible) setOnClickListener { dismissFixIt() }
         }
         val card = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
-            background = roundedRect(Color.rgb(9, 14, 24), 30f, Color.argb(180, 214, 158, 62))
+            background = roundedRect(Color.rgb(9, 14, 24), 30f, Color.argb(180, Color.red(accent), Color.green(accent), Color.blue(accent)))
             setPadding(dp(34f), dp(28f), dp(34f), dp(28f))
             isClickable = true
             layoutParams = FrameLayout.LayoutParams(
@@ -1060,7 +1135,7 @@ class OverlayService : Service() {
         )
         if (where != null) {
             card.addView(
-                textView(where, 19f, Color.rgb(214, 158, 62), bold = true).apply {
+                textView(where, 19f, accent, bold = true).apply {
                     layoutParams = LinearLayout.LayoutParams(
                         LinearLayout.LayoutParams.MATCH_PARENT,
                         LinearLayout.LayoutParams.WRAP_CONTENT,
@@ -1086,9 +1161,9 @@ class OverlayService : Service() {
                     }.apply {
                         setTextColor(Color.rgb(5, 10, 18))
                         background = rippleRounded(
-                            color = Color.rgb(214, 158, 62),
+                            color = accent,
                             radius = 22f,
-                            strokeColor = Color.rgb(214, 158, 62),
+                            strokeColor = accent,
                         )
                     },
                 )
@@ -1113,6 +1188,100 @@ class OverlayService : Service() {
     private fun dismissFixIt() {
         fixItView?.let { safeRemove(it) }
         fixItView = null
+    }
+
+    /**
+     * Draw the one card in this app that a rider is not allowed to wave away.
+     *
+     * `docs/PLAN.md` §5.4 requires that a stop which is neither acked nor observed to decelerate
+     * escalates here rather than to "stopped". Everything about this card is chosen against that
+     * sentence:
+     *
+     * - **No scrim dismiss and no "Not now".** Every other card closes on a tap anywhere, which is
+     *   right when the cost of missing it is a fan left running. It is wrong when the cost is a
+     *   rider stepping onto a belt nothing confirmed had stopped. The only way out is the one
+     *   action, and the action is an acknowledgement rather than a fix — Stride cannot fix this.
+     * - **Red, not the amber every other card uses.** This is not a thing that went wrong with the
+     *   app. It is a thing that may be wrong with the treadmill.
+     * - **It says what failed before it says what to do.** "The console never accepted the stop"
+     *   and "the console accepted it and the belt is still moving" are the same verdict and very
+     *   different things to be standing next to.
+     *
+     * It is drawn in the fix-it layer, above the chrome, so it cannot occlude the pinned stop
+     * control — the hazard table's "navigation panel or edge gesture hides the stop control while
+     * moving" row applies here more than anywhere.
+     */
+    private fun showStopEscalation() {
+        showFixIt(
+            title = "USE THE SAFETY KEY",
+            body = StopEscalation.explain(StopEscalation.lastReason) + "\n\n" +
+                StopEscalation.INSTRUCTION,
+            where = null,
+            actionLabel = "I've stopped the belt",
+            dismissLabel = null,
+            dismissible = false,
+            accent = Color.rgb(226, 72, 72),
+        ) {
+            StopEscalation.acknowledge()
+            lastGesture = "safety key warning acknowledged"
+        }
+    }
+
+    /**
+     * The same warning, in the shade, for the case where nobody is looking at the overlay.
+     *
+     * [WorkoutSession]'s own note is that the overlay outlives the Flutter engine and keeps
+     * counting "while the user is inside Netflix" — which is exactly when no card of ours is on
+     * screen. An alarm only a foreground view can raise is not an alarm, so this one goes through
+     * the notification the foreground service already owns.
+     *
+     * A **separate high-importance channel**, because Android freezes a channel's importance at
+     * creation and the overlay's own channel is deliberately LOW. Tapping it returns to the
+     * launcher, which draws the same warning.
+     */
+    private fun raiseEscalationNotification() {
+        val nm = getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
+        // No SDK_INT guard, unlike startForegroundWithNotification above: minSdk is 26, so both
+        // NotificationChannel and FLAG_IMMUTABLE are always available and lint says so. The older
+        // guards predate that floor and are left alone rather than tidied from here.
+        val channel = NotificationChannel(
+            ALERT_CHANNEL_ID,
+            "Treadmill safety alerts",
+            NotificationManager.IMPORTANCE_HIGH,
+        )
+        channel.enableVibration(true)
+        nm.createNotificationChannel(channel)
+        val home = Intent(this, MainActivity::class.java).apply {
+            action = Intent.ACTION_MAIN
+            addCategory(Intent.CATEGORY_LAUNCHER)
+            flags = Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_RESET_TASK_IF_NEEDED
+        }
+        val backToStride = PendingIntent.getActivity(
+            this,
+            1,
+            home,
+            PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE,
+        )
+        val notification: Notification = Notification.Builder(this, ALERT_CHANNEL_ID)
+            .setContentTitle("USE THE SAFETY KEY")
+            .setContentText(StopEscalation.INSTRUCTION)
+            .setStyle(Notification.BigTextStyle().bigText(StopEscalation.INSTRUCTION))
+            .setSmallIcon(android.R.drawable.stat_sys_warning)
+            .setContentIntent(backToStride)
+            // Ongoing and un-cancellable by a swipe: this is a latch, and a rider clearing it from
+            // the shade would be dismissing a safety warning without ever reading what it said.
+            .setOngoing(true)
+            .setAutoCancel(false)
+            .build()
+        runCatching { nm.notify(ALERT_NOTIFICATION_ID, notification) }
+            .onFailure {
+                android.util.Log.w("OverlayService", "could not raise the safety-key notification", it)
+            }
+    }
+
+    private fun clearEscalationNotification() {
+        val nm = getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
+        runCatching { nm.cancel(ALERT_NOTIFICATION_ID) }
     }
 
     private fun distanceText(): String =
