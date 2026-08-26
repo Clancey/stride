@@ -97,7 +97,7 @@ _console_advertised() {
 # its port is pinned, so when both answer, preferring it means the address stays valid across the
 # next daemon restart instead of going stale under whoever cached it.
 find_console() {
-  local connected candidate host svc
+  local connected candidate host svc tried=""
 
   connected="$(command adb devices | awk '$2 == "device" { print $1; exit }')"
   if [ -n "$connected" ]; then echo "$connected"; return 0; fi
@@ -108,13 +108,25 @@ find_console() {
     # Reported rather than swallowed: an advertised service that will not attach is the symptom
     # that sends people looking at the console when the other service type was up all along.
     echo "    $svc advertised $candidate, which did not attach" >&2
+    tried="$tried $candidate"
     host="${candidate%%:*}"
   done
 
   # Last resort, and only for a host mDNS already named: docs/RUNBOOK.md pins classic wireless
   # debugging to 5555, so a console whose pairing record has gone stale is often still reachable
   # there. This is not a hardcoded address — it is a hardcoded *port* on a discovered host.
-  if [ -n "${host:-}" ] && _console_connect "$host:5555"; then echo "$host:5555"; return 0; fi
+  #
+  # Skipped when it was already a candidate. _adb._tcp is by definition advertised on the pinned
+  # port, so when that is the record that failed, retrying the same address buys nothing, costs a
+  # full connect timeout, and prints the identical refusal twice — muddying the legible failure
+  # this is here to produce.
+  if [ -n "${host:-}" ]; then
+    local fallback="$host:5555"
+    case " $tried " in
+      *" $fallback "*) ;;
+      *) if _console_connect "$fallback"; then echo "$fallback"; return 0; fi ;;
+    esac
+  fi
 
   return 1
 }

@@ -44,10 +44,15 @@ So:
 ## Building and testing
 
 ```bash
-cd apps/spikes             && flutter test   # harness: DER scanner, protobuf inspector, mTLS
-cd packages/stride_control && dart test      # safety coordinator, incl. failure modes
-cd tools/glassos_mock      && dart test      # mock console physics and fault injection
+(cd apps/spikes             && flutter test)  # harness: DER scanner, protobuf inspector, mTLS
+(cd packages/stride_control && dart test)     # safety coordinator, incl. failure modes
+(cd tools/glassos_mock      && dart test)     # mock console physics and fault injection
 ```
+
+Each line is a subshell because all three paths are relative to the repo root. Run
+without them and the second `cd` looks for `apps/spikes/packages/stride_control`,
+fails, `&&` short-circuits, and two of the three suites quietly never run — with the
+error scrolling past under `flutter test`'s output.
 
 **Android lint is not optional**, and neither `flutter build` nor the Dart tests will
 catch what it catches:
