@@ -20,6 +20,7 @@ class _SettingsScreenState extends State<SettingsScreen>
   List<Map<String, dynamic>> _grants = const [];
   Map<String, dynamic> _settings = const {};
   bool? _trackFloorChosen;
+  bool _trackBackdropBlank = false;
   bool _loading = true;
 
   /// True while a transport switch is in flight, so the screen can say so
@@ -57,6 +58,7 @@ class _SettingsScreenState extends State<SettingsScreen>
         _grants = grants;
         _settings = settings;
         _trackFloorChosen = floor['chosen'] as bool?;
+        _trackBackdropBlank = floor['backdrop'] as bool? ?? false;
         _loading = false;
       });
     } on Object {
@@ -105,13 +107,47 @@ class _SettingsScreenState extends State<SettingsScreen>
                     subtitle:
                         'The lap oval behind the controls. Automatic hides it while a video is '
                         'playing and shows it the rest of the time.',
-                    child: _TrackFloorChoice(
-                      chosen: _trackFloorChosen,
-                      onChanged: (value) async {
-                        await SpikeBridge.trackFloorSet(value);
-                        if (!mounted) return;
-                        setState(() => _trackFloorChosen = value);
-                      },
+                    child: Column(
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      children: [
+                        _TrackFloorChoice(
+                          chosen: _trackFloorChosen,
+                          onChanged: (value) async {
+                            // Only mirror what the platform actually accepted.
+                            // This screen used to record the tap regardless, so
+                            // a refused write looked like it had worked right up
+                            // until the next reload put the old value back.
+                            final ok = await SpikeBridge.trackFloorSet(value);
+                            if (!mounted || !ok) return;
+                            setState(() => _trackFloorChosen = value);
+                          },
+                        ),
+                        const SizedBox(height: StrideSpace.lg),
+                        Text(
+                          'Behind the track',
+                          style: Theme.of(context).textTheme.titleMedium,
+                        ),
+                        const SizedBox(height: StrideSpace.xxs),
+                        Text(
+                          _trackFloorChosen == true
+                              ? 'Plain replaces the app grid with a quiet backdrop while the '
+                                    'track is up. Tap the screen to bring the launcher back.'
+                              : 'Only applies while the track floor is Always on — the rest of '
+                                    'the time the track is not over the launcher at all.',
+                          style: Theme.of(context).textTheme.bodyMedium,
+                        ),
+                        const SizedBox(height: StrideSpace.md),
+                        _TrackBackdropChoice(
+                          blank: _trackBackdropBlank,
+                          onChanged: (value) async {
+                            final ok = await SpikeBridge.trackBackdropSet(
+                              value,
+                            );
+                            if (!mounted || !ok) return;
+                            setState(() => _trackBackdropBlank = value);
+                          },
+                        ),
+                      ],
                     ),
                   ),
                   const SizedBox(height: StrideSpace.lg),
@@ -529,6 +565,66 @@ class _TrackFloorChoice extends StatelessWidget {
   }
 }
 
+/// Whether Stride's own launcher stands down while the track floor is drawn.
+///
+/// Two pills rather than three: unlike the track floor there is no useful
+/// "automatic" here. The launcher is only ever behind the track once the rider
+/// has asked for the track, so "decide for me" and "leave it alone" would be
+/// the same answer.
+class _TrackBackdropChoice extends StatelessWidget {
+  const _TrackBackdropChoice({required this.blank, required this.onChanged});
+
+  final bool blank;
+  final ValueChanged<bool> onChanged;
+
+  @override
+  Widget build(BuildContext context) {
+    return Row(
+      children: [
+        _pill(context, 'Launcher', !blank, () => onChanged(false)),
+        const SizedBox(width: StrideSpace.sm),
+        _pill(context, 'Plain', blank, () => onChanged(true)),
+      ],
+    );
+  }
+
+  Widget _pill(
+    BuildContext context,
+    String label,
+    bool selected,
+    VoidCallback onTap,
+  ) {
+    return Expanded(
+      child: Material(
+        color: selected ? StrideColors.accent : StrideColors.panelHigh,
+        borderRadius: BorderRadius.circular(StrideRadius.md),
+        child: InkWell(
+          borderRadius: BorderRadius.circular(StrideRadius.md),
+          onTap: onTap,
+          child: Container(
+            height: StrideSpace.minTouch,
+            alignment: Alignment.center,
+            decoration: BoxDecoration(
+              borderRadius: BorderRadius.circular(StrideRadius.md),
+              border: Border.all(
+                color: selected ? StrideColors.accent : StrideColors.line,
+              ),
+            ),
+            child: Text(
+              label,
+              style: TextStyle(
+                fontSize: 17,
+                fontWeight: FontWeight.w700,
+                color: selected ? StrideColors.ink : StrideColors.text,
+              ),
+            ),
+          ),
+        ),
+      ),
+    );
+  }
+}
+
 /// Kept shut by default and behind a second tap.
 ///
 /// The one switch in here can stop the treadmill responding, so it should not sit in the path of
@@ -797,10 +893,7 @@ class _HeartRateRow extends StatelessWidget {
                   style: Theme.of(context).textTheme.titleMedium,
                 ),
                 const SizedBox(height: StrideSpace.xxs),
-                Text(
-                  _summary(),
-                  style: Theme.of(context).textTheme.bodyMedium,
-                ),
+                Text(_summary(), style: Theme.of(context).textTheme.bodyMedium),
               ],
             ),
           ),

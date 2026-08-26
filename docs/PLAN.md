@@ -623,6 +623,7 @@ The console is 1920x1080 at density 160, so 1 dp is 1 px and every number below 
 | Speed / incline rails | left and right, 132 dp, scrollable presets | chrome visible; toggleable per side |
 | Bottom bar | bottom, 132 px — Back / Home / Recents, timer transport, volume, fan, toggles | always, while chrome visible |
 | Track floor | the whole centre region — everything the strip, bottom bar and rails leave over | a workout exists, no video playing, not over Stride's own launcher; toggleable ("Track") |
+| Plain backdrop | Stride's launcher, behind the track floor | the rider chose it **and** a track floor window is actually attached |
 | Goal ring | bottom right, 260 dp | a goal exists **and** a session exists to measure it against |
 | Now-playing card | bottom left | music (not video) has an active `MediaSession` |
 
@@ -646,6 +647,20 @@ Rules this surface has already had to learn the hard way:
   that outlives a single dropped poll, so the track's lap marker holds its last known position for a
   few seconds and then disappears entirely. Drawing "we cannot see you" as a marker parked on the
   start line claims the runner teleported back to the beginning, once a second, forever.
+- **A finished lap is not an erased lap.** The progress band used to collapse at the lap boundary
+  and let the plain lane colour back through, which read as the rider's work being thrown away once
+  a lap. The colour a lap was filled with now *becomes* the track's base colour and the next lap
+  paints the next colour over it, cycling through `LapPalette`. Lane and band are drawn as disjoint
+  regions rather than one over the other, because a composited band loses its underlay the instant
+  it is promoted and the whole loop visibly thins — the same reset in a subtler form. Position and
+  lap cross into the view in one call for the same reason: applied separately, the incoming colour
+  gets drawn around ~99% of the loop for the second the marker spends animating through the wrap.
+- **The rider can have Stride's own launcher stand down behind the track**, but only while a track
+  floor window is genuinely attached — the *choice* is not enough. The console has no physical Home
+  or Back button, so blanking the launcher for a track that failed to appear would leave nothing on
+  screen and nothing to press. The backdrop is therefore drawn by the launcher rather than as
+  another overlay window, is tappable anywhere, and carries a labelled way back; the overlay's Home
+  button reveals it too.
 - **Every bottom sheet in the launcher goes through `showStrideSheet()`.** A stock
   `showModalBottomSheet` sizes against the full window, ignores the ~318 px the HUD occupies, and
   clipped a safety warning mid-sentence.

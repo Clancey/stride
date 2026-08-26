@@ -162,6 +162,7 @@ class SpikeBridge(private val context: Context) : MethodChannel.MethodCallHandle
                 "mediaSkipPrevious" -> result.success(MediaNowPlaying.skipPrevious(context))
                 "trackFloorGet" -> result.success(trackFloorGet())
                 "trackFloorSet" -> result.success(trackFloorSet(call))
+                "trackBackdropSet" -> result.success(trackBackdropSet(call))
 
                 // --- settings + system grants ---
                 "settingsGet" -> result.success(settingsGet())
@@ -793,16 +794,50 @@ class SpikeBridge(private val context: Context) : MethodChannel.MethodCallHandle
 
     // ------------------------------------------------------------------ track floor
 
-    private fun trackFloorGet(): Map<String, Any?> = mapOf(
-        "on" to OverlayService.trackFloorOn(context),
-        // Null means "nobody has chosen" — the UI shows the toggle following playback, not a
-        // setting the rider picked, and that distinction is worth surfacing.
-        "chosen" to OverlayService.trackFloorChosen,
-        "videoPlaying" to MediaNowPlaying.videoIsPlaying(context),
-    )
+    private fun trackFloorGet(): Map<String, Any?> {
+        StrideSettings.attach(context)
+        return mapOf(
+            "on" to OverlayService.trackFloorOn(context),
+            // What the rider asked for and what is actually on screen are different questions, and
+            // the launcher needs the second one before it will blank itself. See
+            // [OverlayService.trackFloorVisible].
+            "visible" to OverlayService.trackFloorVisible,
+            // Null means "nobody has chosen" — the UI shows the toggle following playback, not a
+            // setting the rider picked, and that distinction is worth surfacing.
+            "chosen" to OverlayService.trackFloorChosen,
+            "backdrop" to StrideSettings.trackBackdrop,
+            "videoPlaying" to MediaNowPlaying.videoIsPlaying(context),
+        )
+    }
 
+    /**
+     * Set the rider's track-floor choice, where a *present* null means "decide automatically".
+     *
+     * The key is `chosen`, and it has to be: this read `on` for its whole life, which is a key Dart
+     * has never sent, so `argument` answered null every time and every press of "Always on" or
+     * "Always off" silently stored "automatic". The pills looked like they worked because the
+     * settings screen kept its own copy — until the next reload, when the platform's answer came
+     * back and overwrote it.
+     *
+     * Absent and null are therefore not the same thing and cannot be collapsed. A missing key is a
+     * malformed call and is refused, which is what stops the same mistake from being silent twice.
+     */
     private fun trackFloorSet(call: MethodCall): Boolean {
-        OverlayService.setTrackFloor(call.argument<Boolean>("on"))
+        if (!call.hasArgument("chosen")) return false
+        OverlayService.setTrackFloor(call.argument<Boolean>("chosen"))
+        return true
+    }
+
+    /**
+     * Turn the launcher's plain backdrop on or off.
+     *
+     * Only stored. Nothing on the overlay draws it — the launcher is what stands down — so unlike
+     * every other setting here there is no `refreshChrome()` to follow it with.
+     */
+    private fun trackBackdropSet(call: MethodCall): Boolean {
+        StrideSettings.attach(context)
+        val blank = call.argument<Boolean>("blank") ?: return false
+        StrideSettings.trackBackdrop = blank
         return true
     }
 

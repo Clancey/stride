@@ -45,15 +45,49 @@ class TrackFloorView(context: Context) : View(context) {
      * one-second poll of a distance register and a marker that teleports once a second reads as
      * broken. A jump of more than [SNAP_FRACTION] of a lap is treated as a seek or a new session
      * and lands immediately.
+     *
+     * Written only through [setLapPosition], because it is not independent of [lap].
      */
     var progress: Float? = null
-        set(value) {
-            val next = value?.let { floorMod(it, 1f) }
-            if (next == field) return
-            val previous = field
-            field = next
-            applyProgress(next, previous)
+        private set
+
+    /**
+     * Which lap the rider is on, 1-based, as [LapTracker] counts them. Selects the colours.
+     *
+     * Written only through [setLapPosition]. Changing it rebuilds the lane and band shaders, which
+     * is why it must not be driven from anything that ticks — the host redraws this view once a
+     * second and rebuilding three gradients at that rate for a number that changes every few
+     * minutes would be pure waste.
+     */
+    var lap: Int = 1
+        private set
+
+    /**
+     * Move the rider to a new position on a given lap, as one indivisible update.
+     *
+     * These arrive together from one sample and must be applied together. Setting them separately
+     * was wrong in a way that only showed up at the moment this class exists to get right: at a lap
+     * boundary progress goes from ~0.99 to ~0.01, which [applyProgress] correctly treats as a small
+     * step forward and animates over a second. If the colour flipped the instant the lap number
+     * did, that second would be spent drawing the *new* lap's colour across ~99% of the loop before
+     * collapsing it to nothing — a full-loop flash of a colour the rider has not run yet.
+     *
+     * So a lap change lands rather than animates. The marker skips the last 1% of the old lap,
+     * which is two pixels and one frame, and in exchange the promotion of the old band to the new
+     * base colour happens in the same frame as the wrap, which is the whole point.
+     */
+    fun setLapPosition(progress: Float?, lap: Int) {
+        val lapChanged = lap != this.lap
+        if (lapChanged) {
+            this.lap = lap
+            buildLaneShaders()
         }
+        val next = progress?.let { floorMod(it, 1f) }
+        if (!lapChanged && next == this.progress) return
+        val previous = this.progress
+        this.progress = next
+        applyProgress(next, previous, land = lapChanged)
+    }
 
     /** Small line above the title, e.g. "LAP 3". Empty hides it. Invalidates on change. */
     var lapBadge: String = ""
@@ -105,6 +139,9 @@ class TrackFloorView(context: Context) : View(context) {
 
         /** Beyond this much of a lap in one sample it is a seek or a fresh session, not running. */
         const val SNAP_FRACTION = 0.34f
+
+        /** Below this much progress there is no band worth drawing, and the whole loop is lane. */
+        const val BAND_EPSILON = 0.0005f
     }
 
     private val density: Float = resources.displayMetrics.density
@@ -118,6 +155,8 @@ class TrackFloorView(context: Context) : View(context) {
     }
     private val bandEdgePaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
         style = Paint.Style.STROKE
+        // Lap 1's edge. Replaced by [buildLaneShaders] as the lap rotates; this is only what the
+        // paint holds before the first fit, when nothing is drawn anyway.
         color = Color.rgb(0xCF, 0xFF, 0xF4)
         strokeWidth = 1.4f * resources.displayMetrics.density
     }
@@ -138,6 +177,9 @@ class TrackFloorView(context: Context) : View(context) {
     }
     private val markerBodyPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
         style = Paint.Style.FILL
+        // Deliberately fixed while the lane and band rotate through [LapPalette]. The marker is the
+        // rider, not the lap: a pin that changed colour with the ground it stands on would be the
+        // one thing on this surface that is always the same shade as its own background.
         color = Color.rgb(0x5C, 0xE8, 0xD2)
     }
     private val markerInnerPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
@@ -173,6 +215,7 @@ class TrackFloorView(context: Context) : View(context) {
 
     private val lanePath = Path()
     private val bandPath = Path()
+    private val remainderPath = Path()
     private val dashPath = Path()
     private val chequerPath = Path()
     private val markerPath = Path()
@@ -187,6 +230,11 @@ class TrackFloorView(context: Context) : View(context) {
 
     private val geometry = TrackGeometry()
     private var geometryReady = false
+
+    // The vertical span the lane and band gradients are stretched over. Cached from the last fit
+    // because a lap change has to rebuild those two shaders without a size change to hang off.
+    private var shaderTop = 0f
+    private var shaderBottom = 0f
 
     private var badgeY = 0f
     private var titleY = 0f
@@ -226,9 +274,21 @@ class TrackFloorView(context: Context) : View(context) {
         if (!geometryReady) return
         applyDim()
 
-        canvas.drawPath(lanePath, lanePaint)
+        // Lane and band are drawn as two disjoint regions rather than one over the other. They used
+        // to overlap, and that is what made a lap boundary still read as a reset even with the
+        // colours rotating: the completed side of the loop was band-composited-over-lane, so the
+        // instant the band was promoted to be the base colour it lost the lane underneath it and
+        // the whole loop thinned. Disjoint regions promote pixel-for-pixel. See LapPalette.
         val hasProgress = progress != null
-        if (hasProgress) drawCompletedBand(canvas)
+        val covered = if (hasProgress) shownProgress else 0f
+        if (covered <= BAND_EPSILON) {
+            canvas.drawPath(lanePath, lanePaint)
+        } else {
+            buildLapPaths(covered)
+            canvas.drawPath(remainderPath, lanePaint)
+            canvas.drawPath(bandPath, bandPaint)
+            canvas.drawPath(bandPath, bandEdgePaint)
+        }
         canvas.drawPath(lanePath, outerRimPaint)
         canvas.drawPath(dashPath, dashPaint)
         canvas.drawPath(chequerPath, chequerPaint)
@@ -258,7 +318,10 @@ class TrackFloorView(context: Context) : View(context) {
         buildLanePath()
         buildDashPath()
         buildChequerPath()
-        buildShaders(geometry.outerTop, geometry.outerBottom)
+        shaderTop = geometry.outerTop
+        shaderBottom = geometry.outerBottom
+        buildLaneShaders()
+        buildScrimShader()
 
         geometryReady = true
         layoutLabels()
@@ -316,29 +379,39 @@ class TrackFloorView(context: Context) : View(context) {
      *
      * A flat opaque band reads as a plastic ring lying on the glass; letting the far side sink into
      * whatever is playing underneath is what makes it read as ground receding away from the rider.
-     * The infield scrim is the exception — text over an album grid needs something opaque behind it.
+     * [LapPalette] holds every colour to that shape, so a lap eight laps in still looks like ground.
+     *
+     * Rebuilt on a size change *and* on a lap change, and on nothing else. It allocates three
+     * shaders, so a version of this that ran per frame would be allocating in a one-second redraw
+     * loop that is otherwise documented as allocation-free.
      */
-    private fun buildShaders(top: Float, bottom: Float) {
-        lanePaint.shader = LinearGradient(
-            0f, top, 0f, bottom,
-            intArrayOf(
-                Color.argb(76, 0x6C, 0x65, 0xBE),
-                Color.argb(134, 0x8A, 0x83, 0xDC),
-                Color.argb(205, 0xAD, 0xA6, 0xF6),
-            ),
-            floatArrayOf(0f, 0.55f, 1f),
-            Shader.TileMode.CLAMP,
-        )
-        bandPaint.shader = LinearGradient(
-            0f, top, 0f, bottom,
-            intArrayOf(
-                Color.argb(78, 0x40, 0xC8, 0xB8),
-                Color.argb(128, 0x50, 0xD8, 0xC4),
-                Color.argb(190, 0x68, 0xEE, 0xD6),
-            ),
-            floatArrayOf(0f, 0.55f, 1f),
-            Shader.TileMode.CLAMP,
-        )
+    private fun buildLaneShaders() {
+        // A fit that has not happened yet, or a degenerate one, gives a zero-height gradient — and
+        // LinearGradient with equal endpoints paints the last colour flat across the whole loop.
+        if (shaderBottom <= shaderTop) return
+        val lane = LapPalette.lane(lap)
+        val band = LapPalette.band(lap)
+        lanePaint.shader = verticalFill(lane)
+        bandPaint.shader = verticalFill(band)
+        // Safe to write the colour even though [applyDim] owns this paint's alpha: applyDim runs
+        // first on every frame and re-asserts it from the design table, so only the hue survives.
+        bandEdgePaint.color = band.edge
+    }
+
+    private fun verticalFill(fill: LapPalette.Fill): LinearGradient = LinearGradient(
+        0f, shaderTop, 0f, shaderBottom,
+        intArrayOf(fill.far, fill.mid, fill.near),
+        floatArrayOf(0f, 0.55f, 1f),
+        Shader.TileMode.CLAMP,
+    )
+
+    /**
+     * The infield scrim: the one thing here that is deliberately not translucent at its centre.
+     *
+     * Text over an album grid or a poster wall needs something opaque behind it. Purely a function
+     * of size, so unlike the lane and band this never has to be rebuilt for a lap change.
+     */
+    private fun buildScrimShader() {
         val scrimRadius = max(geometry.infieldWidth, geometry.infieldHeight) * 0.42f
         if (scrimRadius > 0f) {
             scrimPaint.shader = RadialGradient(
@@ -377,23 +450,36 @@ class TrackFloorView(context: Context) : View(context) {
         subtitleY = geometry.infieldCenterY + geometry.infieldHeight * 0.18f
     }
 
-    private fun drawCompletedBand(canvas: Canvas) {
-        val p = shownProgress
-        if (p <= 0.0005f) return
-        val last = (p * SAMPLES).toInt().coerceIn(0, SAMPLES)
+    /**
+     * Cut the loop at [covered] into the part this lap has run and the part it has not.
+     *
+     * Both walk the same cached sample tables and meet exactly on the projected cut, so the two
+     * fills tile the ring without overlapping and without a gap. Reuses two instance Paths because
+     * this runs on every frame of the marker animation.
+     */
+    private fun buildLapPaths(covered: Float) {
+        val last = (covered * SAMPLES).toInt().coerceIn(0, SAMPLES)
+        geometry.project(covered, 1f)
+        val cutOuterX = geometry.x
+        val cutOuterY = geometry.y
+        geometry.project(covered, -1f)
+        val cutInnerX = geometry.x
+        val cutInnerY = geometry.y
 
         bandPath.reset()
         bandPath.moveTo(outerX[0], outerY[0])
         for (i in 1..last) bandPath.lineTo(outerX[i], outerY[i])
-        geometry.project(p, 1f)
-        bandPath.lineTo(geometry.x, geometry.y)
-        geometry.project(p, -1f)
-        bandPath.lineTo(geometry.x, geometry.y)
+        bandPath.lineTo(cutOuterX, cutOuterY)
+        bandPath.lineTo(cutInnerX, cutInnerY)
         for (i in last downTo 0) bandPath.lineTo(innerX[i], innerY[i])
         bandPath.close()
 
-        canvas.drawPath(bandPath, bandPaint)
-        canvas.drawPath(bandPath, bandEdgePaint)
+        remainderPath.reset()
+        remainderPath.moveTo(cutOuterX, cutOuterY)
+        for (i in last + 1..SAMPLES) remainderPath.lineTo(outerX[i], outerY[i])
+        for (i in SAMPLES downTo last + 1) remainderPath.lineTo(innerX[i], innerY[i])
+        remainderPath.lineTo(cutInnerX, cutInnerY)
+        remainderPath.close()
     }
 
     private fun drawInfield(canvas: Canvas) {
@@ -450,12 +536,15 @@ class TrackFloorView(context: Context) : View(context) {
     }
 
     /**
-     * Take a new lap position, animating toward it unless the jump says it is not running.
+     * Take a new lap position, animating toward it unless something says not to.
      *
      * [previous] being null means the track has been dark — there was nothing on screen to animate
-     * from, so the first known position lands rather than sweeping in from the start line.
+     * from, so the first known position lands rather than sweeping in from the start line. [land]
+     * says the same thing for a different reason: the lap number just changed, and the colours went
+     * with it, so animating across the wrap would draw the new lap's colour around almost the whole
+     * loop before collapsing it. See [setLapPosition].
      */
-    private fun applyProgress(next: Float?, previous: Float?) {
+    private fun applyProgress(next: Float?, previous: Float?, land: Boolean) {
         removeCallbacks(animTick)
         if (next == null) {
             invalidate()
@@ -464,7 +553,7 @@ class TrackFloorView(context: Context) : View(context) {
         // Distance only ever grows, so the marker only ever runs forward; the wrap past the start
         // line is a small forward step, not a lap-long sprint backwards.
         val delta = floorMod(next - shownProgress, 1f)
-        if (previous == null || delta > SNAP_FRACTION || windowToken == null) {
+        if (land || previous == null || delta > SNAP_FRACTION || windowToken == null) {
             shownProgress = next
             invalidate()
             return
