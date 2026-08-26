@@ -302,6 +302,11 @@ class _SettingsScreenState extends State<SettingsScreen>
                     'controls it has and only offer those, so what works '
                     'depends on your machine — and if nothing answers, speed, '
                     'incline and fan stop responding until you switch back.\n\n'
+                    'Switching back may not be enough on its own. Taking the '
+                    "USB connection means taking it from iFit, and iFit does "
+                    'not always get it back — on this console it stayed '
+                    'disconnected from the belt until the machine was '
+                    'restarted. Expect to reboot before iFit works again.\n\n'
                     'The safety key remains the only emergency stop either way.',
         ),
         actions: [

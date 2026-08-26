@@ -61,6 +61,43 @@ ADB — the realistic risk is a crash-looping HOME app starving the device, plus
 possibility that ADB was never going to come back anyway. Cold reconnect plus a power cycle is the
 proof that matters.
 
+### Making Wi-Fi ADB survive a reboot — VERIFIED on a 1750
+
+The default does not. **Wireless debugging is off after every reboot**, and turning it back on needs
+Developer options *on the console* — which is the one thing you cannot reach when the launcher is
+broken, which is the one time you need ADB. Worse, its port is random per boot, so even a device that
+came back has to be re-found over mDNS.
+
+Note what does *not* fix it: `adb_wifi_enabled` is already `1` and `persist.adb.tls_server.enable` is
+already `1` on a console where wireless debugging has been used, and it still comes up off. The
+setting persists; the service does not act on it at boot.
+
+What does work is adbd's own persistent port, which it reads at every start:
+
+```bash
+adb shell setprop persist.adb.tcp.port 5555   # survives reboots; shell may set it, no root needed
+adb tcpip 5555                                # apply it now without waiting for a reboot
+adb connect <console-ip>:5555
+```
+
+Verified across a real reboot on a Commercial 1750: uptime back to 1 minute, `service.adb.tcp.port`
+empty (so nothing was left over from `adb tcpip`), and `adb connect <ip>:5555` succeeded with **no
+screen interaction at all**. It also survived a console power cycle.
+
+Two things to know before relying on it:
+
+- **This is classic ADB auth, not the TLS pairing flow.** It works because your host key is already
+  in `/data/misc/adb/adb_keys` — pairing once puts it there. Check before you depend on it:
+  ```bash
+  adb shell cat /data/misc/adb/adb_keys | awk '{print $1}'   # compare to ~/.android/adbkey.pub
+  ```
+  On a host whose key is *not* trusted, port 5555 answers and then sits at `unauthorized`, which
+  needs a dialog on the console — exactly the lockout this is meant to prevent.
+- **It is a fixed, always-open ADB port on your LAN**, authenticated only by that key. Fine for a
+  treadmill on a home network; think about it before doing it on a shared one.
+
+Set a static DHCP lease at the same time. A fixed port on a moving IP is only half an answer.
+
 ### Record the state you are restoring to
 
 ```bash

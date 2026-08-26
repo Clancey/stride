@@ -37,6 +37,26 @@ object StridePermissions {
     const val ACCESSIBILITY = "accessibility"
     const val NOTIFICATIONS = "notifications"
 
+    /** What [repair] calls the fix for a console that cannot go home. */
+    const val NAVIGATION = "navigation"
+
+    /**
+     * `Settings.Secure.USER_SETUP_COMPLETE`, named here because the constant is `@hide`.
+     *
+     * Set to 1 by the setup wizard. A console that never ran one leaves it at 0 forever, and Android
+     * reads that as "setup still in progress" and refuses to launch a home activity at all.
+     */
+    private const val USER_SETUP_COMPLETE = "user_setup_complete"
+
+    /**
+     * Whether Android believes this device has finished being set up.
+     *
+     * Only ever read to decide whether to repair it. A console that answers 0 here has a HOME key
+     * that silently does nothing, however healthy everything else is.
+     */
+    fun userSetupComplete(context: Context): Boolean =
+        Settings.Secure.getInt(context.contentResolver, USER_SETUP_COMPLETE, 0) == 1
+
     fun all(context: Context): List<Grant> = listOf(
         Grant(
             id = OVERLAY,
@@ -137,6 +157,22 @@ object StridePermissions {
     fun repair(context: Context): List<String> {
         if (!canRepair(context)) return emptyList()
         val repaired = mutableListOf<String>()
+        if (!userSetupComplete(context)) {
+            // Android refuses to start *any* home activity while it believes setup is unfinished —
+            // `ActivityTaskManagerService` logs "Not going home because user setup is in progress"
+            // and drops the request. On a console that never ran a setup wizard the flag is simply
+            // never set, and the effect is not subtle: the HOME key does nothing, Stride's own Home
+            // button does nothing, and a rider who opens Netflix on a machine with no physical
+            // buttons cannot get back out. Reported as "most of the buttons don't work", which is
+            // what it looks like from the outside.
+            //
+            // `device_provisioned` is deliberately not touched. It was already 1 on the console this
+            // was found on, the two flags mean different things, and this class's rule is to change
+            // the narrowest thing that fixes the fault.
+            if (writeSecure(context, USER_SETUP_COMPLETE, "1")) {
+                repaired += NAVIGATION
+            }
+        }
         if (!hasAccessibility(context)) {
             val self = ComponentName(context, StrideAccessibilityService::class.java)
                 .flattenToString()

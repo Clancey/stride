@@ -464,6 +464,9 @@ that look alike" above rather than here, because the trap is that it looks wrong
   `DEVICE_INFO`, `SYSTEM_INFO`, `VERSION_INFO`, `SUPPORTED_COMMANDS`, `VERIFY_SECURITY`, and every
   register read confirmed working end to end after the addressing fix above. The remaining open item
   is starting a workout — see below.
+- **A Commercial 1750 (FitPro2, USB product 3) is a different story**, and the two should not be read
+  as one result. It answers frames but has never completed `DEVICE_INFO`; see "Run against real
+  hardware" below for what it does instead and for the sync sequence it expects first.
 - Distance and elapsed-time units are inferred (above).
 - `SUPPORTED_DEVICES` is never requested — `connect` sends `SUPPORTED_COMMANDS` and then only
   `SYSTEM_INFO`, `VERSION_INFO` and `SERIAL_NUMBER`, and `parseSupportedDevices` has no callers — so
@@ -511,3 +514,159 @@ that look alike" above rather than here, because the trap is that it looks wrong
 - The preset **ladder step** (1.0) is invented. No preset register exists in FitPro, so the direct
   path must synthesise the quick picks; the endpoints come from the machine's own MIN/MAX registers,
   but nothing corroborates the spacing between them.
+
+## Run against real hardware — a Commercial 1750 (FITPRO2, USB product 3)
+
+The first readback against a live console. Three things were settled, and none of them is the wire
+format: the format was never reached.
+
+**The board.** `vendor 8508 / product 3`, `iFIT-LargeX`, one interface of class 255 (vendor
+specific) carrying an **interrupt** pipe each way, both 64-byte, `bInterval 1`. No bulk endpoints at
+all — so [`isDataPipeType`] accepting interrupt endpoints is what makes this device reachable, not a
+FitPro1-only allowance.
+
+**`bulkTransfer` drives those interrupt endpoints.** Measured, not assumed: once the interface was
+genuinely Stride's, ordinary `bulkTransfer` moved frames both ways and the console answered. This is
+`USBDEVFS_BULK` being turned into an interrupt URB by `usb_bulk_msg`, which is what the code claimed
+and is now confirmed on this kernel. A `UsbRequest` path exists behind it as a fallback for a kernel
+where that does not hold; on this console it is never reached.
+
+**The interface is the whole fight, and iFit wins it by default.** `com.ifit.glassos_service` holds
+the console's USB interface from boot. While it does:
+
+- `openDevice` succeeds, `claimInterface(force = true)` returns true, and then **every transfer
+  fails instantly** — not a timeout, an immediate refusal, on both `bulkTransfer` and `UsbRequest`.
+  From the rider's side this is indistinguishable from an absent treadmill, which is why
+  `describeBus` now reports "opened it but could not move a single byte" as its own case.
+- Forcing the claim **breaks iFit until the console is rebooted.** Android's `force` issues
+  `USBDEVFS_DISCONNECT` and nothing ever issues `USBDEVFS_CONNECT`, so GlassOS lost its link to the
+  lower board and reported `DISCONNECTED` from then on. Restarting `glassos_service` did not recover
+  it; a reboot did. `FitProTransport.close` carried this as a suspicion marked "very likely
+  harmless". It is neither.
+
+  Hence: claim plainly first and force only as a fallback, and say so in the opt-in.
+
+**And then the console refuses the protocol.** With the link genuinely working, `DEVICE_INFO`
+returns `CMD_NOT_SUPPORTED` from `ADDRESS_MAIN` and `ADDRESS_TREADMILL` alike. The console is
+answering well-formed frames and declining the command.
+
+That is the outcome [`Variant.FITPRO2`] already warned about in writing: this codec is the console
+talking **down to its motor board**, and a FitPro2 console presenting itself on USB is the
+app-facing link — `Sindarin.FitPro2.Core`'s `[communicationType][device|command][payloadLength]
+[payload]`, a different wire with no checksum. Selecting the register codec for product id 3 was
+recorded as unconfirmed; it is now confirmed **wrong** for this direction of the link.
+
+So direct access is not usable on a 1750 as things stand, and the handshake failure now says which
+of the two possible reasons it hit rather than the single sentence "No FitPro device answered" that
+covered both. Driving a product-3 board directly means implementing the app-to-console protocol,
+which this file does not describe.
+
+### Confirmed: forcing the claim takes the belt away, and only a replug gives it back
+
+The consequence above was measured end to end on the 1750, in both directions.
+
+Switching to direct access with the USB permission granted severed the console from its treadmill.
+GlassOS reported `DISCONNECTED` from then on, and it did **not** come back from restarting
+`glassos_service`, from restarting Stride, or from `adb reboot`. Checked at the kernel afterwards,
+the board was not merely unclaimed — it was **gone from the bus**: `num_connects=0`,
+`/sys/bus/usb/devices/` holding nothing but the four root hubs, and no `/dev/bus/usb/003/002`. A
+device that is not enumerated cannot be recovered by anything in userspace, which is why every
+restart failed and why the rider-facing copy says *power-cycled at the wall*. Unplugging the
+console's USB lead and plugging it back in re-enumerated it (`3-1 213c iFIT-LargeX`) and GlassOS
+attached again immediately.
+
+With the refusal in place the same sequence is now harmless. Selecting direct access, granting the
+USB dialog, and switching back to iFit leaves the link untouched:
+
+```
+I MachineLink:     usb permission broadcast: claimed=true, actually granted=true
+W FitProTransport: usb: /dev/bus/usb/003/002 is held by another process and GlassOS is
+                   running; refusing to force the claim
+I MachineLink:     console Connect -> Attached(state=2)
+```
+
+`Attached(state=2)` is `IDLE` — the console still has its treadmill, during and after the attempt.
+
+One more thing this run settled, which is easy to mistake for a dead link: with GlassOS attached and
+the machine idle, `SetIncline` comes back
+
+```
+WorkoutState IDLE is not valid for this operation, expected one of [[RUNNING]]
+```
+
+That is a healthy console decoding the command and declining it. Speed and incline only move once a
+workout is running, so a refusal in that shape is evidence the link works, not that it does not.
+
+## Read against GlassOS 6.14.6, and the FitPro2 handshake corrected
+
+Everything below is from the decompiled `com.ifit.glassos_service` rather than from the C#, and each
+claim names the class it came from. Three of them contradict what this file previously said.
+
+### Confirmed unchanged
+
+The wire format is right. `vh/d.e()` builds `[address][length][command][body…][checksum]` with an
+overhead of 4 and the checksum over bytes `0 … length-2` — byte for byte what [`frame`] does. The
+command ids (`vh/c`), device addresses (`yh/a`: `MAIN` 2, `TREADMILL` 4), and status values
+(`vh/b`: `DEV_NOT_SUPPORTED` 0, `CMD_NOT_SUPPORTED` 1, `DONE` 2, …, `SECURITY_BLOCK` 8) all match.
+Replies put the status at byte 3 and the payload at byte 4 (`vh/e.a`).
+
+The `[0x02, 0x04, 0x02, len]` envelope really is BLE-only, and now for a better reason than
+inference: `th/q` applies it when its `connectionType` is 2, the BLE driver passes 2 (`hc/g0`), and
+the USB driver passes 1 (`th/s`, constructed over `wh/c`). USB gets the bare frame.
+
+### Corrected: `SYSTEM_INFO` declares three body bytes, not two
+
+`vh/e`'s no-arg constructor — the `SYSTEM_INFO` one — sets ContentLength to 3 and returns
+`new byte[]{0, 0, 0}`. `VERSION_INFO` (`vh/j`) really is 2, sending `{false, false}`. The previous
+revision gave both 2, which is a frame whose declared length disagrees with its own contents.
+
+### Corrected: the console was never refusing anything
+
+This file recorded that a product-3 board answers `DEVICE_INFO` with `CMD_NOT_SUPPORTED`, and
+concluded the register codec was the wrong protocol for the app-facing link. **That conclusion was
+wrong, and it was an artefact of this codebase's own framing.** With the bytes logged both ways:
+
+```
+DEVICE_INFO @4 -> 04 04 81 89 <- 00 04 04 81
+```
+
+The reply is a padding `00` followed by the request. Read literally, byte 1 is `04` — the *address*,
+not a length — so the reader declared a 4-byte frame, truncated, and handed up `00 04 04 81`. Byte 3
+of that is `81`; of the resynchronised `04 04 81 89` it is `89`, the request's own checksum. Neither
+is a status. "The console says CMD_NOT_SUPPORTED" was this code reading a checksum.
+
+Two fixes follow, both mirroring GlassOS. Leading zeroes are skipped, because byte 0 is a device
+address and address 0 is `NONE` — `ai/b.a` rejects `bytes[0] == 0` outright. And a frame equal to
+the request is an acknowledgement, not an answer, so the reader reads on; GlassOS survives this by
+validating every read and simply reading again (`rj/p`, `wh/c.r`).
+
+Once resynchronised the console echoes and then says nothing more, which is a different and more
+honest failure than the one previously recorded.
+
+### Found: USB links are opened with a 64-byte `0xFF` sync
+
+`wh/c.X` is the USB adapter's open routine, and it logs its own steps: *"Discarding buffer from
+console"*, *"Sending buffer full of 0xFF"*, *"0xFF send successfully. Now reading"*, then either
+*"Read the response but it was not what was expected"* or *"Read the response and it was equal to the
+expected response. Incrementing consecutiveBuffers"*.
+
+So: discard whatever is pending, write 64 bytes of `0xFF`, read, and require the same buffer back —
+**twice consecutively**, giving up after ten failures of either kind, 500 ms between attempts, 300 ms
+per transfer (`wh/c.f17339x`). The expected answer is `ai.b.f824b`: 64 bytes of `0xFF` with index 3
+left as a wildcard, the same constant the running link uses to *reject* a frame.
+
+Nothing in Stride did this, which is the most likely reason the stream was a byte out of step.
+Implemented in `UsbSerialTransport.synchronise`; **not yet confirmed to make the console answer**,
+because the board dropped off the USB bus before the sequence could be observed end to end.
+
+### Hazard, reproduced twice: the board can leave the bus entirely
+
+Driving this console directly — claiming its interface and writing to it — twice ended with the board
+**not enumerated at all**: `num_connects=0`, nothing under `/sys/bus/usb/devices` but the four root
+hubs, no `/dev/bus/usb/003/00x`. Neither restarting `glassos_service`, nor restarting Stride, nor
+`adb reboot` brought it back; unplugging the console's USB lead and plugging it in again did, both
+times.
+
+That is worse than losing the interface, because nothing in software can re-enumerate a device that
+is not there. It is the strongest argument for the refusal in `UsbSerialTransport.open`: on a console
+where iFit's service is live, direct access is not a thing to try casually.

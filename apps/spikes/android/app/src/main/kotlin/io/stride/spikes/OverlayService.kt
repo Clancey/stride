@@ -173,6 +173,19 @@ class OverlayService : Service() {
         private const val RAIL_WIDTH_DP = 132f
 
         /**
+         * The quick picks shown when the machine has not published its own.
+         *
+         * Whole steps over the range a NordicTrack treadmill covers, highest first to match the
+         * order GlassOS publishes and the order the column is laid out in. These are a fallback for
+         * display, not a claim about the machine: every value picked from them still goes through
+         * [MachineCoordinator]'s clamp before it reaches the belt.
+         */
+        private val INCLINE_LADDER =
+            listOf(12.0, 10.0, 8.0, 6.0, 5.0, 4.0, 3.0, 2.0, 1.0, 0.0, -1.0, -2.0, -3.0)
+
+        private val SPEED_LADDER = listOf(12.0, 10.0, 9.0, 8.0, 7.0, 6.0, 5.0, 4.0, 3.0, 2.0, 1.0)
+
+        /**
          * How far past the end rungs a value may sit and still mark that rung.
          *
          * Small on purpose. Its whole job is to absorb rounding, not to pull a stopped belt onto
@@ -417,6 +430,17 @@ class OverlayService : Service() {
 
     private val workoutListener: (WorkoutSession.State) -> Unit = { state ->
         mainHandler.post {
+            // A setpoint the rider asked for before the machine would take one. RUNNING is the
+            // first moment the console will accept it; IDLE means the start was refused or given
+            // up on, and a request that outlived its workout must never be replayed into the next.
+            when (state) {
+                WorkoutSession.State.RUNNING -> pendingSetpoint?.let {
+                    pendingSetpoint = null
+                    it()
+                }
+                WorkoutSession.State.IDLE -> pendingSetpoint = null
+                else -> Unit
+            }
             // A lap position measured against the previous session says nothing about this one, and
             // the machine's own distance counter resets underneath us at the same moment.
             if (state == WorkoutSession.State.IDLE) lapTracker.reset()
@@ -1659,8 +1683,7 @@ class OverlayService : Service() {
      * 0.5 and 1.0 into two pills both reading "1" — two buttons, same label, different commands.
      * Whole numbers still render without a trailing ".0".
      */
-    private fun formatPreset(value: Double): String =
-        if (value == value.roundToInt().toDouble()) value.roundToInt().toString() else "%.1f".format(value)
+    private fun formatPreset(value: Double): String = formatRailPreset(value)
 
     /**
      * Preset columns come from the machine when it has told us what it supports — GlassOS answers
@@ -1673,22 +1696,29 @@ class OverlayService : Service() {
      */
     private fun addInclineRail() {
         val limits = MachineCoordinator.machineLimits
-        val presets = MachineLink.inclinePresets
-            ?.map(::formatPreset)
-            ?: listOf(12.0, 10.0, 8.0, 6.0, 5.0, 4.0, 3.0, 2.0, 1.0, 0.0, -1.0, -2.0, -3.0)
-                .filter { limits == null || (it <= limits.maxInclinePercent && it >= limits.minInclinePercent) }
-                .map(::formatPreset)
+        val presets = railEntries(
+            published = MachineLink.inclinePresets,
+            ladder = INCLINE_LADDER,
+            floor = limits?.minInclinePercent,
+            ceiling = limits?.maxInclinePercent,
+        )
         val binding = addRail(
             accent = amber,
             entries = presets,
             entrySuffix = "%",
             currentEntry = MachineLink.inclinePercent?.roundToInt()?.toString(),
             gravity = Gravity.START or Gravity.TOP,
-            usable = { MachineLink.canCommandIncline() },
+            // Live whenever a command could travel at all. The console declining setpoints from
+            // idle is a state a tap can fix, not a reason to grey the column out — see requestSetpoint.
+            usable = { MachineLink.canCommand() },
             measured = { MachineLink.inclinePercent },
             pending = PendingSetpoint(tolerance = INCLINE_ARRIVED_TOLERANCE, graceMs = PENDING_GRACE_MS),
             onPick = { percent ->
-                MachineCoordinator.setInclinePercent(percent)
+                // Never starts a belt: tilting the deck is not a request for motion. See
+                // requestSetpoint.
+                requestSetpoint(mayStart = false) { done ->
+                    MachineCoordinator.setInclinePercent(percent, done)
+                }
                 lastGesture = "incline -> $percent%"
             },
         )
@@ -1696,24 +1726,107 @@ class OverlayService : Service() {
         leftInclineView = binding?.scroll
     }
 
+    /**
+     * Which entries a rail should actually show.
+     *
+     * Three rules, in order, and the first two are the ones that were missing.
+     *
+     * A rail with no pills in it is never the right answer. The column is still a live control —
+     * Stride can command speed and incline whether or not the console publishes buttons for them —
+     * so an empty column is a toggle that opens onto nothing, which is precisely what the rider
+     * reported: the corner button lights up, the rail window is created at full size, and there is
+     * nothing inside it. A machine that publishes no presets gets the derived ladder instead.
+     *
+     * That case is not hypothetical or a decoding fault. GlassOS answers `GetControls` from the
+     * *current workout*, so a console sitting idle returns a `ControlList` with no controls at all —
+     * a well-formed, successful, empty answer. Treating it as the machine's final word left both
+     * rails permanently blank on a console that was working perfectly.
+     *
+     * Finally, an intersection that empties the ladder is discarded rather than shown. Limits come
+     * off a wire and a nonsensical pair — a zeroed struct, an unfinished probe — must not be able to
+     * filter every button away. A ladder slightly outside the machine's range gets clamped by
+     * [MachineCoordinator]; a column with nothing in it cannot be clamped back into usefulness.
+     */
+    private fun railEntries(
+        published: List<Double>?,
+        ladder: List<Double>,
+        floor: Double?,
+        ceiling: Double?,
+    ): List<String> = railPresetEntries(published, ladder, floor, ceiling)
+
+    /**
+     * A setpoint the rider asked for before the machine would take one, held until it will.
+     *
+     * Cleared on every resolution — applied on RUNNING, dropped on IDLE — so a request can never
+     * outlive the tap that made it and surprise a later workout.
+     */
+    private var pendingSetpoint: (() -> Unit)? = null
+
+    /**
+     * Send a setpoint, starting a workout first if that is the only thing in the way.
+     *
+     * The console refuses speed and incline from idle, and Stride used to draw the columns dead and
+     * explain why on tap. That is honest and it is not what the rider meant: they tapped 5 because
+     * they want the belt at 5, and being told to press a different button first is the app declining
+     * to do the obvious thing. It was reported, reasonably, as the buttons not working.
+     *
+     * So a tap that cannot land now starts the workout and lands afterwards. This is a deliberate
+     * motion path and it is treated as one: it is only reached from a rider's own tap on a specific
+     * value, it goes through [WorkoutSession] exactly as the Start button does — so the same
+     * handshake, the same watchdog and the same refusal reporting apply — and if the start is
+     * refused the setpoint is dropped rather than replayed at whatever happens next.
+     *
+     * ## Why [mayStart] is not simply true
+     *
+     * Only a *speed* tap may start a belt. Asking for 5 mph on a stopped machine is a request for
+     * motion and reads as one; asking for 4% incline is a request to tilt the deck, and starting the
+     * belt because someone wanted the deck moved is surprise motion — the one thing the safety rules
+     * here are written against. It is also what the machine's own keys do: a speed key starts a
+     * NordicTrack, an incline key does not.
+     *
+     * So incline still says what it needs rather than taking a liberty, and the column stays live
+     * either way so nothing looks broken.
+     */
+    private fun requestSetpoint(
+        mayStart: Boolean,
+        apply: (onDone: ((MachineCoordinator.Outcome) -> Unit)?) -> Unit,
+    ) {
+        apply { outcome ->
+            if (outcome !is MachineCoordinator.Outcome.Rejected) return@apply
+            mainHandler.post {
+                if (!mayStart || WorkoutSession.state != WorkoutSession.State.IDLE) {
+                    showMachineControlUnavailable()
+                    return@post
+                }
+                // Re-sent rather than remembered as a value, so the retry goes through the same
+                // clamp and the same ramp the first attempt did.
+                pendingSetpoint = { apply(null) }
+                WorkoutSession.start()
+            }
+        }
+    }
+
     private fun addSpeedRail() {
         val limits = MachineCoordinator.machineLimits
-        val presets = MachineLink.speedPresets
-            ?.map(::formatPreset)
-            ?: listOf(12.0, 10.0, 9.0, 8.0, 7.0, 6.0, 5.0, 4.0, 3.0, 2.0, 1.0)
-                .filter { limits == null || (it <= limits.maxSpeedMph && it >= limits.minSpeedMph) }
-                .map(::formatPreset)
+        val presets = railEntries(
+            published = MachineLink.speedPresets,
+            ladder = SPEED_LADDER,
+            floor = limits?.minSpeedMph,
+            ceiling = limits?.maxSpeedMph,
+        )
         val binding = addRail(
             accent = cyan,
             entries = presets,
             entrySuffix = "",
             currentEntry = MachineLink.speedMph?.roundToInt()?.toString(),
             gravity = Gravity.END or Gravity.TOP,
-            usable = { MachineLink.canCommandSpeed() },
+            usable = { MachineLink.canCommand() },
             measured = { MachineLink.speedMph },
             pending = PendingSetpoint(tolerance = SPEED_ARRIVED_TOLERANCE, graceMs = PENDING_GRACE_MS),
             onPick = { mph ->
-                MachineCoordinator.setSpeedMph(mph)
+                requestSetpoint(mayStart = true) { done ->
+                    MachineCoordinator.setSpeedMph(mph, done)
+                }
                 lastGesture = "speed -> $mph mph"
             },
         )
@@ -1793,6 +1906,10 @@ class OverlayService : Service() {
         var ignoreClicksUntilMs = 0L
         val clearSettling = Runnable { railSettling = false }
         var activeView: View? = null
+        // The digit a quick second tap would extend, and when it was tapped. Per rail, because
+        // typing 6 on the speed column has nothing to do with the incline column.
+        var lastPick: Double? = null
+        var lastPickAt = 0L
         val buttons = LinkedHashMap<String, TextView>()
         val binding = RailBinding(
             accent = accent,
@@ -1820,19 +1937,27 @@ class OverlayService : Service() {
                 // The pill's own label is the source of the value, so what the rider sees is
                 // exactly what gets sent. Parsing can only fail if a preset is not a number, in
                 // which case sending nothing is the right answer.
-                val value = entry.toDoubleOrNull()
-                if (value == null || !usable()) {
+                val tapped = entry.toDoubleOrNull()
+                if (tapped == null || !usable()) {
                     showMachineControlUnavailable()
                     return@railEntryButton
                 }
+                val now = SystemClock.uptimeMillis()
+                // A quick second tap types a tenth onto the first: 5 then 5 is 5.5, 6 then 4 is 6.4.
+                val composed = composeSetpoint(lastPick, lastPickAt, tapped, now, COMPOSE_WINDOW_MS)
+                val value = composed ?: tapped
+                // A composed value has consumed its first digit; a plain pick becomes the next
+                // first digit. Either way a third tap starts over rather than compounding.
+                lastPick = if (composed == null) tapped else null
+                lastPickAt = now
                 onPick(value)
                 // Mark the tap immediately. The belt will take seconds to get here and telemetry
                 // will keep reporting the old figure throughout; without this the rider's own
                 // choice is the one thing on screen that does not acknowledge them.
                 binding.pending.request(
                     value = value,
-                    label = entry,
-                    nowMs = SystemClock.uptimeMillis(),
+                    label = formatRailPreset(value),
+                    nowMs = now,
                     measured = measured(),
                 )
                 syncRailHighlights()
@@ -2877,4 +3002,101 @@ class OverlayService : Service() {
     }
 
 
+}
+
+/**
+ * Format one quick-pick value for its pill.
+ *
+ * Not `roundToInt`: the direct path builds its ladder from the machine's own `MIN_KPH`/`MAX_KPH` and
+ * `MIN_GRADE`/`MAX_GRADE`, which on plenty of treadmills step in halves. Rounding turned 0.5 and 1.0
+ * into two pills both reading "1" — two buttons, same label, different commands. Whole numbers still
+ * render without a trailing ".0".
+ *
+ * Top-level so it can be tested without a Service; [OverlayService] delegates to it.
+ */
+internal fun formatRailPreset(value: Double): String =
+    if (value == kotlin.math.round(value) && kotlin.math.abs(value) < Int.MAX_VALUE) {
+        value.toInt().toString()
+    } else {
+        "%.1f".format(value)
+    }
+
+/**
+ * Which entries a quick-pick rail should show, given what the machine published and what it can do.
+ *
+ * Three rules, in order, and the first two are the ones that were missing.
+ *
+ * A rail with no pills in it is never the right answer. The column is still a live control — Stride
+ * commands speed and incline whether or not the console publishes buttons for them — so an empty
+ * column is a toggle that opens onto nothing. That is exactly what was reported: the corner button
+ * lights up, the rail window is created at its full 132×722, and there is nothing inside it.
+ *
+ * That case is neither hypothetical nor a decoding fault. GlassOS answers `GetControls` out of the
+ * *current workout*, so a console sitting idle returns a well-formed, successful, **empty**
+ * `ControlList`. Treating that as the machine's final word left both rails permanently blank on a
+ * console that was working perfectly.
+ *
+ * Finally, an intersection that empties the ladder is discarded rather than shown. Limits come off a
+ * wire, and a nonsensical pair — a zeroed struct, an unfinished probe — must not be able to filter
+ * every button away. A ladder reaching slightly outside the machine's range is clamped by
+ * [MachineCoordinator] on the way to the belt; a column with nothing in it cannot be clamped back
+ * into usefulness.
+ */
+internal fun railPresetEntries(
+    published: List<Double>?,
+    ladder: List<Double>,
+    floor: Double?,
+    ceiling: Double?,
+): List<String> {
+    published?.takeIf { it.isNotEmpty() }?.let { return it.map(::formatRailPreset) }
+    val within = ladder.filter {
+        (floor == null || it >= floor) && (ceiling == null || it <= ceiling)
+    }
+    return (within.takeIf { it.isNotEmpty() } ?: ladder).map(::formatRailPreset)
+}
+
+/**
+ * How long a second tap has to land to be read as a second digit rather than a new choice.
+ *
+ * Long enough to type two pills that may be far apart on a scrolling column, short enough that a
+ * rider who picks 6 and then changes their mind to 4 gets 4 rather than 6.4. This is the one number
+ * here that is a judgement rather than a derivation.
+ */
+internal const val COMPOSE_WINDOW_MS = 1_000L
+
+/**
+ * The value a tap means, when a quick previous tap turns it into a second digit.
+ *
+ * Tapping 5 and then 5 again asks for 5.5; 6 then 4 asks for 6.4. The rails are whole numbers, so
+ * without this the only way to reach a half step is the console's own buttons — and on a column of
+ * big round pills, tapping twice is a far more natural way to say 6.4 than any spinner would be.
+ *
+ * Returns null when the tap is an ordinary pick, which is the common case and the safe default:
+ *
+ *  - nothing was tapped before, or not recently enough ([windowMs]);
+ *  - the first tap was not a whole number, so there is no digit to extend — a machine that
+ *    publishes 7.5 as a preset is choosing its own steps and should not have them re-typed;
+ *  - the second tap is not a single digit, because "12" cannot be a tenths place.
+ *
+ * The sign of the first value is kept and the magnitude grows, so on an incline column -2 then 5
+ * reads as -2.5, which is how it would be typed and how it would be read back.
+ *
+ * Deliberately pure: this decides what a treadmill is asked to do, from two taps whose meaning
+ * depends on a clock, and every branch of it should be checkable without a treadmill.
+ */
+internal fun composeSetpoint(
+    previous: Double?,
+    previousAtMs: Long,
+    tapped: Double,
+    nowMs: Long,
+    windowMs: Long,
+): Double? {
+    val first = previous ?: return null
+    if (nowMs - previousAtMs !in 0 until windowMs) return null
+    if (first != kotlin.math.floor(first)) return null
+    if (tapped != kotlin.math.floor(tapped) || tapped < 0.0 || tapped > 9.0) return null
+    val magnitude = kotlin.math.abs(first) + tapped / 10.0
+    // Rounded because 6 + 4/10 is not exactly 6.4 in binary, and the value becomes a label.
+    val rounded = kotlin.math.round(magnitude * 10.0) / 10.0
+    return if (first < 0.0) -rounded else rounded
 }

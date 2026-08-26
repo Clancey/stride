@@ -71,6 +71,16 @@ object FitProCodec {
     const val FRAME_OVERHEAD: Int = 4
 
     /**
+     * The longest frame this protocol allows, header and checksum included.
+     *
+     * GlassOS rejects any reply whose length byte exceeds this outright, naming it `maxMsgLength`
+     * (`ai/b.a`: *"Second byte is N, which exceeds maxMsgLength (64)"*). It is also exactly the size
+     * of the buffer the USB path reads into (`rj/p.f14325l = new byte[64]`), so a longer declared
+     * length cannot be honest.
+     */
+    const val MAX_FRAME_LENGTH: Int = 64
+
+    /**
      * The software version above which a console demands `VERIFY_SECURITY` before it will accept
      * writes. VERIFIED (`xh/n0.smali`: `const/16 v13, 0x4b` then `if-le … :cond_c`, skipping the
      * security branch for anything at or below it).
@@ -146,7 +156,17 @@ object FitProCodec {
          */
         val requestContentLength: Int
             get() = when (this) {
-                SYSTEM_INFO, VERSION_INFO -> 2
+                // Three, not two, and the difference is measured rather than reasoned about.
+                // GlassOS's own SYSTEM_INFO command object declares ContentLength 3 and returns
+                // `{0, 0, 0}` as its body (`vh/e.java`: the no-arg constructor sets `f16662i = 3`,
+                // and `g()` answers `new byte[]{0, 0, 0}` for that case). VERSION_INFO alongside it
+                // really is two — `vh/j.java` declares 2 and sends `{false, false}` — so this was
+                // right about one command and wrong about the other.
+                //
+                // The consequence of getting it wrong is a frame whose length byte disagrees with
+                // its own contents, which is the class of error a console answers by ignoring.
+                SYSTEM_INFO -> 3
+                VERSION_INFO -> 2
                 VERIFY_SECURITY -> SECURITY_CONTENT_LENGTH
                 else -> 0
             }
@@ -1119,4 +1139,39 @@ object FitProCodec {
     /** The status byte of any reply, or null if it is too short to have one. */
     fun statusOf(bytes: ByteArray): Status? =
         if (bytes.size < FRAME_OVERHEAD) null else Status.fromValue(bytes[3].toInt() and 0xFF)
+
+    /**
+     * Whether [reply] is a well-formed answer to [command] from [address].
+     *
+     * Transcribed from `ai/b.a`, which GlassOS runs over **every** frame before anything reads a
+     * status out of it. Stride was reading the status straight off byte 3 with no such check, and on
+     * a shared, packetised pipe that is how one command's answer gets attributed to another: a stale
+     * telemetry frame, or a buffer the board never filled, decodes as a perfectly plausible refusal.
+     * "The console says CMD_NOT_SUPPORTED" and "we read a byte that was never an answer" look
+     * identical from here, and only this tells them apart.
+     *
+     * The all-`0xFF` buffer is rejected first and by name. GlassOS keeps a 64-byte `0xFF` sentinel
+     * (`ai.b.f824b`, with index 3 left as a wildcard) and treats a matching read as *no device*
+     * rather than as data — an unwritten USB buffer reads exactly like that.
+     */
+    fun replyMatches(reply: ByteArray, command: Command): Boolean {
+        if (reply.size < FRAME_OVERHEAD) return false
+        // Index 3 is deliberately skipped, as GlassOS's own sentinel does: the board may leave a
+        // status in an otherwise untouched buffer.
+        if (reply.indices.all { it == 3 || reply[it] == 0xFF.toByte() }) return false
+        // Non-zero, and nothing stronger. Address 0 is NONE and cannot begin a frame, which is the
+        // check `ai/b.a` makes — but it does **not** compare the reply's address to the one the
+        // request was sent to, and neither may this. An X22i stamps every reply with its own bus
+        // address (5) rather than the MAIN it was asked, so requiring an echo here would reject
+        // every frame that console ever sends. Matching a reply to its request is the *command*
+        // byte's job below; whether the sender is the expected device is `replyAddress`'s, once
+        // DEVICE_INFO has established what that address actually is.
+        if (reply[0].toInt() and 0xFF == 0) return false
+        val declared = reply[1].toInt() and 0xFF
+        if (declared < FRAME_OVERHEAD || declared > MAX_FRAME_LENGTH || declared > reply.size) {
+            return false
+        }
+        if (reply[2] != command.value.toByte()) return false
+        return reply[declared - 1] == checksum(reply, declared - 1)
+    }
 }

@@ -138,6 +138,26 @@ object MachineLink {
         REOPEN_INTERVAL_MS shl failures.coerceIn(0, MAX_REOPEN_FAILURES)
 
     /**
+     * How long an axis that published no presets stands before it is asked again.
+     *
+     * Two extra RPCs on a ten-second cadence, against a poll that already makes eight every two
+     * seconds, so the cost is noise. It is deliberately not "every poll": the answer only changes
+     * when the console starts or ends a workout, and there is nothing to be gained by asking
+     * between those.
+     */
+    private const val EMPTY_PRESET_RETRY_MS = 10_000L
+
+    /**
+     * How long a freshly opened link may report "no treadmill" before it counts as a fault.
+     *
+     * Measured on a Commercial 1750 from cold: `Connect` sat out the full 12-second command timeout
+     * three times before the console attached, about 40 seconds after Stride started. Two minutes is
+     * comfortably past that without being so long that a genuinely detached console goes unreported
+     * — and the window closes early anyway, the instant the console attaches for the first time.
+     */
+    private const val CONSOLE_BOOT_GRACE_MS = 120_000L
+
+    /**
      * How often the poll retries a heart rate strap that is enabled but not connected.
      *
      * Longer than [REOPEN_INTERVAL_MS] because the failure is far more likely to be permanent — most
@@ -157,12 +177,38 @@ object MachineLink {
     private const val REDETECT_INTERVAL_MS = 5_000L
 
     /**
+     * What a control says while the console is still on its way up.
+     *
+     * A booting console reports [GlassOsClient.ConsoleState.DISCONNECTED] for the same reason a
+     * broken one does — the head unit has not attached the lower board yet — and on this hardware
+     * that lasts the best part of a minute, with each `Connect` sitting out the full 12-second
+     * command timeout before the machine finally answers. Showing
+     * [CONSOLE_DETACHED_NOTICE] through that window tells a rider their treadmill is broken and
+     * sends them to the wall socket, every single time the console is switched on.
+     *
+     * Deliberately still a warning rather than a reassurance. Stride genuinely cannot read the belt
+     * here, so the safety line has to keep saying so; what changes is that it names a cause that
+     * resolves on its own instead of one that needs the mains pulled.
+     */
+    const val CONSOLE_STARTING_NOTICE: String =
+        "The treadmill is still starting up. Stride can't read it yet, and the belt may be moving."
+
+    /** The same, in the longer form the settings screen shows. */
+    const val CONSOLE_STARTING_REASON: String =
+        "The console is still starting up and hasn't attached its treadmill yet. This takes about a " +
+            "minute from cold, and speed and incline come back on their own — there is nothing to fix."
+
+    /**
      * What a control says when GlassOS is answering but has no machine attached to it.
      *
      * Its own state, not a guess: the console reports [GlassOsClient.ConsoleState.DISCONNECTED]
      * and every RPC that would move something blocks until it times out. Distinct from
      * [CONTROL_LOCKED_NOTICE] because the fix is different — nothing about Stride or the app will
      * recover this, only the machine coming back will.
+     *
+     * Only said once the console has had time to start, and only when it has never attached — see
+     * [consoleStarting]. Said too early it is simply wrong, and safety copy that is wrong in the
+     * ordinary case is not believed in the case that matters.
      */
     const val CONSOLE_DETACHED_NOTICE: String =
         "The console has lost its connection to the treadmill. Nothing can reach the belt until " +
@@ -187,6 +233,7 @@ object MachineLink {
      */
     val metricsNotice: String
         get() = when {
+            consoleStarting -> CONSOLE_STARTING_NOTICE
             consoleDetached -> CONSOLE_DETACHED_NOTICE
             status == Status.LINKED -> SAFETY_KEY_NOTICE
             else -> CANNOT_READ_NOTICE
@@ -250,6 +297,17 @@ object MachineLink {
     @Volatile private var connectFailures: Int = 0
     @Volatile private var nextConnectAt: Long = 0L
     @Volatile private var lastAttachedAt: Long = 0L
+
+    /**
+     * When this link was opened, and whether the console has ever attached across it.
+     *
+     * The pair is what [consoleStarting] is built from: a console that has never attached and was
+     * only asked a moment ago is starting up, and one that has attached even once is not. Both are
+     * reset by [closeTransport], because a new transport is a new question.
+     */
+    @Volatile private var linkOpenedAt: Long = 0L
+
+    @Volatile private var everAttached: Boolean = false
 
     /**
      * Whether a handshake is already queued or running.
@@ -333,6 +391,21 @@ object MachineLink {
     @Volatile private var speedPresetsFetched: Boolean = false
 
     /**
+     * When an axis that answered "I have no presets" may be asked again.
+     *
+     * An empty answer is real, but on GlassOS it is not *final*: `GetControls` is answered from the
+     * live workout, so an idle console returns an empty `ControlList` and starts publishing its
+     * real buttons only once a workout is running. Latching that first empty answer for the life of
+     * the link is what left both quick-pick columns blank on a perfectly healthy console.
+     *
+     * So an empty answer is cached — callers still get to tell "none" from "not asked" — but it is
+     * re-asked on this interval instead of being believed forever. A non-empty answer still latches:
+     * presets do not change under a running link once the machine has actually published them.
+     */
+    @Volatile private var nextInclinePresetAskAt: Long = 0L
+    @Volatile private var nextSpeedPresetAskAt: Long = 0L
+
+    /**
      * Bumped whenever a preset answer lands. The overlay builds its rails once, before any machine
      * has been asked anything, so without a signal that the answers have arrived it would show the
      * fallback ladder for the life of the window.
@@ -367,6 +440,26 @@ object MachineLink {
         get() = fresh()?.consoleState == GlassOsClient.ConsoleState.DISCONNECTED_NAME
 
     /**
+     * True when the console says it has no treadmill, but has not yet had time to find one.
+     *
+     * A booting console and a broken one report the same thing, and telling them apart is the whole
+     * point: one resolves itself in about a minute, the other needs the mains pulled. The evidence
+     * used is deliberately narrow — a link that has **never** seen the console attached, within
+     * [CONSOLE_BOOT_GRACE_MS] of that link opening.
+     *
+     * "Never attached" is what keeps this honest. The moment the console attaches once, the grace is
+     * spent for good ([everAttached] is never cleared while the link lives), so a treadmill that
+     * genuinely drops out mid-session gets the real warning immediately rather than a minute of
+     * reassurance. And after the window, an unattached console gets the real warning too.
+     */
+    val consoleStarting: Boolean
+        get() {
+            if (!consoleDetached || everAttached) return false
+            val opened = linkOpenedAt
+            return opened != 0L && SystemClock.elapsedRealtime() - opened < CONSOLE_BOOT_GRACE_MS
+        }
+
+    /**
      * Why we are in this state, in words a person on the machine can act on — not an error code.
      * This used to lead with what Stride would *not* do, which was the honest thing to say when
      * nothing here could move a belt. Stride drives the machine now, so saying otherwise would
@@ -374,6 +467,7 @@ object MachineLink {
      */
     val reason: String
         get() = when {
+            consoleStarting -> CONSOLE_STARTING_REASON
             consoleDetached -> CONSOLE_DETACHED_REASON
             status == Status.LINKED ->
                 "Stride is linked to this machine. " +
@@ -531,6 +625,10 @@ object MachineLink {
         // Opening the transport is blocking I/O — USB enumeration, a BLE connect, and a multi-frame
         // handshake — so it happens on the link thread rather than on whoever called attach.
         h.post {
+            // Stamped before the open, not after: the point of reference is when Stride started
+            // asking, and on a cold console the open itself is part of the wait.
+            linkOpenedAt = SystemClock.elapsedRealtime()
+            everAttached = false
             openTransport(app)
             armReopen()
         }
@@ -898,6 +996,11 @@ object MachineLink {
 
     private fun closeTransport() {
         MachineCoordinator.rebind(null)
+        // A reading taken through the old transport says nothing about the new one, and the belt
+        // edge is built from exactly two readings. Carried across a switch, GlassOS reporting
+        // WORKOUT and a freshly opened direct link reporting anything else is a manufactured
+        // "the rider pressed Stop" — from two different wires, seconds apart.
+        WorkoutMachineCoupling.forgetConsole()
         direct = null
         directSession?.let { runCatching { it.close() } }
         directSession = null
@@ -933,6 +1036,8 @@ object MachineLink {
         speedPresetsCache = null
         inclinePresetsFetched = false
         speedPresetsFetched = false
+        nextInclinePresetAskAt = 0L
+        nextSpeedPresetAskAt = 0L
         if (hadPresets) presetsGeneration.incrementAndGet()
         nextReopenAt = 0L
         // Deliberately NOT clearing reopenFailures here. This method is called *inside* every retry,
@@ -943,6 +1048,9 @@ object MachineLink {
             connectFailures = 0
             nextConnectAt = 0L
             lastAttachedAt = 0L
+            // A new transport is a new question: it has not attached yet, and its grace starts now.
+            everAttached = false
+            linkOpenedAt = SystemClock.elapsedRealtime()
             // Any handshake still in flight belongs to a link that no longer exists. Clearing
             // the flag here rather than waiting for it to finish means a re-attach is never
             // blocked by the tail of the previous one.
@@ -967,11 +1075,18 @@ object MachineLink {
                 // but the settings screen went on claiming there was no GlassOS service while
                 // GlassOS was plainly working.
                 StrideSettings.resolveTransportFromReading()
+                // The console is not only a thing Stride commands; it has its own Stop button under
+                // the rider's hand. This is where pressing it reaches the overlay.
+                WorkoutMachineCoupling.observeConsole(read.consoleState)
                 // Presets are static for the machine, so fetch them once on the same background
                 // thread as the poll rather than inventing a second worker. A read having just
                 // succeeded means the link is up, so this is the cheapest moment to try.
                 fetchPresetsOnce()
             } else {
+                // Nothing came back, so nothing is known about the belt. Dropping the remembered
+                // reading stops a link that recovers minutes later from delivering a stale edge
+                // built out of two readings with a gap between them.
+                WorkoutMachineCoupling.forgetConsole()
                 reopenIfDropped()
             }
             // Outside the read check on purpose: a strap is not part of the machine link, so its
@@ -1068,6 +1183,10 @@ object MachineLink {
         }
         if (result is ConnectResult.Attached) {
             lastAttachedAt = done
+            // Latched for the life of the link. Once a console has attached even once, a later
+            // DISCONNECTED is a real fault rather than a slow start, and must be reported as one
+            // immediately instead of being excused for another minute.
+            everAttached = true
             connectFailures = 0
             nextConnectAt = 0L
         } else {
@@ -1227,30 +1346,76 @@ object MachineLink {
      * but not incline — a flat treadmill, or a console whose incline control list is missing — must
      * still get its speed rail, and coupling them meant one null answer suppressed both.
      *
-     * An empty list is a real answer and is kept as one. It means "this machine offers no presets on
-     * this axis", which is not the same as "we have not asked yet", and collapsing the two is what
-     * let the overlay fall back to a hardcoded ladder for a machine that had positively said it had
-     * nothing to offer.
+     * An empty list is a real answer and is cached as one, so callers can still tell "this machine
+     * publishes none" from "we have not asked". It is **not** treated as the machine's last word,
+     * which is the fix for a rider looking at two empty quick-pick columns: GlassOS answers
+     * `GetControls` out of the live workout, so an idle console returns an empty `ControlList` and
+     * only starts publishing its real buttons once something is running. Latching the first empty
+     * answer meant the rails could never fill in, for the whole life of the link.
      *
-     * [presetsGeneration] is bumped whenever an answer lands so the overlay can rebuild rails that
-     * were built before the machine had told us anything.
+     * [presetsGeneration] is bumped only when the answer actually differs from the one already held.
+     * A re-ask that returns the same empty list changes nothing on screen, and bumping the
+     * generation for it would rebuild the entire overlay chrome on a timer — the flashing that
+     * [closeTransport] had to be taught not to cause.
+     *
+     * A console that has lost its own treadmill is asked once and then left alone. It has nothing to
+     * publish and every RPC to it can block for the full read timeout; re-asking on a timer would
+     * spend the poll thread — the thread every metric on screen depends on — waiting for two answers
+     * that cannot exist yet. The first ask still happens, because "never asked" has to become
+     * "asked" for the rails to know which they are looking at.
      */
     private fun fetchPresetsOnce() {
         if (inclinePresetsFetched && speedPresetsFetched) return
-        if (!inclinePresetsFetched) {
-            MachineCoordinator.ask { it.inclinePresets() }?.let {
-                inclinePresetsCache = it
-                inclinePresetsFetched = true
-                presetsGeneration.incrementAndGet()
+        val now = SystemClock.elapsedRealtime()
+        val detached = consoleDetached
+        if (!inclinePresetsFetched && mayAskPresets(inclinePresetsCache, nextInclinePresetAskAt, now, detached)) {
+            MachineCoordinator.ask { it.inclinePresets() }?.let { answer ->
+                val changed = answer != inclinePresetsCache
+                inclinePresetsCache = answer
+                if (answer.isEmpty()) {
+                    nextInclinePresetAskAt = now + EMPTY_PRESET_RETRY_MS
+                } else {
+                    inclinePresetsFetched = true
+                }
+                if (changed) presetsGeneration.incrementAndGet()
             }
         }
-        if (!speedPresetsFetched) {
-            MachineCoordinator.ask { it.speedPresetsMph() }?.let {
-                speedPresetsCache = it
-                speedPresetsFetched = true
-                presetsGeneration.incrementAndGet()
+        if (!speedPresetsFetched && mayAskPresets(speedPresetsCache, nextSpeedPresetAskAt, now, detached)) {
+            MachineCoordinator.ask { it.speedPresetsMph() }?.let { answer ->
+                val changed = answer != speedPresetsCache
+                speedPresetsCache = answer
+                if (answer.isEmpty()) {
+                    nextSpeedPresetAskAt = now + EMPTY_PRESET_RETRY_MS
+                } else {
+                    speedPresetsFetched = true
+                }
+                if (changed) presetsGeneration.incrementAndGet()
             }
         }
+    }
+
+    /**
+     * Whether one preset axis may be asked on this pass.
+     *
+     * Pulled out as a pure function because it is the guard between "the rails fill in as soon as
+     * the machine has something to publish" and "the poll thread spends its life waiting on a
+     * console that has nothing to say", and those pull in opposite directions.
+     *
+     * A [cache] of null has never been answered, so it is always asked: the rails need "asked, and
+     * the answer was none" to be distinguishable from "not asked yet", and only an ask produces
+     * that. Past the first answer the clock applies — and on a [detached] console it never comes
+     * round again, because a head unit that has lost its treadmill cannot start publishing quick
+     * picks for it, and every RPC to it can block for the full read timeout.
+     */
+    internal fun mayAskPresets(
+        cache: List<Double>?,
+        nextAskAt: Long,
+        nowMs: Long,
+        detached: Boolean,
+    ): Boolean = when {
+        cache == null -> true
+        detached -> false
+        else -> nowMs >= nextAskAt
     }
 
     /**
@@ -1339,6 +1504,7 @@ object MachineLink {
         val detail = machineDetail
         if (!canCommand() && detail != null) return detail
         return when {
+            consoleStarting -> CONSOLE_STARTING_NOTICE
             consoleDetached -> CONSOLE_DETACHED_NOTICE
             canCommand() -> CONTROL_NEEDS_WORKOUT_NOTICE
             else -> CONTROL_LOCKED_NOTICE
