@@ -83,7 +83,13 @@ class EndOfWorkoutSequenceTest {
         override fun workoutState(): Int? = null
         override fun autoFanSupported(): Boolean? = null
         override fun speedPresetsMph(): List<Double>? = null
-        override fun inclinePresets(): List<Double>? = null
+
+        /**
+         * Ignores [spacing], because it has no range to space: this console answers "no presets" the
+         * way an unbound transport does, and the end-of-workout path never asks. Named rather than
+         * `_` so the next person reading this does not have to check whether it was forgotten.
+         */
+        override fun inclinePresets(spacing: InclineSpacing): List<Double>? = null
         override fun limits(): MachineLimits? = null
     }
 
