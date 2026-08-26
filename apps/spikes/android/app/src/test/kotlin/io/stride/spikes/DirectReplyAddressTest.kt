@@ -1,6 +1,7 @@
 package io.stride.spikes
 
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNotNull
 import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
@@ -40,6 +41,26 @@ class DirectReplyAddressTest {
         /** The address byte of every frame this console has been sent, in order. */
         val addressesAsked = mutableListOf<Int>()
 
+        /**
+         * Who register replies come from, when that is not [replyFrom].
+         *
+         * Null means "the same device that answered `DEVICE_INFO`", which is every console ever
+         * observed. Setting it is how a test stages the seam this file exists for: one device
+         * introduces itself, a different one answers the read that licenses writing.
+         */
+        var readWriteReplyFrom: Int? = null
+
+        /**
+         * Addresses for the first register replies, one each, before [readWriteReplyFrom] applies.
+         *
+         * A single crossed frame followed by a correct one is a different situation from a console
+         * that is consistently answered for by somebody else, and the probe treats them differently.
+         */
+        val crossedReplies = mutableListOf<Int>()
+
+        /** How many `READ_WRITE_DATA` frames this console has been sent, in order. */
+        val readWriteFrames = mutableListOf<ByteArray>()
+
         /** A plausible treadmill: 0.5–12 mph, 0–15% grade, currently stopped and flat. */
         val readValues = mutableMapOf(
             FitProCodec.Register.ACTUAL_KPH to 0,
@@ -54,7 +75,10 @@ class DirectReplyAddressTest {
             addressesAsked += frame[0].toInt() and 0xFF
             return when (command) {
                 FitProCodec.Command.DEVICE_INFO -> deviceInfo()
-                FitProCodec.Command.READ_WRITE_DATA -> readWrite(frame)
+                FitProCodec.Command.READ_WRITE_DATA -> {
+                    readWriteFrames += frame
+                    readWrite(frame)
+                }
                 else -> null
             }
         }
@@ -103,7 +127,7 @@ class DirectReplyAddressTest {
 
             val total = FitProCodec.FRAME_OVERHEAD + 1 + values.size
             val out = ByteArray(total)
-            out[0] = replyFrom.toByte()
+            out[0] = (crossedReplies.removeFirstOrNull() ?: readWriteReplyFrom ?: replyFrom).toByte()
             out[1] = total.toByte()
             out[2] = FitProCodec.Command.READ_WRITE_DATA.value.toByte()
             out[3] = FitProCodec.Status.DONE.value.toByte()
@@ -124,8 +148,11 @@ class DirectReplyAddressTest {
         override fun close() = Unit
     }
 
-    private fun connected(): Pair<DirectMachineSession, NonEchoingConsole> {
+    private fun connected(
+        configure: (NonEchoingConsole) -> Unit = {},
+    ): Pair<DirectMachineSession, NonEchoingConsole> {
         val wire = NonEchoingConsole(consoleAddress)
+        configure(wire)
         val session = DirectMachineSession(wire)
         assertNotNull("the handshake must survive a console that doesn't echo", session.connect().deviceInfo)
         return session to wire
@@ -193,5 +220,96 @@ class DirectReplyAddressTest {
         val (session, _) = connected()
         session.close()
         assertNull(session.replyAddress)
+    }
+
+    /**
+     * The probe is held to the same rule, because it is the one that licenses writing.
+     *
+     * `LINK_CONFIRMED` is what lets [DirectMachineCommands] encode a write at all, and the limits
+     * this exchange caches are what the clamp is built from. Until this check existed, `DEVICE_INFO`
+     * could establish the peer as one device while a second device answered the read that unlocked
+     * control — and supplied the speed and grade limits with it.
+     */
+    @Test
+    fun `a probe reply from an unexpected address leaves the link unconfirmed`() {
+        val (session, _) = connected { it.readWriteReplyFrom = consoleAddress + 1 }
+
+        assertEquals(FitProProbe.Stage.UNCONFIRMED, session.probe.stage)
+        assertFalse("an unidentified device must not license writing", session.probe.confirmed)
+        assertNull("nor may its limits reach the clamp", session.probe.limits)
+        assertTrue(
+            "the refusal must name what happened, not blame the frame: ${session.probe.detail}",
+            session.probe.detail.startsWith("another device answered"),
+        )
+    }
+
+    /** And the refusal is a refusal, not a write that gets sent and then disowned. */
+    @Test
+    fun `an unconfirmed probe refuses a write instead of transmitting it`() {
+        val (session, wire) = connected { it.readWriteReplyFrom = consoleAddress + 1 }
+        val framesBefore = wire.readWriteFrames.size
+
+        val ack = DirectMachineCommands(session).setSpeedKph(5.0)
+
+        assertTrue("writing must be refused: $ack", ack is MachineAck.Refused)
+        assertEquals(
+            "nothing may reach the wire once the probe has refused",
+            framesBefore,
+            wire.readWriteFrames.size,
+        )
+    }
+
+    /**
+     * One crossed frame is not a verdict.
+     *
+     * Nothing re-runs the probe while the handshake stands — `DirectMachineCommands.connect`
+     * re-handshakes only when `deviceInfo` is null — so a single stray reply that failed this check
+     * outright would leave a console that is answering perfectly unable to write for the life of the
+     * transport. It is retried once, and only for this failure.
+     */
+    @Test
+    fun `a single crossed reply is retried rather than failing the probe`() {
+        val (session, wire) = connected { it.crossedReplies += consoleAddress + 1 }
+
+        assertEquals(FitProProbe.Stage.LINK_CONFIRMED, session.probe.stage)
+        assertNotNull(session.probe.limits)
+        assertEquals("the retry must be one extra read, not a storm", 2, wire.readWriteFrames.size)
+    }
+
+    /** The console this file is about must still be able to control its machine. */
+    @Test
+    fun `a console that answers from its own address still confirms`() {
+        val (session, _) = connected()
+        assertEquals(FitProProbe.Stage.LINK_CONFIRMED, session.probe.stage)
+        assertTrue(session.probe.confirmed)
+        assertNotNull("its own limits must be what the clamp gets", session.probe.limits)
+    }
+
+    /**
+     * With no handshake behind it, the probe expects the address it asked.
+     *
+     * That fallback is not decoration: [DirectWriteSequenceTest] confirms its probe without ever
+     * running `connect`, and a probe that demanded a learned address would refuse every console
+     * that had not yet introduced itself — which is a probe that can never license the first write.
+     */
+    @Test
+    fun `a probe with no handshake expects the address it asked`() {
+        val wire = NonEchoingConsole(consoleAddress)
+        val probe = FitProProbe()
+        assertEquals(
+            "nothing has been learned yet, so a reply from elsewhere is still a stranger",
+            FitProProbe.Stage.UNCONFIRMED,
+            probe.confirm(wire).stage,
+        )
+
+        wire.replyFrom = FitProCodec.ADDRESS_MAIN
+        assertEquals(FitProProbe.Stage.LINK_CONFIRMED, probe.confirm(wire).stage)
+
+        // And the expectation follows the address asked rather than being pinned to MAIN.
+        val treadmill = NonEchoingConsole(FitProCodec.ADDRESS_TREADMILL)
+        assertEquals(
+            FitProProbe.Stage.LINK_CONFIRMED,
+            FitProProbe().confirm(treadmill, address = FitProCodec.ADDRESS_TREADMILL).stage,
+        )
     }
 }

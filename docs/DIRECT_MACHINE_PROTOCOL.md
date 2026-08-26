@@ -276,8 +276,7 @@ treadmill address would be talking to a device iFit never talks to.
 
 **That covers outgoing frames only, and confusing it with reply validation was a real bug on real
 hardware.** `parseResponse`'s `expectAddress` check requires an *incoming* reply's own address byte
-to equal the address the request was sent to — a guard against a late reply from an earlier frame
-being mistaken for this one's answer. On a NordicTrack X22i (FitPro1, software 83), every reply
+to equal an address the caller supplies. On a NordicTrack X22i (FitPro1, software 83), every reply
 observed — `DEVICE_INFO`, `SYSTEM_INFO`, `VERSION_INFO`, and every register read/write — came back
 stamped with the console's own bus address (**5**) instead of the address asked (MAIN/2). GlassOS-era
 hardware apparently echoes the address it was asked, closely enough that this was never seen to
@@ -290,6 +289,40 @@ Fixed by keeping the reply's own address from `DEVICE_INFO`'s un-overridden pars
 outgoing address. Outgoing frames are unaffected — they still go to MAIN, matching the paragraph
 above. Confirmed live on that same X22i: the handshake now completes and `MachineLink` holds a
 stable `Attached` connection with live telemetry, where it previously looped `NoAnswer` forever.
+
+**What that check is, and what it is not.** It is *peer validation*: it rejects a frame from a device
+that is not the one we handshook with. It is **not** request/reply correlation, which this document
+and the code both claimed for a while. FitPro carries no request id, and two answers from the *same*
+console to two successive `READ_WRITE_DATA` frames carry an identical address byte and an identical
+command byte — so a late reply to an earlier frame is precisely what these bytes cannot separate, and
+on a console that stamps every reply the same way that is every frame it sends. Real correlation
+would need the transport to drain or quarantine what it has not matched after a timeout, which it
+does not do today. Peer validation is still worth having, and `replyAddress` is what makes it work on
+this hardware.
+
+The **probe** validates its reply the same way. `FitProProbe.confirm` takes the address the answer
+must come from and `DirectMachineSession.connect` passes `replyAddress ?: address`, so the one
+exchange that moves `Stage` to `LINK_CONFIRMED` — and `LINK_CONFIRMED` is what lets
+`DirectMachineCommands` encode a write at all, and where `MachineLimits` is read from — is held to
+the same standard as the reads and writes that follow it. Before that, on a shared bus, `DEVICE_INFO`
+could establish the peer as one device while a different responder supplied the reply that unlocked
+writes and the limits that feed the clamp. A wrong-source reply is retried exactly once, because
+nothing re-runs the probe while the handshake stands, so a single crossed frame would otherwise leave
+a working console unable to write until the transport dropped. Not observed on hardware — this is
+defence in depth, bounded before and after by the probe's own plausibility checks.
+
+`parseDeviceInfo` is held to `replyMatches` (command byte, declared length, checksum) before the
+session learns an address from it, and its supported-register mask is bounded by the frame's declared
+length rather than by the buffer, so a console that under-declares cannot have its checksum byte and
+the transport's zero padding decoded as registers it never claimed.
+
+The other post-`DEVICE_INFO` handshake replies — `SUPPORTED_COMMANDS`, `SYSTEM_INFO`, `VERSION_INFO`,
+`SERIAL_NUMBER`, `VERIFY_SECURITY` — still ignore byte 0. That is a deliberate omission, not an
+oversight: none of them can authorise a write, since the write gate is the probe alone, and a foreign
+reply on any of them can only *deny* — a poisoned `SYSTEM_INFO` yields a wrong security hash and a
+`SECURITY_BLOCK`. Validating them would add a second way to fail the unlock on a console above
+software 75, which is a way to lose direct control entirely and is not testable without one of those
+consoles in hand.
 
 ## Register map — VERIFIED (`sh/a.java:145`)
 

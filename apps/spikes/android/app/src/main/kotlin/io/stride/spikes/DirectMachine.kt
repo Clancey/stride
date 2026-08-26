@@ -78,15 +78,22 @@ class DirectMachineSession(
      * reply rather than assumed to equal [address].
      *
      * [handshake] deliberately keeps [address] pinned to the address asked, matching GlassOS
-     * (see [address]'s note) — outgoing frames are unaffected by this field. But [parseResponse]
-     * also checks that *incoming* replies carry the address they were sent to, as a guard against a
-     * late reply from an earlier frame being mistaken for the answer to this one. GlassOS-era
-     * hardware happens to echo the address it was asked, so that check was never seen to fail. This
-     * X22i (FitPro1, not GlassOS) does not: every reply observed on real hardware — DEVICE_INFO,
-     * SYSTEM_INFO, VERSION_INFO, and register reads alike — comes back stamped with the console's
-     * own bus address instead (5, when asked at [FitProCodec.ADDRESS_MAIN]/2), which made every
-     * read and write after the handshake look like a silent, unanswering machine. Null until
-     * `DEVICE_INFO` has answered once.
+     * (see [address]'s note) — outgoing frames are unaffected by this field. What it buys is
+     * **peer validation** on the way back in: [FitProCodec.parseResponse] rejects a reply whose
+     * address byte is not this one, so a frame from a device that is not the console we handshook
+     * with cannot be read as that console's answer. It is worth being exact about what that is not.
+     * It is not request/reply correlation: two answers from the *same* console to two successive
+     * `READ_WRITE_DATA` frames carry an identical address byte and an identical command byte, so
+     * this check cannot tell them apart — and on a console that stamps every reply the same way,
+     * that is every frame it sends. Real correlation would need the transport to drain or quarantine
+     * what it has not matched, which it does not do today.
+     *
+     * GlassOS-era hardware happens to echo the address it was asked, so validating against the
+     * outgoing address was never seen to fail. This X22i (FitPro1, not GlassOS) does not: every
+     * reply observed on real hardware — DEVICE_INFO, SYSTEM_INFO, VERSION_INFO, and register reads
+     * alike — comes back stamped with the console's own bus address instead (5, when asked at
+     * [FitProCodec.ADDRESS_MAIN]/2), which made every read and write after the handshake look like a
+     * silent, unanswering machine. Null until `DEVICE_INFO` has answered once.
      */
     @Volatile
     var replyAddress: Int? = null
@@ -439,7 +446,18 @@ class DirectMachineSession(
 
         // The probe reads registers too, so it needs the same supported-register filter — see
         // FitProProbe.attempt. deviceInfo is set above, so `supports` can answer by now.
-        val probeResult = probe.confirm(transport, reference, address) { info.supports(it) }
+        //
+        // It also gets the address replies must come from, which until now it was the one
+        // post-handshake exchange not to check — and it is the exchange that licenses writing at
+        // all. `replyAddress` cannot be null here, because `handshake()` sets it on the path that
+        // returns non-null; the fallback is written the same way as `exchange` and `authorisedWrite`
+        // above so that there is one rule for reply identity in this class rather than two.
+        val probeResult = probe.confirm(
+            transport,
+            reference,
+            address,
+            expectAddress = replyAddress ?: address,
+        ) { info.supports(it) }
 
         // Only after the probe, because what follows are register *writes*. FitProProbe exists to
         // establish that this peer is the motor controller and "implements the same register table
