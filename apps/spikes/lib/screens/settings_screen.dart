@@ -180,6 +180,9 @@ class _SettingsScreenState extends State<SettingsScreen>
                     heartRateStrapBattery:
                         _settings['heartRateStrapBattery'] as int?,
                     onHeartRateStrap: _setHeartRateStrap,
+                    inclineSpacing:
+                        _settings['inclineSpacing'] as String? ?? 'fine',
+                    onInclineSpacing: _setInclineSpacing,
                     transportAutomatic:
                         _settings['transportAutomatic'] as bool? ?? true,
                     transportDetail: _settings['transportDetail'] as String?,
@@ -311,8 +314,31 @@ class _SettingsScreenState extends State<SettingsScreen>
     }
   }
 
-  Future<bool?> _confirmLeavingIfit(String transport) {
-    final ftms = transport == 'ftms';
+  /// Re-space the incline quick-pick column.
+  ///
+  /// No confirmation and no waiting loop, unlike the two above. This changes
+  /// which buttons are drawn and nothing else — it cannot take the treadmill
+  /// away, so there is nothing to warn about and no handshake to wait out.
+  ///
+  /// The local state is only updated once the platform says it stored the
+  /// choice. Recording the tap regardless is what made the track-floor pills
+  /// look correct right up until the next reload put the real value back.
+  Future<void> _setInclineSpacing(String spacing) async {
+    final ok = await SpikeBridge.inclineSpacingSet(spacing);
+    if (!mounted) return;
+    if (!ok) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text("That setting couldn't be saved.")),
+      );
+      return;
+    }
+    setState(() => _settings = <String, dynamic>{
+      ..._settings,
+      'inclineSpacing': spacing,
+    });
+  }
+
+  Future<bool?> _confirmLeavingIfit(String transport) {    final ftms = transport == 'ftms';
     return showDialog<bool>(
       context: context,
       builder: (context) => AlertDialog(
@@ -644,6 +670,8 @@ class _AdvancedSection extends StatelessWidget {
     this.heartRateStrapName,
     this.heartRateStrapBattery,
     required this.onHeartRateStrap,
+    this.inclineSpacing = 'fine',
+    required this.onInclineSpacing,
     this.transportAutomatic = true,
     this.transportDetail,
   });
@@ -676,6 +704,12 @@ class _AdvancedSection extends StatelessWidget {
   final String? heartRateStrapName;
   final int? heartRateStrapBattery;
   final ValueChanged<bool> onHeartRateStrap;
+
+  /// How the incline column is spaced: `'fine'` or `'coarse'`. A string rather
+  /// than a bool because the platform owns the vocabulary, and a third spacing
+  /// should not have to change this type to be added.
+  final String inclineSpacing;
+  final ValueChanged<String> onInclineSpacing;
 
   /// Whether the connection in use was detected rather than chosen by the rider.
   final bool transportAutomatic;
@@ -825,14 +859,91 @@ class _AdvancedSection extends StatelessWidget {
               onChanged: onHeartRateStrap,
             ),
           ),
+          const SizedBox(height: StrideSpace.lg),
+          _Section(
+            title: 'Incline quick picks',
+            subtitle:
+                'How far apart the buttons in the incline column are. Only '
+                'applies where Stride builds that column itself — on iFit the '
+                'console publishes its own quick picks and those are used as '
+                'they are.',
+            child: _InclineSpacingChoice(
+              spacing: inclineSpacing,
+              onChanged: onInclineSpacing,
+            ),
+          ),
         ],
       ],
     );
   }
 }
 
-/// The heart rate strap switch and whatever it has found.
+/// How far apart the incline column's buttons sit.
 ///
+/// Two pills, and the coarse one is labelled with both of its steps rather than
+/// as "coarse". The two sides of flat are not spaced the same — 5% climbing,
+/// 3% declining — because a treadmill that declines at all rarely passes -6%,
+/// so a single 5% step would give a rider one decline button and call it a
+/// range. A label that hid that would make the column look wrong on arrival.
+class _InclineSpacingChoice extends StatelessWidget {
+  const _InclineSpacingChoice({required this.spacing, required this.onChanged});
+
+  /// `'fine'` or `'coarse'`. Anything else is treated as the default rather
+  /// than as no selection: a pill row with nothing lit looks broken, and the
+  /// platform has already resolved an unreadable value to fine.
+  final String spacing;
+  final ValueChanged<String> onChanged;
+
+  @override
+  Widget build(BuildContext context) {
+    final coarse = spacing == 'coarse';
+    return Row(
+      children: [
+        _pill(context, 'Every 1%', !coarse, () => onChanged('fine')),
+        const SizedBox(width: StrideSpace.sm),
+        _pill(context, '5% up, 3% down', coarse, () => onChanged('coarse')),
+      ],
+    );
+  }
+
+  Widget _pill(
+    BuildContext context,
+    String label,
+    bool selected,
+    VoidCallback onTap,
+  ) {
+    return Expanded(
+      child: Material(
+        color: selected ? StrideColors.accent : StrideColors.panelHigh,
+        borderRadius: BorderRadius.circular(StrideRadius.md),
+        child: InkWell(
+          borderRadius: BorderRadius.circular(StrideRadius.md),
+          onTap: onTap,
+          child: Container(
+            height: StrideSpace.minTouch,
+            alignment: Alignment.center,
+            decoration: BoxDecoration(
+              borderRadius: BorderRadius.circular(StrideRadius.md),
+              border: Border.all(
+                color: selected ? StrideColors.accent : StrideColors.line,
+              ),
+            ),
+            child: Text(
+              label,
+              style: TextStyle(
+                fontSize: 17,
+                fontWeight: FontWeight.w700,
+                color: selected ? StrideColors.ink : StrideColors.text,
+              ),
+            ),
+          ),
+        ),
+      ),
+    );
+  }
+}
+
+/// The heart rate strap switch and whatever it has found.///
 /// Separate from the transport chooser because a strap is an accessory rather
 /// than a way of reaching the machine: a rider on any of the three transports
 /// can wear one, and burying it in that list would imply a choice between them.

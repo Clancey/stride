@@ -433,6 +433,22 @@ object MachineLink {
     @Volatile private var nextSpeedPresetAskAt: Long = 0L
 
     /**
+     * Which [InclineSpacing] the cached incline answer was built from, or null when
+     * nothing is cached.
+     *
+     * A tag rather than a re-read, because the rider can change the spacing while a preset ask is
+     * already in flight. [refreshInclinePresets] alone cannot cover that: it clears the cache, then
+     * the older request's answer lands and re-latches `inclinePresetsFetched`, and
+     * [fetchPresetsOnce] returns early forever after — a stale column that survives until the
+     * transport is switched. Recording what each cached answer was actually built from turns that
+     * race into a mismatch the next poll pass notices and corrects on its own.
+     *
+     * Written *before* the fetched flag for the same reason: a pass that sees `fetched` must already
+     * be able to see what it was fetched for.
+     */
+    @Volatile private var inclinePresetsSpacing: InclineSpacing? = null
+
+    /**
      * Bumped whenever a preset answer lands. The overlay builds its rails once, before any machine
      * has been asked anything, so without a signal that the answers have arrived it would show the
      * fallback ladder for the life of the window.
@@ -857,12 +873,43 @@ object MachineLink {
     }
 
     /**
-     * Re-open the link against whatever [StrideSettings.transport] now says.
+     * The rider's incline spacing, or the default when the settings store cannot be reached.
      *
-     * Called when the rider changes the transport. Everything measured through the old path is
-     * dropped rather than carried across, because a speed read from GlassOS is not evidence about a
-     * direct link, and a stale reading is the one thing this object exists to prevent.
+     * Attaching here rather than assuming: this runs on the poll thread, which starts before the
+     * settings screen has ever been opened, and [StrideSettings.requirePrefs] throws rather than
+     * guessing. Falling back to FINE on a link with no context is the same answer a fresh install
+     * gets, so a missing context can only ever produce the column that shipped — never a rearranged
+     * one the rider did not ask for.
      */
+    private fun inclineSpacing(): InclineSpacing {
+        val app = appContext ?: return InclineSpacing.FINE
+        StrideSettings.attach(app)
+        return StrideSettings.inclineSpacing
+    }
+
+    /**
+     * Drop the cached incline ladder because the rider re-spaced it.
+     *
+     * Only the incline axis, and no transport churn: the machine's range has not changed, so closing
+     * and re-opening the link to re-derive one column would throw away every reading and every
+     * handshake for a display choice.
+     *
+     * The generation is bumped unconditionally, unlike the guarded bump in [closeTransport]. That
+     * guard exists to stop a *timer* from rebuilding the overlay when nothing changed; this is a
+     * rider's own tap, and the fallback ladder they see until the re-ask lands is itself spaced by
+     * the new choice — so there is always something to rebuild for.
+     *
+     * [fetchPresetsOnce] would notice the change on its own within a poll or two. This is what makes
+     * it happen while the rider is still looking at the screen.
+     */
+    fun refreshInclinePresets() {
+        inclinePresetsCache = null
+        inclinePresetsSpacing = null
+        inclinePresetsFetched = false
+        nextInclinePresetAskAt = 0L
+        presetsGeneration.incrementAndGet()
+    }
+
     /**
      * Counts completed [retarget]s, so a caller can tell when a switch has actually landed.
      *
@@ -877,6 +924,13 @@ object MachineLink {
     /** @see retargetSeq */
     val retargetCount: Int get() = retargetSeq.get()
 
+    /**
+     * Re-open the link against whatever [StrideSettings.transport] now says.
+     *
+     * Called when the rider changes the transport. Everything measured through the old path is
+     * dropped rather than carried across, because a speed read from GlassOS is not evidence about a
+     * direct link, and a stale reading is the one thing this object exists to prevent.
+     */
     fun retarget() {
         val app = appContext ?: return
         handler?.post {
@@ -1178,6 +1232,9 @@ object MachineLink {
         speedPresetsCache = null
         inclinePresetsFetched = false
         speedPresetsFetched = false
+        // Cleared with the answer it described. Leaving it set would let a new transport's first
+        // pass believe a cache that no longer exists was built for the current spacing.
+        inclinePresetsSpacing = null
         nextInclinePresetAskAt = 0L
         nextSpeedPresetAskAt = 0L
         if (hadPresets) presetsGeneration.incrementAndGet()
@@ -1512,15 +1569,32 @@ object MachineLink {
      * spend the poll thread — the thread every metric on screen depends on — waiting for two answers
      * that cannot exist yet. The first ask still happens, because "never asked" has to become
      * "asked" for the rails to know which they are looking at.
+     *
+     * The spacing check comes **before** the both-fetched early return, and has to. Placing it after
+     * would make the one case it exists for unreachable: a spacing change that raced an in-flight
+     * ask leaves both axes fetched, which is exactly when the early return fires.
      */
     private fun fetchPresetsOnce() {
+        // Read once per pass, and pass the same value down. Reading it again when the answer lands
+        // would tag the result with whatever the setting says *then*, which is the stale-forever bug
+        // this tag exists to prevent rather than a fix for it.
+        val spacing = inclineSpacing()
+        if (spacing != inclinePresetsSpacing) {
+            inclinePresetsFetched = false
+            // The empty-answer backoff belongs to the old spacing's answer. Leaving it armed would
+            // hold a rider's freshly chosen column back by an interval they did nothing to earn.
+            nextInclinePresetAskAt = 0L
+        }
         if (inclinePresetsFetched && speedPresetsFetched) return
         val now = SystemClock.elapsedRealtime()
         val detached = consoleDetached
         if (!inclinePresetsFetched && mayAskPresets(inclinePresetsCache, nextInclinePresetAskAt, now, detached)) {
-            MachineCoordinator.ask { it.inclinePresets() }?.let { answer ->
-                val changed = answer != inclinePresetsCache
+            MachineCoordinator.ask { it.inclinePresets(spacing) }?.let { answer ->
+                val changed = answer != inclinePresetsCache || spacing != inclinePresetsSpacing
                 inclinePresetsCache = answer
+                // Before the fetched flag: a pass that sees the latch must be able to see what was
+                // latched, or it cannot tell a current answer from one built for the old spacing.
+                inclinePresetsSpacing = spacing
                 if (answer.isEmpty()) {
                     nextInclinePresetAskAt = now + EMPTY_PRESET_RETRY_MS
                 } else {

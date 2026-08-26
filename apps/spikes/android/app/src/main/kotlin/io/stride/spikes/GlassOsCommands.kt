@@ -183,7 +183,16 @@ class GlassOsCommands(private val client: GlassOsClient) : MachineCommands {
         client.controls("SpeedService")
             ?.let { shapePresets(it, GlassOsClient.ControlType.MPS) { v -> v * MachineLink.MPS_TO_MPH } }
 
-    override fun inclinePresets(): List<Double>? =
+    /**
+     * The incline quick picks the console publishes.
+     *
+     * [spacing] is ignored, and that is the answer rather than an omission. These are the buttons
+     * the console's own designers chose and published; there is nothing here for Stride to re-space,
+     * and no range to re-space it over — [limits] is null on this transport by design. Re-deriving
+     * them at 5% would be Stride overruling the machine about its own controls using numbers the
+     * machine never gave it.
+     */
+    override fun inclinePresets(spacing: InclineSpacing): List<Double>? =
         client.controls("InclineService")
             ?.let { shapePresets(it, GlassOsClient.ControlType.INCLINE) { v -> v } }
 

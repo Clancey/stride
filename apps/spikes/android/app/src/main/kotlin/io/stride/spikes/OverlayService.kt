@@ -197,6 +197,25 @@ class OverlayService : Service() {
         private val INCLINE_LADDER =
             listOf(12.0, 10.0, 8.0, 6.0, 5.0, 4.0, 3.0, 2.0, 1.0, 0.0, -1.0, -2.0, -3.0)
 
+        /**
+         * The same fallback for a rider who asked for the coarse column.
+         *
+         * Derived rather than spelled out, so the fallback cannot drift from the column that
+         * replaces it: the endpoints are [INCLINE_LADDER]'s, and the spacing is whatever
+         * [MachinePresets.inclineLadder] currently produces over them. That keeps the rail from
+         * visibly re-spacing itself the moment the machine's real range lands.
+         *
+         * [INCLINE_LADDER] above is deliberately *not* derived the same way. It skips 11, 9 and 7,
+         * so generating it would quietly change the column every rider who never opened the setting
+         * has been looking at — and this whole setting is only defensible because its default is
+         * untouched.
+         */
+        private val INCLINE_LADDER_COARSE = MachinePresets.inclineLadder(
+            INCLINE_LADDER.last(),
+            INCLINE_LADDER.first(),
+            InclineSpacing.COARSE,
+        )
+
         private val SPEED_LADDER = listOf(12.0, 10.0, 9.0, 8.0, 7.0, 6.0, 5.0, 4.0, 3.0, 2.0, 1.0)
 
         /**
@@ -1852,7 +1871,15 @@ class OverlayService : Service() {
         val limits = MachineCoordinator.machineLimits
         val presets = railEntries(
             published = MachineLink.inclinePresets,
-            ladder = INCLINE_LADDER,
+            // The rider's spacing reaches the fallback too. Skipping it would leave the column at 1%
+            // for as long as the machine has published nothing — which on GlassOS is every idle
+            // console, and on the direct path is every moment before the probe lands — and then
+            // re-space itself under their hand.
+            ladder = if (StrideSettings.inclineSpacing == InclineSpacing.COARSE) {
+                INCLINE_LADDER_COARSE
+            } else {
+                INCLINE_LADDER
+            },
             floor = limits?.minInclinePercent,
             ceiling = limits?.maxInclinePercent,
         )

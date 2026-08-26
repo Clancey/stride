@@ -38,7 +38,21 @@ class DirectTransportParityTest {
         override fun workoutState(): Int? = null.also { asked += "workoutState" }
         override fun autoFanSupported(): Boolean? = null.also { asked += "autoFanSupported" }
         override fun speedPresetsMph(): List<Double>? = null.also { asked += "speedPresetsMph" }
-        override fun inclinePresets(): List<Double>? = null.also { asked += "inclinePresets" }
+
+        /**
+         * Records the [spacing] it was handed, not just that it was called.
+         *
+         * The rider's choice is a parameter on this interface rather than a lookup inside each
+         * driver, so that a transport which ignores it says so in its own signature. That only pays
+         * off if the value actually arrives: a recorder that discarded it would still pass while
+         * every caller passed a constant.
+         */
+        override fun inclinePresets(spacing: InclineSpacing): List<Double>? =
+            null.also {
+                asked += "inclinePresets"
+                spacingsAsked += spacing
+            }
+        val spacingsAsked = mutableListOf<InclineSpacing>()
         override fun limits(): MachineLimits? = null.also { asked += "limits" }
         private fun record(name: String): MachineAck {
             asked += name
@@ -63,8 +77,27 @@ class DirectTransportParityTest {
         val recorder = Recorder()
         val asMachine: MachineCommands = recorder
         asMachine.speedPresetsMph()
-        asMachine.inclinePresets()
+        asMachine.inclinePresets(InclineSpacing.FINE)
         assertEquals(listOf("speedPresetsMph", "inclinePresets"), recorder.asked)
+    }
+
+    /**
+     * The rider's spacing reaches the transport intact, rather than being dropped on the way.
+     *
+     * Worth its own test because every other way of losing it is silent. The column would still
+     * render, still be usable, and still be built from the machine's own range — just always at the
+     * default spacing, which looks exactly like a setting nobody wired up.
+     */
+    @Test
+    fun `the spacing a caller chose is what the transport is handed`() {
+        val recorder = Recorder()
+        val asMachine: MachineCommands = recorder
+        asMachine.inclinePresets(InclineSpacing.COARSE)
+        asMachine.inclinePresets(InclineSpacing.FINE)
+        assertEquals(
+            listOf(InclineSpacing.COARSE, InclineSpacing.FINE),
+            recorder.spacingsAsked,
+        )
     }
 
     /**
