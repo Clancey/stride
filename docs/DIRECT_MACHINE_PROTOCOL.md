@@ -465,8 +465,9 @@ that look alike" above rather than here, because the trap is that it looks wrong
   register read confirmed working end to end after the addressing fix above. The remaining open item
   is starting a workout — see below.
 - Distance and elapsed-time units are inferred (above).
-- `SUPPORTED_DEVICES` is requested during the handshake but the reply is not checked, so there is no
-  model or device-type allowlist before commands are bound.
+- `SUPPORTED_DEVICES` is never requested — `connect` sends `SUPPORTED_COMMANDS` and then only
+  `SYSTEM_INFO`, `VERSION_INFO` and `SERIAL_NUMBER`, and `parseSupportedDevices` has no callers — so
+  there is no model or device-type allowlist before commands are bound.
 - **Whether GlassOS's `StartNewWorkout` moves the belt by itself.** It does — measured on the real
   machine, it drove the console `IDLE → WARM_UP → WORKOUT` and started the belt at **1.0 mph** with
   no speed command sent by Stride, on a flat deck. `DirectMachineCommands.startWorkout` now

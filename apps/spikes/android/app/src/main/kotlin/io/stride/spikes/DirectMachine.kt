@@ -542,6 +542,7 @@ class DirectMachineSession(
             supportedCommands = emptySet()
             fanRegister = null
             address = FitProCodec.ADDRESS_MAIN
+            replyAddress = null
             forgetSecurity()
         }
     }
@@ -554,6 +555,7 @@ class DirectMachineSession(
             supportedCommands = emptySet()
             fanRegister = null
             address = FitProCodec.ADDRESS_MAIN
+            replyAddress = null
             forgetSecurity()
             runCatching { transport.close() }
                 .onFailure { Log.w(TAG, "closing direct transport failed", it) }
