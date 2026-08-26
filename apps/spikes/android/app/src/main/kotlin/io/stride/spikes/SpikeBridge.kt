@@ -168,6 +168,7 @@ class SpikeBridge(private val context: Context) : MethodChannel.MethodCallHandle
                 "settingsGet" -> result.success(settingsGet())
                 "transportSet" -> result.success(transportSet(call))
                 "heartRateStrapSet" -> result.success(heartRateStrapSet(call))
+                "inclineSpacingSet" -> result.success(inclineSpacingSet(call))
                 "usbPermissionRequest" -> result.success(usbPermissionRequest())
                 "grantsGet" -> result.success(grantsGet())
                 "grantsRepair" -> result.success(StridePermissions.repair(context))
@@ -635,6 +636,9 @@ class SpikeBridge(private val context: Context) : MethodChannel.MethodCallHandle
             "heartRateStrapLinked" to MachineLink.heartRateStrapLinked,
             "heartRateStrapName" to MachineLink.heartRateStrapName,
             "heartRateStrapBattery" to MachineLink.heartRateStrapBattery,
+            // Lower-cased to match "transport" above, so the screen reads every enum-shaped setting
+            // the same way rather than remembering which one shouts.
+            "inclineSpacing" to StrideSettings.inclineSpacing.name.lowercase(Locale.US),
             // Whether the transport in use was detected or chosen, and what the probe actually
             // found. Shown rather than only acted on: a rider whose console was detected as one
             // thing and behaves like another learns more from this line than from any retry.
@@ -671,6 +675,35 @@ class SpikeBridge(private val context: Context) : MethodChannel.MethodCallHandle
         MachineLink.retargetHeartRate()
         // The overlay decides whether to build a bpm pill when it lays its chrome out, so without
         // this the switch appears to do nothing until something unrelated rebuilds the strip.
+        OverlayService.refreshChrome()
+        return true
+    }
+
+    /**
+     * Set how the incline quick-pick column is spaced.
+     *
+     * `hasArgument` rather than a null check on the value, and an unknown name is refused rather
+     * than parsed into the default. Both guards are here because of what `trackFloorSet` did for its
+     * whole life: it read a key Dart never sent, `argument` answered null every time, every press
+     * silently stored the default, and the screen looked correct until the next reload put the real
+     * value back. A setter that reports success while storing something else is worse than one that
+     * fails, so a malformed call is a false and the pills do not move.
+     *
+     * Acts on the choice as well as recording it. The link latches a non-empty preset answer for the
+     * life of the transport, so without the refresh a rider would re-space their column and see
+     * nothing change until they switched transports or rebooted the console.
+     */
+    private fun inclineSpacingSet(call: MethodCall): Boolean {
+        StrideSettings.attach(context)
+        if (!call.hasArgument("spacing")) return false
+        val raw = call.argument<String>("spacing") ?: return false
+        val parsed = InclineSpacing.entries
+            .firstOrNull { it.name.equals(raw, ignoreCase = true) } ?: return false
+        StrideSettings.inclineSpacing = parsed
+        MachineLink.refreshInclinePresets()
+        // The rails' pills are views, so changing which values they carry means adding and removing
+        // them — a rebuild, not a repaint. Without this the column keeps its old buttons until
+        // something unrelated rebuilds the chrome.
         OverlayService.refreshChrome()
         return true
     }

@@ -24,6 +24,7 @@ object StrideSettings {
     private const val KEY_TRANSPORT = "machine.transport"
     private const val KEY_FAN = "machine.fanState"
     private const val KEY_HR_STRAP = "sensor.heartRateStrap"
+    private const val KEY_INCLINE_SPACING = "presets.inclineSpacing"
 
     /** How Stride is permitted to reach the machine. */
     enum class Transport {
@@ -210,6 +211,25 @@ object StrideSettings {
         get() = requirePrefs().getBoolean(KEY_HR_STRAP, false)
         set(value) {
             requirePrefs().edit().putBoolean(KEY_HR_STRAP, value).apply()
+        }
+
+    /**
+     * How the incline quick-pick column is spaced.
+     *
+     * [InclineSpacing.FINE] on a fresh install and on any value that no longer
+     * parses, because the default has to be the column that shipped before this was a choice — a
+     * rider who never opened this setting must not find their buttons rearranged by an update.
+     *
+     * Stored as the enum name rather than a step in percent. A number would look like it could be
+     * anything, and it cannot: the coarse option is *two* steps either side of flat, and writing
+     * "5" into a preference would lose the half of it that makes decline usable.
+     */
+    var inclineSpacing: InclineSpacing
+        get() = InclineSpacing.parse(
+            requirePrefs().getString(KEY_INCLINE_SPACING, null),
+        )
+        set(value) {
+            requirePrefs().edit().putString(KEY_INCLINE_SPACING, value.name).apply()
         }
 
     /**

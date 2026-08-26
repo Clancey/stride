@@ -162,6 +162,16 @@ class SpikeBridge {
       _bool('transportSet', <String, dynamic>{'transport': transport});
   static Future<bool> heartRateStrapSet(bool enabled) =>
       _bool('heartRateStrapSet', <String, dynamic>{'enabled': enabled});
+
+  /// How the incline quick-pick column is spaced: `'fine'` (every 1%, the
+  /// default) or `'coarse'` (5% climbing, 3% declining).
+  ///
+  /// The key is `spacing`, and the platform refuses the call if it is missing
+  /// rather than falling back to the default — the same guard `trackFloorSet`
+  /// needed after reading a key Dart never sent, which made every press look
+  /// like it worked and store nothing.
+  static Future<bool> inclineSpacingSet(String spacing) =>
+      _bool('inclineSpacingSet', <String, dynamic>{'spacing': spacing});
   static Future<bool> usbPermissionRequest() => _bool('usbPermissionRequest');
   static Future<List<Map<String, dynamic>>> grantsGet() => _list('grantsGet');
   static Future<bool> grantOpenSettings(String id) =>

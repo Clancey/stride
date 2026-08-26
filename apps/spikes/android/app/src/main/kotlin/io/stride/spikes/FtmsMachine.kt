@@ -148,9 +148,9 @@ class FtmsMachineCommands(private val transport: FtmsLink) : MachineCommands {
         )
     }
 
-    override fun inclinePresets(): List<Double>? {
+    override fun inclinePresets(spacing: InclineSpacing): List<Double>? {
         val range = transport.inclinationRange ?: return null
-        return MachinePresets.ladder(range.minPercent, range.maxPercent, step = 1.0)
+        return MachinePresets.inclineLadder(range.minPercent, range.maxPercent, spacing)
     }
 
     /**

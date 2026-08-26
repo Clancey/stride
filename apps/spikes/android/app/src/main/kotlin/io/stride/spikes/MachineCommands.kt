@@ -118,8 +118,16 @@ interface MachineCommands {
      */
     fun speedPresetsMph(): List<Double>?
 
-    /** The inclines this machine offers as quick picks, in percent, or null when not asked. */
-    fun inclinePresets(): List<Double>?
+    /**
+     * The inclines this machine offers as quick picks, in percent, or null when not asked.
+     *
+     * [spacing] is the rider's choice from Settings → Advanced, and it is a parameter rather than a
+     * setting each implementation looks up for itself. Only the transports that *derive* a ladder
+     * from a reported range can honour it — GlassOS publishes the console's own list and reports no
+     * range at all — and passing it in is what makes "this transport ignores it" a visible decision
+     * in the implementation rather than a missing lookup nobody notices.
+     */
+    fun inclinePresets(spacing: InclineSpacing): List<Double>?
 
     /**
      * The range the machine will accept, or null where it does not say.

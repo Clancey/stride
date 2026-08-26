@@ -1618,10 +1618,10 @@ class DirectMachineCommands(private val session: DirectMachineSession) : Machine
         return ladder(limits.minSpeedMph, limits.maxSpeedMph, step = 1.0)
     }
 
-    /** As [speedPresetsMph], from `MIN_GRADE`/`MAX_GRADE`, in whole percent. */
-    override fun inclinePresets(): List<Double>? {
+    /** As [speedPresetsMph], from `MIN_GRADE`/`MAX_GRADE`, in percent at the rider's [spacing]. */
+    override fun inclinePresets(spacing: InclineSpacing): List<Double>? {
         val limits = session.probe.limits ?: return null
-        return ladder(limits.minInclinePercent, limits.maxInclinePercent, step = 1.0)
+        return MachinePresets.inclineLadder(limits.minInclinePercent, limits.maxInclinePercent, spacing)
     }
 
     override fun limits(): MachineLimits? = session.probe.limits

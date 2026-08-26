@@ -677,9 +677,18 @@ that look alike" above rather than here, because the trap is that it looks wrong
   `BleTransport.variant` is hardcoded `FITPRO1` and derives nothing from the device, so a
   BLE-attached console is held by the capability check alone. Re-confirmation on an X22i against the
   two-frame sequence is still wanted.
-- The preset **ladder step** (1.0) is invented. No preset register exists in FitPro, so the direct
-  path must synthesise the quick picks; the endpoints come from the machine's own MIN/MAX registers,
-  but nothing corroborates the spacing between them.
+- The preset **ladder step** is invented. No preset register exists in FitPro, so the direct path
+  must synthesise the quick picks; the endpoints come from the machine's own MIN/MAX registers, but
+  nothing corroborates the spacing between them.
+
+  Since issue #27 there are two spacings and the rider picks which, in Settings → Advanced. Neither
+  is corroborated any better than the other — the choice exists because the *right* invented step
+  depends on the machine, not because one of them was discovered. The default is unchanged at 1.0,
+  and the alternative is asymmetric: 5% at and above flat, 3% below it, because a console reporting
+  -6% to 40% (an X22i) yields a forty-button column at 1% while its whole decline range fits in two
+  buttons. Both are `MachinePresets.inclineLadder`, both take their endpoints from `MIN_GRADE` and
+  `MAX_GRADE` exactly as before, and neither may produce a value outside them. Speed is untouched
+  and remains a flat 1.0 mph.
 
 ## Run against real hardware — a Commercial 1750 (FITPRO2, USB product 3)
 

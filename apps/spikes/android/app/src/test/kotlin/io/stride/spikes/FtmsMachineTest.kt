@@ -422,7 +422,7 @@ class FtmsMachineTest {
         // none". Collapsing them would make a transport failure look like a machine with no presets
         // and the UI would stop retrying.
         assertNull(commands.speedPresetsMph())
-        assertNull(commands.inclinePresets())
+        assertNull(commands.inclinePresets(InclineSpacing.FINE))
     }
 
     // ---- workout state ----------------------------------------------------------------------

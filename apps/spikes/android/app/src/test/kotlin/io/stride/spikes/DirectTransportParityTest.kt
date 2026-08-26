@@ -38,7 +38,8 @@ class DirectTransportParityTest {
         override fun workoutState(): Int? = null.also { asked += "workoutState" }
         override fun autoFanSupported(): Boolean? = null.also { asked += "autoFanSupported" }
         override fun speedPresetsMph(): List<Double>? = null.also { asked += "speedPresetsMph" }
-        override fun inclinePresets(): List<Double>? = null.also { asked += "inclinePresets" }
+        override fun inclinePresets(spacing: InclineSpacing): List<Double>? =
+            null.also { asked += "inclinePresets" }
         override fun limits(): MachineLimits? = null.also { asked += "limits" }
         private fun record(name: String): MachineAck {
             asked += name
@@ -63,7 +64,7 @@ class DirectTransportParityTest {
         val recorder = Recorder()
         val asMachine: MachineCommands = recorder
         asMachine.speedPresetsMph()
-        asMachine.inclinePresets()
+        asMachine.inclinePresets(InclineSpacing.FINE)
         assertEquals(listOf("speedPresetsMph", "inclinePresets"), recorder.asked)
     }
 
