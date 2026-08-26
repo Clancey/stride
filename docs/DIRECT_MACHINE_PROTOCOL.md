@@ -430,7 +430,7 @@ An end now sends, in this order and each as its own queued job behind the stop:
 |---|---|---|
 | 1 | `KPH = 0`, `WORKOUT_MODE = IDLE` | always — the stop itself, preempting the queue |
 | 2 | `KPH = 0` | always |
-| 3 | `GRADE = 0` | only when telemetry shows the belt at rest |
+| 3 | `GRADE = 0` | only when telemetry shows the belt at rest **and** this console has proved its speed register reports motion |
 | 4 | `FAN_STATE = OFF` | always |
 
 The second zero looks redundant and is the point. If the stop frame landed, the console is idle, it
@@ -445,6 +445,20 @@ by the argument above it is precisely the *lost-stop* branch where 2 is accepted
 deck movement would fire only while the belt was still running. A null reading (stale snapshot, or
 a machine that could not be asked) is not permission either. The deck therefore stays put unless
 Stride can see a stopped belt, which after a pause it normally can, and mid-run it cannot.
+
+**A zero from `ACTUAL_KPH` is not automatically permission either — see issue #34.** On the X22i
+that register reads exactly `0x0000` on every poll while a rider walks at 4 mph, with
+`CURRENT_DISTANCE` accumulating the real pace beside it. That is not a decode bug and not a missing
+register; iFit shows live speed on the same console. It is a confident, well-formed, entirely
+plausible zero — so a null check does not catch it, and a gate built only on "speed reads zero"
+flattens the deck under a moving belt on that machine.
+
+The gate therefore also requires that this console has, at some point on this link, reported a
+speed above the moving threshold at all. Until it has, its zero is indistinguishable from a
+register stuck at zero and is treated as worth nothing. On an X22i exhibiting #34 the deck is never
+flattened, which is exactly where it sat before any of this existed. If #34 is solved, or
+corroboration from `CURRENT_DISTANCE` failing to advance is added, that condition can be
+strengthened — it must not be dropped.
 
 `GRADE = 0` is clamped like any other incline, so a machine whose reported grade range excludes
 zero gets as flat as it goes rather than a value it would refuse — the same coercion `startWorkout`

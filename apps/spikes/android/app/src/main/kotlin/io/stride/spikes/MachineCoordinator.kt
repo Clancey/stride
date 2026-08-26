@@ -661,8 +661,13 @@ object MachineCoordinator {
             // job's writes outliving the generation that authorised them.
             if (generation.get() != gen || endGeneration.get() != end) return@submit Outcome.Superseded
             val observed = MachineLink.speedMph
-            if (!mayFlattenDeck(observed)) {
-                Log.i(TAG, "belt not observably at rest (speed=$observed); leaving the deck where it is")
+            if (!mayFlattenDeck(observed, MachineLink.everReportedMotion)) {
+                Log.i(
+                    TAG,
+                    "belt not observably at rest (speed=$observed, " +
+                        "everReportedMotion=${MachineLink.everReportedMotion}); " +
+                        "leaving the deck where it is",
+                )
                 return@submit speed.toOutcome()
             }
             // Flat is the state a rider steps off onto, and it is the same state a workout is
@@ -825,7 +830,7 @@ internal fun shouldAdoptWorkout(state: Int?, beltSpeedMph: Double?): Boolean =
     state == GlassOsCommands.WORKOUT_RUNNING && (beltSpeedMph ?: 0.0) > BELT_MOVING_MPH
 
 /** Above this the belt is moving, rather than reporting rounding noise around a stop. */
-private const val BELT_MOVING_MPH = 0.1
+internal const val BELT_MOVING_MPH = 0.1
 
 /**
  * Whether the deck may be driven to flat as part of ending a workout.
@@ -839,11 +844,26 @@ private const val BELT_MOVING_MPH = 0.1
  * wrong twice. [MachineAck.Ok] means a console took a register write; it says nothing about a belt.
  * And it selects for exactly the wrong case: if the stop landed, the console is idle and refuses
  * the write, so an ack-gated deck movement would happen *only* on the branch where the console is
- * still in a workout with the belt running. That is the one state a deck must not move in, arrived
- * at by a rule meant to prevent it.
+ * still in a workout with the belt running. Measured on a GlassOS console, which refuses both
+ * `SetSpeed` and `SetIncline` outside `RUNNING` in as many words.
  *
- * So the gate is observed speed — the same reading [shouldAdoptWorkout] uses to answer "is this
- * belt moving", from `ACTUAL_KPH` on the direct path, which is a register Stride only ever reads.
+ * ## Why a zero speed is not enough either — issue #34
+ *
+ * `observedSpeedMph == 0.0` looks like the honest reading this should turn on, and on the X22i it
+ * is a lie. `ACTUAL_KPH` reads exactly `0x0000` on every poll while a rider walks at 4 mph, with
+ * `CURRENT_DISTANCE` accumulating the real pace beside it — not a decode bug, not a missing
+ * register, and iFit shows live speed on the same console. **Not null, either.** A gate that only
+ * refuses on null accepts that console's confident, well-formed zero and flattens the deck under a
+ * moving belt, which is the same hazard the ack version had, reached through a different door and
+ * with no branch to limit it.
+ *
+ * So the reading alone is not the question. [everReportedMotion] asks whether this console's speed
+ * register has *ever* said anything but zero on this link; until it has, a zero from it is
+ * indistinguishable from a register stuck at zero and is worth nothing. See
+ * [MachineLink.everReportedMotion].
+ *
+ * If #34 is ever solved, or corroboration from `CURRENT_DISTANCE` not advancing is added, this can
+ * be strengthened. It must not be weakened.
  *
  * **Null is not permission.** [MachineLink.speedMph] is null when the snapshot is stale or the
  * machine could not be asked, and "we cannot see the belt" has to mean "do not move anything",
@@ -851,5 +871,5 @@ private const val BELT_MOVING_MPH = 0.1
  * moving a treadmill. The cost of being wrong in this direction is a deck left on a hill, which is
  * exactly where it sat before any of this existed.
  */
-internal fun mayFlattenDeck(observedSpeedMph: Double?): Boolean =
-    observedSpeedMph != null && observedSpeedMph <= BELT_MOVING_MPH
+internal fun mayFlattenDeck(observedSpeedMph: Double?, everReportedMotion: Boolean): Boolean =
+    everReportedMotion && observedSpeedMph != null && observedSpeedMph <= BELT_MOVING_MPH

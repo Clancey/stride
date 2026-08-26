@@ -575,7 +575,9 @@ app than the bug being fixed:
    observed reading rather than on that write being acknowledged, because an ack describes a
    console accepting a register and not a belt slowing — and gating on the ack would have moved the
    deck *only* on the lost-stop branch, which is the one where the belt is still running. An
-   unreadable speed is not permission either.
+   unreadable speed is not permission either, and neither is a zero from a console that has never
+   reported motion at all: issue #34 has the X22i reporting a confident `0x0000` speed while a
+   rider walks at 4 mph, which a null check does not catch.
 2. **Fan off.** The missing counterpart to restoring the fan on start. Sent unconditionally rather
    than gated on what Stride thinks the fan is doing — a restore still in flight would be invisible
    to such a check and would turn the fan on right behind the stop — and it deliberately does not

@@ -146,25 +146,26 @@ class WorkoutEndTest {
     // ------------------------------------------------------------------ moving the deck
 
     /**
-     * The deck goes flat only for a belt Stride can *see* has stopped.
+     * The deck goes flat only for a belt Stride can *see* has stopped, on a console whose speed
+     * register has proved it says anything at all.
      *
-     * The first version of this gated on the re-asserted `KPH = 0` coming back accepted, which is a
+     * The first version gated on the re-asserted `KPH = 0` coming back accepted, which is a
      * statement about a console taking a register write and not about a belt. It was worse than
      * useless: on a console that took the stop, the re-assert is refused and no deck moves — so the
      * ack gate fired only on the branch where the console was still in a workout with the belt
      * running, which is the single state a deck must not move in.
      */
     @Test
-    fun `a stopped belt may have its deck flattened`() {
-        assertTrue(mayFlattenDeck(0.0))
+    fun `a stopped belt on a console that reports motion may have its deck flattened`() {
+        assertTrue(mayFlattenDeck(0.0, everReportedMotion = true))
         // Rounding noise around a stop is still a stop.
-        assertTrue(mayFlattenDeck(0.05))
+        assertTrue(mayFlattenDeck(0.05, everReportedMotion = true))
     }
 
     @Test
     fun `a moving belt keeps its deck`() {
-        assertFalse(mayFlattenDeck(0.5))
-        assertFalse(mayFlattenDeck(6.0))
+        assertFalse(mayFlattenDeck(0.5, everReportedMotion = true))
+        assertFalse(mayFlattenDeck(6.0, everReportedMotion = true))
     }
 
     /**
@@ -177,6 +178,52 @@ class WorkoutEndTest {
      */
     @Test
     fun `an unreadable belt keeps its deck`() {
-        assertFalse("null speed is not permission to move anything", mayFlattenDeck(null))
+        assertFalse("null speed is not permission to move anything", mayFlattenDeck(null, true))
+        assertFalse(mayFlattenDeck(null, false))
+    }
+
+    /**
+     * **Issue #34.** A console whose speed register is stuck at zero never gets its deck moved.
+     *
+     * This is the case a null check does not catch and the whole reason `everReportedMotion`
+     * exists. On the X22i, `ACTUAL_KPH` reads exactly `0x0000` on every poll while a rider walks at
+     * 4 mph — not null, not absent, not a decode error, with `CURRENT_DISTANCE` accumulating the
+     * real pace beside it. A gate that only refuses on null accepts that confident zero and drops
+     * the deck under a moving belt.
+     *
+     * Until a console has shown its speed register saying something other than zero, a zero from it
+     * is indistinguishable from a register that always reads zero, and is worth nothing.
+     */
+    @Test
+    fun `a console that has never reported motion is never believed when it reports zero`() {
+        assertFalse(
+            "a stuck-at-zero speed register must not license moving the deck (#34)",
+            mayFlattenDeck(0.0, everReportedMotion = false),
+        )
+        assertFalse(mayFlattenDeck(0.05, everReportedMotion = false))
+    }
+
+    /**
+     * The two conditions are an AND, and neither one alone is enough.
+     *
+     * Pinned as a table because the failure that matters is a future refactor keeping one half.
+     */
+    @Test
+    fun `the deck moves only when both conditions hold`() {
+        val cases = listOf(
+            Triple(0.0, true, true),
+            Triple(0.0, false, false),
+            Triple(4.0, true, false),
+            Triple(4.0, false, false),
+            Triple(null, true, false),
+            Triple(null, false, false),
+        )
+        for ((speed, seenMotion, expected) in cases) {
+            assertEquals(
+                "speed=$speed everReportedMotion=$seenMotion",
+                expected,
+                mayFlattenDeck(speed, seenMotion),
+            )
+        }
     }
 }

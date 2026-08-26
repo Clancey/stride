@@ -333,6 +333,31 @@ object MachineLink {
     @Volatile private var client: GlassOsClient? = null
 
     /**
+     * Whether this machine has ever, on this link, reported a speed that means the belt is moving.
+     *
+     * Not a reading — a statement about whether this console's speed register can be believed when
+     * it says zero.
+     *
+     * It exists because of issue #34: on the X22i, `ACTUAL_KPH` reads exactly `0x0000` on every
+     * poll while a rider is genuinely walking at 4 mph. Not null, not absent, not a decode error —
+     * a confident, well-formed, entirely plausible zero, while `CURRENT_DISTANCE` accumulates the
+     * real pace beside it. "We could not ask" and "we asked, and the answer is a lie" are different
+     * failures, and a null check only catches the first.
+     *
+     * So anything that would treat a zero speed as evidence of a stopped belt has to know whether
+     * this console has ever demonstrated that it reports motion at all. On a machine whose register
+     * is stuck at zero this never becomes true, and the zero is correctly worth nothing. Once a
+     * console has shown real motion, its zero has earned the same credit the rest of this file
+     * already extends it.
+     *
+     * Reset with the snapshot when a transport is torn down: a different machine has to prove
+     * itself again.
+     */
+    @Volatile
+    var everReportedMotion: Boolean = false
+        private set
+
+    /**
      * The direct path, when [StrideSettings.transport] selects it. Null on the GlassOS path.
      *
      * Held separately from [client] rather than behind a shared interface because the two are not
@@ -1018,6 +1043,10 @@ object MachineLink {
         client = null
         snapshot = null
         snapshotAt = 0L
+        // A different machine has to earn the benefit of the doubt again. Carrying this across a
+        // transport swap would let an honest console vouch for the register of the one that
+        // replaced it.
+        everReportedMotion = false
         // Only announce a preset change when there was something to lose.
         //
         // The overlay rebuilds its entire chrome whenever this generation moves, which is correct
@@ -1069,6 +1098,10 @@ object MachineLink {
             if (read != null) {
                 snapshot = read
                 snapshotAt = System.currentTimeMillis()
+                // Latched, never cleared by a later zero. The question this answers is not "is the
+                // belt moving now" — that is what the snapshot is for — but "does this console's
+                // speed register ever say anything but zero". See everReportedMotion and issue #34.
+                if ((read.speedMph ?: 0.0) > BELT_MOVING_MPH) everReportedMotion = true
                 // A real reading over GlassOS settles the question the probe could not. Without
                 // this, a console whose daemon started *after* an inconclusive probe kept the
                 // unresolved state forever - harmless for the transport, which is already right,
