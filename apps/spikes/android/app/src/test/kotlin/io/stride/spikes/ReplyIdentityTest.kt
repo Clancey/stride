@@ -41,30 +41,40 @@ class ReplyIdentityTest {
 
     @Test
     fun `a well-formed answer to the command we sent is accepted`() {
-        assertTrue(FitProCodec.replyMatches(reply(), command, address))
+        assertTrue(FitProCodec.replyMatches(reply(), command))
     }
 
     /** The case that matters: a real frame, for a different command. */
     @Test
     fun `an answer to a different command is not ours`() {
         val other = reply(command = FitProCodec.Command.READ_WRITE_DATA)
-        assertFalse(FitProCodec.replyMatches(other, command, address))
+        assertFalse(FitProCodec.replyMatches(other, command))
         // And it would otherwise have decoded as a perfectly ordinary status.
         assertTrue(FitProCodec.statusOf(other) != null)
     }
 
-    /** A frame from another device on the bus is not ours either. */
+    /**
+     * A reply stamped with a different address is still ours.
+     *
+     * This is the one check that must *not* be made here, and it took an X22i to show why: that
+     * console answers every frame with its own bus address (5) rather than the MAIN it was asked, so
+     * requiring an echo would reject everything it ever says. Matching a reply to its request is the
+     * command byte's job; identifying the sender is `DirectMachineSession.replyAddress`'s, once
+     * DEVICE_INFO has established what the console actually calls itself.
+     */
     @Test
-    fun `an answer from a different address is not ours`() {
-        assertFalse(
-            FitProCodec.replyMatches(
-                reply(address = FitProCodec.ADDRESS_TREADMILL),
-                command,
-                address,
-            ),
+    fun `an answer carrying the console's own address is still accepted`() {
+        assertTrue(
+            FitProCodec.replyMatches(reply(address = FitProCodec.ADDRESS_TREADMILL), command),
         )
+        assertTrue(FitProCodec.replyMatches(reply(address = 5), command))
     }
 
+    /** Address 0 is NONE and cannot begin a frame — the one address rule `ai/b.a` does apply. */
+    @Test
+    fun `an answer from address zero is not a frame`() {
+        assertFalse(FitProCodec.replyMatches(reply(address = 0), command))
+    }
     /**
      * An untouched USB buffer reads as all-`0xFF`, and must never be mistaken for a refusal.
      *
@@ -74,17 +84,17 @@ class ReplyIdentityTest {
     @Test
     fun `an unwritten buffer is not an answer`() {
         val blank = ByteArray(64) { 0xFF.toByte() }
-        assertFalse(FitProCodec.replyMatches(blank, command, address))
+        assertFalse(FitProCodec.replyMatches(blank, command))
         blank[3] = FitProCodec.Status.CMD_NOT_SUPPORTED.value.toByte()
         assertFalse("a status in an empty buffer is still not an answer",
-            FitProCodec.replyMatches(blank, command, address))
+            FitProCodec.replyMatches(blank, command))
     }
 
     @Test
     fun `a corrupted checksum is not an answer`() {
         val corrupted = reply()
         corrupted[corrupted.size - 1] = (corrupted[corrupted.size - 1] + 1).toByte()
-        assertFalse(FitProCodec.replyMatches(corrupted, command, address))
+        assertFalse(FitProCodec.replyMatches(corrupted, command))
     }
 
     /** A length byte that cannot be honest, in both directions. */
@@ -92,24 +102,23 @@ class ReplyIdentityTest {
     fun `an impossible declared length is not an answer`() {
         assertFalse(
             "shorter than the header",
-            FitProCodec.replyMatches(reply(declaredLength = 2), command, address),
+            FitProCodec.replyMatches(reply(declaredLength = 2), command),
         )
         assertFalse(
             "longer than the protocol allows",
             FitProCodec.replyMatches(
                 reply(declaredLength = FitProCodec.MAX_FRAME_LENGTH + 1),
                 command,
-                address,
             ),
         )
         assertFalse(
             "longer than the bytes we actually read",
-            FitProCodec.replyMatches(reply(declaredLength = 60), command, address),
+            FitProCodec.replyMatches(reply(declaredLength = 60), command),
         )
     }
 
     @Test
     fun `a truncated read is not an answer`() {
-        assertFalse(FitProCodec.replyMatches(byteArrayOf(2, 5), command, address))
+        assertFalse(FitProCodec.replyMatches(byteArrayOf(2, 5), command))
     }
 }

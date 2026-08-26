@@ -1154,12 +1154,19 @@ object FitProCodec {
      * (`ai.b.f824b`, with index 3 left as a wildcard) and treats a matching read as *no device*
      * rather than as data — an unwritten USB buffer reads exactly like that.
      */
-    fun replyMatches(reply: ByteArray, command: Command, address: Int): Boolean {
+    fun replyMatches(reply: ByteArray, command: Command): Boolean {
         if (reply.size < FRAME_OVERHEAD) return false
         // Index 3 is deliberately skipped, as GlassOS's own sentinel does: the board may leave a
         // status in an otherwise untouched buffer.
         if (reply.indices.all { it == 3 || reply[it] == 0xFF.toByte() }) return false
-        if (reply[0].toInt() and 0xFF != address) return false
+        // Non-zero, and nothing stronger. Address 0 is NONE and cannot begin a frame, which is the
+        // check `ai/b.a` makes — but it does **not** compare the reply's address to the one the
+        // request was sent to, and neither may this. An X22i stamps every reply with its own bus
+        // address (5) rather than the MAIN it was asked, so requiring an echo here would reject
+        // every frame that console ever sends. Matching a reply to its request is the *command*
+        // byte's job below; whether the sender is the expected device is `replyAddress`'s, once
+        // DEVICE_INFO has established what that address actually is.
+        if (reply[0].toInt() and 0xFF == 0) return false
         val declared = reply[1].toInt() and 0xFF
         if (declared < FRAME_OVERHEAD || declared > MAX_FRAME_LENGTH || declared > reply.size) {
             return false

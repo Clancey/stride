@@ -446,7 +446,7 @@ class DirectMachineSession(
             }
             // Checked before the status is believed. See FitProCodec.replyMatches: without this, a
             // stale frame or an unwritten buffer reads as a plausible refusal from the console.
-            if (!FitProCodec.replyMatches(reply, FitProCodec.Command.DEVICE_INFO, candidate)) {
+            if (!FitProCodec.replyMatches(reply, FitProCodec.Command.DEVICE_INFO)) {
                 Log.w(TAG, "address $candidate answered something that was not a DEVICE_INFO reply")
                 refusals[candidate] = null
                 continue
