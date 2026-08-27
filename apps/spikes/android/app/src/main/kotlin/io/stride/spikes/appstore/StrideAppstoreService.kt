@@ -114,6 +114,9 @@ class StrideAppstoreService : Service() {
             // Loud, because this is a different bug from the one this method guards against.
             // Reaching here means startForeground() itself refused, not that we were too slow.
             Log.e(TAG, "no foreground notification after two attempts; doing no work")
+            if (intent?.action == ACTION_CHECK || intent?.action == null) {
+                AppstoreState.failCheck("update service could not start")
+            }
             // Safe to stop, and worth doing. If we arrived by the deadline-free route there is no
             // promise outstanding, so this is a clean exit. If we arrived by the timed route then
             // the platform is going to tear us down and crash the process within ten seconds either
@@ -170,7 +173,6 @@ class StrideAppstoreService : Service() {
 
     /** Fetch, parse, classify, then act on whatever the plan says is safe to act on. */
     private fun check() {
-        AppstoreState.beginCheck()
         recordCheckStarted(this)
         val url = catalogUrl(this)
         val body = try {
@@ -331,6 +333,7 @@ class StrideAppstoreService : Service() {
                     "${bundle.name} is installed."
                 },
             )
+            AppstoreState.beginCheck()
             worker.execute { check() }
             return
         }
@@ -481,6 +484,11 @@ class StrideAppstoreService : Service() {
 
         @Volatile
         private var active: StrideAppstoreService? = null
+        private val startup = AppstoreStartup(
+            Executors.newSingleThreadExecutor { runnable ->
+                Thread(runnable, "StrideAppstoreStartup").apply { isDaemon = true }
+            },
+        )
 
         fun isRunning(): Boolean = active != null
 
@@ -519,7 +527,18 @@ class StrideAppstoreService : Service() {
 
         // -------------------------------------------------------------- entry points
 
-        fun check(context: Context) = start(context, ACTION_CHECK)
+        fun check(context: Context) {
+            // Publish and invalidate any cache restore before asking Android to enqueue the service.
+            // Waiting for onStartCommand leaves a window where stale cache can win after a manual
+            // check has already been requested.
+            AppstoreState.beginCheck()
+            try {
+                start(context, ACTION_CHECK)
+            } catch (e: Exception) {
+                AppstoreState.failCheck("update service could not start: ${e.message}")
+                throw e
+            }
+        }
 
         /**
          * Check, but only if the last one is old enough. Called on every launcher start.
@@ -538,11 +557,25 @@ class StrideAppstoreService : Service() {
         fun checkOnStart(context: Context) {
             val prefs = context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
             val last = prefs.getLong(KEY_LAST_CHECK, 0L)
-            if (!UpdatePlan.shouldCheckOnStart(last, System.currentTimeMillis())) {
-                restoreCached(context)
-                return
-            }
-            check(context)
+            val generation = AppstoreState.beginInitialization()
+            val appContext = context.applicationContext
+            startup.initialize(
+                shouldCheck = UpdatePlan.shouldCheckOnStart(last, System.currentTimeMillis()),
+                check = { check(appContext) },
+                restore = { restoreCached(appContext, generation) },
+                onFailure = { error ->
+                    Log.w(TAG, "cached catalog initialization failed", error)
+                    AppstoreState.failInitialization(
+                        generation,
+                        if (error is IllegalStateException) {
+                            "No successful catalog is cached; check again when network is available."
+                        } else {
+                            "cached catalog is not usable: " +
+                                (error.message ?: error.javaClass.simpleName)
+                        },
+                    )
+                },
+            )
         }
 
         /**
@@ -553,21 +586,17 @@ class StrideAppstoreService : Service() {
          * an update for something already updated. Only the catalog bytes are worth keeping; the
          * verdict is cheap and must be current.
          *
-         * Never overwrites a live result, and stays silent on a bad cache: this runs on the launcher
-         * start path, where the correct failure is simply "not checked yet" and a real check.
+         * Never overwrites a live result. A missing or bad cache is published explicitly so the
+         * launcher cannot confuse an unanswered initialization with an answered empty catalog.
          */
-        internal fun restoreCached(context: Context) {
-            if (AppstoreState.catalog != null) return
+        internal fun restoreCached(context: Context, generation: Long) {
             val prefs = context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
-            val body = prefs.getString(KEY_CATALOG, null) ?: return
+            val body = prefs.getString(KEY_CATALOG, null)
+                ?: throw IllegalStateException("no cached catalog is available")
             val checkedAt = prefs.getLong(KEY_LAST_CHECK, 0L)
-            try {
-                val catalog = CatalogManifest.parse(body)
-                val plan = UpdatePlan.compute(catalog, installedApps(context), deviceProfile(context))
-                AppstoreState.restore(catalog, plan, checkedAt)
-            } catch (e: Exception) {
-                Log.w(TAG, "cached catalog unusable, leaving state empty", e)
-            }
+            val catalog = CatalogManifest.parse(body)
+            val plan = UpdatePlan.compute(catalog, installedApps(context), deviceProfile(context))
+            AppstoreState.restore(catalog, plan, checkedAt, generation)
         }
 
         /** Stored so a launcher restart can show the last known state without hitting the network. */

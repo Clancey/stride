@@ -55,10 +55,12 @@ class AppstoreStateRestoreTest {
     fun `restore surfaces the pending update and the time it was actually found`() {
         val cat = catalog(entry("com.example.app", versionCode = 9))
         val checkedAt = 1_700_000_000_000L
+        val generation = AppstoreState.beginInitialization()
 
-        AppstoreState.restore(cat, planFor(cat, installedVersion = 8), checkedAt)
+        AppstoreState.restore(cat, planFor(cat, installedVersion = 8), checkedAt, generation)
 
         assertNotNull(AppstoreState.catalog)
+        assertEquals(AppstoreState.Initialization.READY, AppstoreState.initialization)
         assertEquals(checkedAt, AppstoreState.lastCheckWallMs)
         assertEquals(1, AppstoreState.plan.filterIsInstance<UpdateAvailable>().size)
     }
@@ -66,7 +68,13 @@ class AppstoreStateRestoreTest {
     @Test
     fun `restore does not claim a check just happened`() {
         val cat = catalog(entry("com.example.app", versionCode = 9))
-        AppstoreState.restore(cat, planFor(cat, installedVersion = 8), 1_700_000_000_000L)
+        val generation = AppstoreState.beginInitialization()
+        AppstoreState.restore(
+            cat,
+            planFor(cat, installedVersion = 8),
+            1_700_000_000_000L,
+            generation,
+        )
 
         // elapsedRealtime is measured from boot, so a value carried across a restart is not
         // comparable. Freshness must fail towards checking again, never towards trusting disk.
@@ -80,7 +88,8 @@ class AppstoreStateRestoreTest {
         // because completeCheck stamps SystemClock.elapsedRealtime, which is not available off
         // hardware - the guard being tested is the same one either way.
         val live = catalog(entry("com.example.app", versionCode = 12))
-        AppstoreState.restore(live, planFor(live, installedVersion = 12), 500L)
+        val generation = AppstoreState.beginInitialization()
+        AppstoreState.restore(live, planFor(live, installedVersion = 12), 500L, generation)
 
         val stale = catalog(entry("com.example.app", versionCode = 9))
         AppstoreState.restore(stale, planFor(stale, installedVersion = 8), 1L)
@@ -88,5 +97,48 @@ class AppstoreStateRestoreTest {
         assertEquals(500L, AppstoreState.lastCheckWallMs)
         assertEquals(12L, AppstoreState.catalog!!.apps.single().versionCode)
         assertEquals(0, AppstoreState.plan.filterIsInstance<UpdateAvailable>().size)
+    }
+
+    @Test
+    fun `late cached restore cannot overwrite a check that started after it`() {
+        val stale = catalog(entry("com.example.app", versionCode = 9))
+        val generation = AppstoreState.beginInitialization()
+
+        AppstoreState.beginCheck()
+        val restored = AppstoreState.restore(
+            stale,
+            planFor(stale, installedVersion = 8),
+            1L,
+            generation,
+        )
+
+        assertEquals(false, restored)
+        assertEquals(AppstoreState.Initialization.LOADING, AppstoreState.initialization)
+        assertEquals(null, AppstoreState.catalog)
+    }
+
+    @Test
+    fun `failed initialization is distinguishable from an empty catalog`() {
+        val generation = AppstoreState.beginInitialization()
+
+        AppstoreState.failInitialization(generation, "cache corrupt")
+        val snapshot = AppstoreState.snapshot()
+
+        assertEquals(AppstoreState.Initialization.FAILED, snapshot.initialization)
+        assertEquals("cache corrupt", snapshot.lastError)
+        assertEquals(null, snapshot.catalog)
+    }
+
+    @Test
+    fun `a check that cannot start resolves loading as failed`() {
+        AppstoreState.beginInitialization()
+        AppstoreState.beginCheck()
+
+        AppstoreState.failCheck("update service could not start")
+        val snapshot = AppstoreState.snapshot()
+
+        assertEquals(AppstoreState.Initialization.FAILED, snapshot.initialization)
+        assertEquals(false, snapshot.checking)
+        assertEquals("update service could not start", snapshot.lastError)
     }
 }

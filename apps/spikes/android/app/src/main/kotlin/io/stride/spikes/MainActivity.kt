@@ -83,11 +83,12 @@ class MainActivity : FlutterActivity() {
         // rebooted (the common case - it is plugged in) would otherwise only ever check once.
         // enqueueUniquePeriodicWork(KEEP) makes this idempotent.
         AppstoreWorker.ensureScheduled(applicationContext)
-        // ...and check right now, if the last check is old enough to be worth repeating. The
+        // ...and initialize right now, if the last check is old enough to be worth repeating. The
         // periodic worker alone means a console that has just been power-cycled shows "No catalog
         // check has completed yet" until its first ~6h tick, which is exactly when someone is most
         // likely to be looking for an update. The staleness guard is what keeps this from becoming
-        // a catalog fetch on every glance at the launcher.
+        // a catalog fetch on every glance at the launcher. Only the ordered timestamp decision is
+        // synchronous; cached-catalog parsing and package enumeration run on a process worker.
         StrideAppstoreService.checkOnStart(applicationContext)
         channel = MethodChannel(flutterEngine.dartExecutor.binaryMessenger, SpikeBridge.CHANNEL).also {
             it.setMethodCallHandler(SpikeBridge(applicationContext))
