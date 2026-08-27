@@ -256,6 +256,8 @@ object MachineLink {
     /** How long a reading stays believable after the last successful poll. */
     private const val FRESHNESS_MS = 4_000L
 
+    private const val FEET_PER_MILE = 5_280.0
+
     /** Log tag. */
     private const val TAG = "MachineLink"
 
@@ -331,6 +333,75 @@ object MachineLink {
     @Volatile private var snapshot: GlassOsClient.Snapshot? = null
     @Volatile private var snapshotAt: Long = 0L
     @Volatile private var client: GlassOsClient? = null
+    private val transportGeneration = java.util.concurrent.atomic.AtomicLong(0L)
+
+    /**
+     * The running integral behind the overlay's vertical-gain figure.
+     *
+     * One immutable value carries the workout identity, distance baseline, and accrued feet so a UI
+     * thread can never observe pieces from different polls. Null before the first successful poll,
+     * and again whenever the transport is closed, means "not measured" rather than a fabricated zero.
+     */
+    data class VertGainState(
+        val workoutId: String?,
+        val distanceMiles: Double?,
+        val feet: Double?,
+    )
+
+    private data class VertGainPublication(
+        val state: VertGainState,
+        val atMs: Long,
+    )
+
+    @Volatile private var vertGainPublication: VertGainPublication? = null
+
+    /**
+     * Fold one complete telemetry poll into vertical gain.
+     *
+     * The rectangle uses the incline reported on the poll that closes each distance interval. That
+     * is necessarily an approximation when distance or incline is coarse, but unlike multiplying the
+     * whole workout distance by the latest incline it preserves changes over the run.
+     *
+     * Missing or non-finite distance/incline leaves the baseline untouched. When telemetry recovers,
+     * the next usable poll therefore accounts for the full distance gap instead of silently dropping
+     * it. A backwards distance is ignored in the same way: it neither subtracts climb nor moves the
+     * baseline backwards and causes that distance to be counted twice later.
+     */
+    fun foldVertGain(
+        previous: VertGainState?,
+        read: GlassOsClient.Snapshot,
+    ): VertGainState {
+        val distance = read.distanceMiles?.takeIf { it.isFinite() && it >= 0.0 }
+        val incline = read.inclinePercent?.takeIf { it.isFinite() }
+
+        // The first reading establishes what workout is being observed. Every later identity change
+        // is a hard boundary, including a transition to or from null.
+        if (previous == null || previous.workoutId != read.workoutId) {
+            return VertGainState(
+                workoutId = read.workoutId,
+                distanceMiles = if (distance != null && incline != null) distance else null,
+                // An idle poll establishes a real reset even though its metrics may be absent. During
+                // a workout, zero is only knowable after a complete poll establishes the baseline.
+                feet = if (read.workoutId == null || (distance != null && incline != null)) 0.0 else null,
+            )
+        }
+
+        // No workout means no workout climb. Some consoles leave their last distance and incline in
+        // otherwise-idle snapshots; integrating those leftovers would turn an honest reset into a
+        // total that starts growing between workouts.
+        if (read.workoutId == null) return previous.copy(feet = 0.0)
+
+        val baseline = previous.distanceMiles
+        if (distance == null || incline == null) return previous
+        if (baseline == null) return previous.copy(distanceMiles = distance, feet = 0.0)
+        if (distance < baseline) return previous
+
+        val gained = (distance - baseline) * FEET_PER_MILE * incline.coerceAtLeast(0.0) / 100.0
+        if (!gained.isFinite()) return previous
+        val total = (previous.feet ?: 0.0) + gained
+        if (!total.isFinite()) return previous
+        return previous.copy(distanceMiles = distance, feet = total)
+    }
 
     /**
      * One poll's worth of the readings a stop confirmation needs, taken together.
@@ -579,6 +650,19 @@ object MachineLink {
 
     /** Distance covered this session, as measured by the machine. Null means unknown. */
     val distanceMiles: Double? get() = fresh()?.distanceMiles
+
+    /**
+     * Positive vertical gain accumulated from distance and incline telemetry, in feet.
+     *
+     * Null while no complete poll has established a baseline, or when the publication is stale.
+     * The immutable publication keeps the figure and its timestamp from straddling two polls. Zero
+     * is a real initialized value: no climb has yet been observed for the current workout identity.
+     */
+    val vertGainFeet: Double?
+        get() = vertGainPublication
+            ?.takeIf { System.currentTimeMillis() - it.atMs <= FRESHNESS_MS }
+            ?.state
+            ?.feet
 
     /** Instantaneous pace, derived from measured speed only. Null means unknown. */
     val paceMinPerMile: Double? get() = fresh()?.paceMinPerMile
@@ -1229,6 +1313,9 @@ object MachineLink {
     ): Boolean = incline != null || speed != null || inclineFetched || speedFetched
 
     private fun closeTransport() {
+        // Invalidates a read already in flight before any transport-owned value is cleared. The poll
+        // checks this generation before publishing, so detach cannot resurrect an old snapshot.
+        transportGeneration.incrementAndGet()
         MachineCoordinator.rebind(null)
         // A reading taken through the old transport says nothing about the new one, and the belt
         // edge is built from exactly two readings. Carried across a switch, GlassOS reporting
@@ -1252,6 +1339,7 @@ object MachineLink {
         client = null
         snapshot = null
         snapshotAt = 0L
+        vertGainPublication = null
         // Cleared with the snapshot, for the same reason: a reading belongs to the machine that
         // produced it. [readingSeq] is deliberately *not* reset — it is a monotonic ordering used
         // to tell a reading taken before a stop from one taken after it, and restarting the count
@@ -1312,15 +1400,21 @@ object MachineLink {
 
     private val poll = object : Runnable {
         override fun run() {
+            val generation = transportGeneration.get()
             val read = try {
                 client?.read() ?: direct?.read() ?: ftms?.read()
             } catch (t: Throwable) {
                 // A failed read means "we do not know". Never a crash, and never a stale number.
                 null
             }
+            // detach() can close the transport from another thread while a blocking read is in
+            // flight. Nothing returned by that obsolete generation may be published or rescheduled.
+            if (generation != transportGeneration.get()) return
             if (read != null) {
-                snapshot = read
                 val at = System.currentTimeMillis()
+                val gain = foldVertGain(vertGainPublication?.state, read)
+                vertGainPublication = VertGainPublication(gain, at)
+                snapshot = read
                 snapshotAt = at
                 // Published as one object, after the snapshot, so a stop confirmation gets a speed
                 // and a distance that came off the same poll. See Observation.

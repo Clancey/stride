@@ -1307,6 +1307,10 @@ class OverlayService : Service() {
         MachineLink.calories?.let { String.format(Locale.US, "%.0f", it) }
             ?: MachineLink.NO_READING
 
+    private fun vertGainText(): String =
+        MachineLink.vertGainFeet?.let { String.format(Locale.US, "%.0f", it) }
+            ?: MachineLink.NO_READING
+
     /**
      * Heart rate, or [MachineLink.NO_READING].
      *
@@ -1807,9 +1811,9 @@ class OverlayService : Service() {
             trackPill(it) { caloriesText() }
         })
         metrics.addView(metricDivider())
-        // Vertical gain needs incline integrated over distance, which we do not compute yet. It
-        // stays honestly blank rather than being faked from a single incline sample.
-        metrics.addView(metricPillCell("vert gain (ft)", MachineLink.NO_READING, R.drawable.ic_metric_vertgain, Color.rgb(104, 235, 126), 1f))
+        metrics.addView(metricPillCell("vert gain (ft)", vertGainText(), R.drawable.ic_metric_vertgain, Color.rgb(104, 235, 126), 1f).also {
+            trackPill(it) { vertGainText() }
+        })
         metrics.addView(metricDivider())
         // Only when the rider has turned the strap on. A permanently blank eighth pill would narrow
         // the seven that do work, to report the absence of an accessory most riders do not own.
