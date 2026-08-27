@@ -257,7 +257,7 @@ class FanReadoutTest {
     /**
      * A fan change the rider never made still reaches the readout.
      *
-     * `MachineCoordinator.settleAfterEnd` shuts the fan off at the end of a workout (#29), so the
+     * `MachineCoordinator.stopAndSettle` shuts the fan off at the end of a workout (#29), so the
      * state can now diverge from what is on screen with no user action at all — which is exactly when
      * a stale readout is least likely to be questioned. The stamp on the request carries it
      * immediately, and the next reading confirms it.

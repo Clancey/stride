@@ -596,6 +596,24 @@ object MachineCoordinator {
      */
     @Synchronized
     fun stop(onSettled: ((StopVerdict) -> Unit)? = null) {
+        enqueueStop(onSettled)?.start()
+    }
+
+    /**
+     * Stop a definitively ended workout and enqueue every follow-up under the same monitor.
+     *
+     * Keeping this as one coordinator operation prevents a start or rebind from landing after the
+     * stop but before the follow-ups sample their generation and transport.
+     */
+    @Synchronized
+    fun stopAndSettle(onSettled: ((StopVerdict) -> Unit)? = null) {
+        val watcher = enqueueStop(onSettled)
+        enqueueSettlement()
+        watcher?.start()
+    }
+
+    /** Caller holds this object's monitor. */
+    private fun enqueueStop(onSettled: ((StopVerdict) -> Unit)?): StopConfirmation? {
         val gen = generation.incrementAndGet()
         queue.clear()
         pendingFanRequest = null
@@ -615,7 +633,7 @@ object MachineCoordinator {
                 c.stop().toOutcome()
             },
         )
-        watcher?.start()
+        return watcher
     }
 
     /**
@@ -970,9 +988,10 @@ object MachineCoordinator {
      * The three follow-ups are enqueued here, by one caller, in their wire order. The flatten job
      * cannot be submitted from inside the zero job: the worker could do that before the ending
      * thread submits fan-off, putting a 700 ms wait and a deck movement in front of the fan.
+     *
+     * Caller holds this object's monitor, immediately after [enqueueStop].
      */
-    @Synchronized
-    fun settleAfterEnd() {
+    private fun enqueueSettlement() {
         // Sampled here, on the caller's thread, so the checks inside the job compare against the
         // state this end belonged to rather than against whatever is current when it runs.
         val gen = generation.get()

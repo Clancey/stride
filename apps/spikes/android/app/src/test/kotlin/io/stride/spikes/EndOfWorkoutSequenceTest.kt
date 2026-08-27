@@ -55,6 +55,9 @@ class EndOfWorkoutSequenceTest {
         var fanEntered: CountDownLatch? = null
         var releaseFan: CountDownLatch? = null
 
+        /** Signals that the stop reached this transport before its optional call gate. */
+        var stopEntered: CountDownLatch? = null
+
         private fun record(what: String) {
             blockUntil?.await(5, TimeUnit.SECONDS)
             calls += what
@@ -86,6 +89,7 @@ class EndOfWorkoutSequenceTest {
         override fun resume(): MachineAck = MachineAck.Ok
 
         override fun stop(): MachineAck {
+            stopEntered?.countDown()
             record("stop")
             return stopAck
         }
@@ -142,8 +146,7 @@ class EndOfWorkoutSequenceTest {
 
     /** Exactly what [WorkoutMachineCoupling] issues for a definitive end, in its order. */
     private fun endWorkout() {
-        MachineCoordinator.stop()
-        MachineCoordinator.settleAfterEnd()
+        MachineCoordinator.stopAndSettle()
     }
 
     /**
@@ -154,8 +157,7 @@ class EndOfWorkoutSequenceTest {
      */
     private fun endWorkoutAwaitingVerdict(): StopVerdict {
         val settled = java.util.concurrent.ArrayBlockingQueue<StopVerdict>(4)
-        MachineCoordinator.stop { settled.add(it) }
-        MachineCoordinator.settleAfterEnd()
+        MachineCoordinator.stopAndSettle { settled.add(it) }
         return settled.poll(15, TimeUnit.SECONDS)
             ?: throw AssertionError("the stop confirmation never settled")
     }
@@ -204,6 +206,25 @@ class EndOfWorkoutSequenceTest {
 
         awaitCalls(4)
         assertEquals(listOf("stop", "speed 0.00", "fan 0", "incline 0.0"), console.calls)
+    }
+
+    @Test
+    fun `a rebind cannot capture settlement between the end stop and its follow-ups`() {
+        val oldConsole = console
+        val gate = CountDownLatch(1)
+        val stopEntered = CountDownLatch(1)
+        oldConsole.blockUntil = gate
+        oldConsole.stopEntered = stopEntered
+
+        MachineCoordinator.stopAndSettle()
+        assertTrue("stop never reached the original transport", stopEntered.await(5, TimeUnit.SECONDS))
+        console = RecordingConsole()
+        MachineCoordinator.rebind(console)
+        gate.countDown()
+
+        settle()
+        assertTrue("the replacement transport must receive no old-workout writes", console.calls.isEmpty())
+        assertEquals(listOf("stop"), oldConsole.calls)
     }
 
     /**
@@ -583,8 +604,7 @@ class EndOfWorkoutSequenceTest {
         val gate = CountDownLatch(1)
         console.blockUntil = gate
         val startedAt = System.nanoTime()
-        MachineCoordinator.stop { }
-        MachineCoordinator.settleAfterEnd()
+        MachineCoordinator.stopAndSettle { }
         val elapsedMs = TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - startedAt)
         assertTrue("ending took ${elapsedMs}ms with the console wedged", elapsedMs < 500)
         gate.countDown()
