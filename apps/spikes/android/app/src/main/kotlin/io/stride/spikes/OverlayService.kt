@@ -2752,10 +2752,10 @@ class OverlayService : Service() {
     /**
      * Which fan segment to light, best evidence first.
      *
-     * The machine's own answer outranks Stride's last request, which outranks the rider's
-     * remembered preference. That order used to start at the request, so a sheet opened on a fresh
-     * launch lit the pill for a setting chosen days ago on possibly a different treadmill — and
-     * once the console's own fan button had been pressed, the lit pill was simply wrong.
+     * Uses the same evidence ordering as the top-strip readout: a pending request outranks telemetry
+     * from before the tap, current telemetry outranks an accepted write, and either outranks the
+     * rider's remembered preference. Keeping this shared prevents the picker and readout from
+     * disagreeing during the poll between request and acknowledgement.
      *
      * The remembered preference stays as the last resort because this is a picker, not a readout:
      * with nothing lit it looks broken, and the remembered value is at least the one the next
@@ -2763,7 +2763,7 @@ class OverlayService : Service() {
      * honestly, and it is deliberately not said twice in two different vocabularies.
      */
     private fun selectedFanSegment(): Int? =
-        MachineLink.fanState ?: MachineCoordinator.lastFanState ?: StrideSettings.fanState
+        MachineLink.fanSelection() ?: StrideSettings.fanState
 
     private fun refreshFanSegments() {
         if (fanSegmentViews.isEmpty()) return

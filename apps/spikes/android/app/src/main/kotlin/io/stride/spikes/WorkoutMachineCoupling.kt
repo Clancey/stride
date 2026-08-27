@@ -212,8 +212,8 @@ object WorkoutMachineCoupling {
      * because matching the fan to effort is a better default than any fixed speed we could guess;
      * otherwise it stays off and the rider chooses.
      */
-    private fun restoreFan() {
-        MachineCoordinator.restoreFan(StrideSettings.fanState)
+    private fun restoreFan(token: MachineCoordinator.FanRestoreToken) {
+        MachineCoordinator.restoreFan(StrideSettings.fanState, token)
     }
 
     /**
@@ -247,7 +247,11 @@ object WorkoutMachineCoupling {
      * A refusal is reported, not just swallowed, because the rider's next move depends on which one
      * it was — a console with no machine attached is not something tapping Start again will fix.
      */
-    private fun onStartSettled(token: Int, outcome: MachineCoordinator.Outcome) {
+    private fun onStartSettled(
+        token: Int,
+        fanRestoreToken: MachineCoordinator.FanRestoreToken,
+        outcome: MachineCoordinator.Outcome,
+    ) {
         // Sampled together, under the lock that guards the token, so the answer cannot be judged
         // against one attempt's identity and then applied to another's state.
         val (stale, state) = synchronized(this) { (token != startToken) to WorkoutSession.state }
@@ -267,7 +271,7 @@ object WorkoutMachineCoupling {
                 // the fan anyway would turn it on *behind* the stop that abandon just sent — a
                 // console blowing away over a workout that never happened, which is the same
                 // complaint issue #29 opened with, reached from the other end.
-                if (WorkoutSession.confirmStart()) restoreFan()
+                if (WorkoutSession.confirmStart()) restoreFan(fanRestoreToken)
             }
 
             StartSettlement.ABANDON -> {
@@ -476,7 +480,9 @@ object WorkoutMachineCoupling {
                 next == WorkoutSession.State.STARTING -> {
                 val token = synchronized(this) { ++startToken }
                 armWatchdog(token)
-                MachineCoordinator.startWorkout { outcome -> onStartSettled(token, outcome) }
+                MachineCoordinator.startWorkout { outcome, fanRestoreToken ->
+                    onStartSettled(token, fanRestoreToken, outcome)
+                }
             }
 
             previous == WorkoutSession.State.RUNNING && next == WorkoutSession.State.PAUSED ->
