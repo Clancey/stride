@@ -1633,7 +1633,8 @@ class DirectMachineCommands(private val session: DirectMachineSession) : Machine
     }
 
     /**
-     * The speeds this machine will accept, as a ladder built from its own reported range.
+     * The speeds this machine will accept, as a ladder built from its reported range intersected
+     * with Stride's installation clamp.
      *
      * GlassOS publishes a list the console's designers chose; FitPro publishes no such list, only
      * `MIN_KPH` and `MAX_KPH`. Rather than leave the direct path with no quick picks — which would
@@ -1650,7 +1651,7 @@ class DirectMachineCommands(private val session: DirectMachineSession) : Machine
      */
     override fun speedPresetsMph(): List<Double>? {
         val limits = session.probe.limits ?: return null
-        return ladder(limits.minSpeedMph, limits.maxSpeedMph, step = 1.0)
+        return MachinePresets.speedLadder(limits.minSpeedMph, limits.maxSpeedMph)
     }
 
     /** As [speedPresetsMph], from `MIN_GRADE`/`MAX_GRADE`, in percent at the rider's [spacing]. */

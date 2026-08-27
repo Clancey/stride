@@ -61,6 +61,39 @@ class RailPresetsTest {
         assertEquals(listOf("10", "7.5", "5"), entries)
     }
 
+    @Test
+    fun `published presets outside installation clamps use an honest fallback`() {
+        val entries = railPresetEntries(
+            published = listOf(40.0, 20.0, 15.0),
+            ladder = inclineLadder,
+            floor = MachineCoordinator.MIN_INCLINE,
+            ceiling = MachineCoordinator.MAX_INCLINE,
+        )
+        assertEquals(inclineLadder.map(::formatRailPreset), entries)
+    }
+
+    @Test
+    fun `published presets cannot collapse into duplicate clamp commands`() {
+        val entries = railPresetEntries(
+            published = listOf(40.0, 20.0, 12.0, 12.0, 10.0, -6.0, -3.0),
+            ladder = inclineLadder,
+            floor = MachineCoordinator.MIN_INCLINE,
+            ceiling = MachineCoordinator.MAX_INCLINE,
+        )
+        assertEquals(listOf("12", "10", "-3"), entries)
+    }
+
+    @Test
+    fun `range validation uses the displayed command rather than the raw endpoint`() {
+        val entries = railPresetEntries(
+            published = listOf(2.57),
+            ladder = listOf(2.57),
+            floor = 2.55,
+            ceiling = 2.57,
+        )
+        assertTrue("2.57 displays and parses as an out-of-range 2.6", entries.isEmpty())
+    }
+
     /** A real range still narrows the ladder — that behaviour is the point of having limits. */
     @Test
     fun `limits narrow the ladder`() {
@@ -74,22 +107,20 @@ class RailPresetsTest {
     }
 
     /**
-     * A nonsensical range must not be able to empty the column.
+     * A non-null range with no overlap is different from limits that have not arrived yet.
      *
-     * A zeroed limits struct, or one read before a probe finished, would otherwise filter every
-     * speed away and reproduce the original bug from the other direction — this time on a machine
-     * that had published nothing wrong at all.
+     * Null limits use the installation range and keep the fallback usable. Once a machine explicitly
+     * reports a disjoint range, there is no value the column can honestly offer.
      */
     @Test
-    fun `limits that exclude everything fall back to the whole ladder`() {
+    fun `an empty effective intersection offers no dishonest buttons`() {
         val entries = railPresetEntries(
             published = null,
             ladder = speedLadder,
             floor = 40.0,
             ceiling = 50.0,
         )
-        assertEquals(speedLadder.size, entries.size)
-        assertTrue(entries.contains("1"))
+        assertTrue(entries.isEmpty())
     }
 
     /** Half steps survive; rounding them made two pills with one label and two meanings. */
