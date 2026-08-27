@@ -6,6 +6,22 @@
 /// a console.
 library;
 
+/// Whether the platform has answered the launch-time catalog question yet.
+enum AppstoreInitialization {
+  notStarted,
+  loading,
+  ready,
+  failed;
+
+  static AppstoreInitialization parse(Object? raw) => switch (raw as String?) {
+    'not_started' => AppstoreInitialization.notStarted,
+    'loading' => AppstoreInitialization.loading,
+    'ready' => AppstoreInitialization.ready,
+    'failed' => AppstoreInitialization.failed,
+    _ => AppstoreInitialization.notStarted,
+  };
+}
+
 /// Where one package is in the fetch -> verify -> install pipeline.
 ///
 /// Mirrors `AppstoreState.Stage` on the Kotlin side. Unknown values decode to
@@ -347,6 +363,7 @@ class AppstoreSetupStep {
 /// The whole snapshot.
 class AppstoreStatus {
   const AppstoreStatus({
+    required this.initialization,
     required this.checking,
     required this.busy,
     required this.serviceRunning,
@@ -372,6 +389,7 @@ class AppstoreStatus {
               .toList()
         : <AppstoreItem>[];
     return AppstoreStatus(
+      initialization: AppstoreInitialization.parse(map['initialization']),
       checking: map['checking'] == true,
       busy: map['busy'] == true,
       serviceRunning: map['serviceRunning'] == true,
@@ -382,9 +400,13 @@ class AppstoreStatus {
       lastCheckWallMs: (map['lastCheckWallMs'] as num?)?.toInt() ?? 0,
       items: items,
       bundles: switch (map['bundles']) {
-        final List raw => raw
-            .map((e) => AppstoreBundle.fromMap(Map<String, dynamic>.from(e as Map)))
-            .toList(),
+        final List raw =>
+          raw
+              .map(
+                (e) =>
+                    AppstoreBundle.fromMap(Map<String, dynamic>.from(e as Map)),
+              )
+              .toList(),
         _ => const <AppstoreBundle>[],
       },
       lastError: map['lastError'] as String?,
@@ -393,6 +415,7 @@ class AppstoreStatus {
   }
 
   static const AppstoreStatus empty = AppstoreStatus(
+    initialization: AppstoreInitialization.notStarted,
     checking: false,
     busy: false,
     serviceRunning: false,
@@ -404,6 +427,7 @@ class AppstoreStatus {
     items: <AppstoreItem>[],
   );
 
+  final AppstoreInitialization initialization;
   final bool checking;
   final bool busy;
   final bool serviceRunning;
@@ -421,12 +445,15 @@ class AppstoreStatus {
   final String? lastError;
   final String? catalogUrl;
 
+  bool get initializing =>
+      initialization == AppstoreInitialization.notStarted ||
+      initialization == AppstoreInitialization.loading;
+
   /// Genuine updates to already-installed apps. Something merely *offered* by
   /// the catalog and never installed is not a pending update and must not nag
   /// like one.
-  int get pendingCount => _standalone
-      .where((item) => item.kind == AppstoreKind.update)
-      .length;
+  int get pendingCount =>
+      _standalone.where((item) => item.kind == AppstoreKind.update).length;
 
   /// What the launcher badges: everything the rider could act on right now.
   ///

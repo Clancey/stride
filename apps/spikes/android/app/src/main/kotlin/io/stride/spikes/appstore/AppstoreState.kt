@@ -15,6 +15,13 @@ import android.os.SystemClock
  */
 object AppstoreState {
 
+    enum class Initialization {
+        NOT_STARTED,
+        LOADING,
+        READY,
+        FAILED,
+    }
+
     enum class Stage {
         /** Nothing in flight. */
         IDLE,
@@ -61,6 +68,12 @@ object AppstoreState {
 
     private val listeners = mutableListOf<() -> Unit>()
     private val statuses = LinkedHashMap<String, PackageStatus>()
+    private var initializationGeneration = 0L
+    private var recheckRequested = false
+
+    @Volatile
+    var initialization: Initialization = Initialization.NOT_STARTED
+        private set
 
     @Volatile
     var bundleRun: BundleRun? = null
@@ -122,17 +135,33 @@ object AppstoreState {
     var lastError: String? = null
         private set
 
+    data class CheckRequest(val generation: Long, val shouldRun: Boolean)
+    data class CheckFinish(val finished: Boolean, val shouldRecheck: Boolean)
+
     @Synchronized
-    fun beginCheck() {
+    fun beginCheck(): CheckRequest {
+        if (checking) {
+            recheckRequested = true
+            return CheckRequest(initializationGeneration, shouldRun = false)
+        }
+        initializationGeneration++
+        if (catalog == null) initialization = Initialization.LOADING
         checking = true
+        lastError = null
         notifyListeners()
+        return CheckRequest(initializationGeneration, shouldRun = true)
     }
 
     @Synchronized
-    fun completeCheck(catalog: CatalogManifest, plan: List<PlanItem>) {
+    fun completeCheck(
+        generation: Long,
+        catalog: CatalogManifest,
+        plan: List<PlanItem>,
+    ): Boolean {
+        if (generation != initializationGeneration) return false
         this.catalog = catalog
         this.plan = plan
-        this.checking = false
+        this.initialization = Initialization.READY
         this.lastError = null
         this.lastCheckElapsedMs = SystemClock.elapsedRealtime()
         this.lastCheckWallMs = System.currentTimeMillis()
@@ -141,6 +170,19 @@ object AppstoreState {
         val known = plan.map { it.packageName }.toSet()
         statuses.keys.retainAll(known)
         notifyListeners()
+        return true
+    }
+
+    @Synchronized
+    fun finishCheck(generation: Long): CheckFinish {
+        if (generation != initializationGeneration || !checking) {
+            return CheckFinish(finished = false, shouldRecheck = false)
+        }
+        checking = false
+        val shouldRecheck = recheckRequested
+        recheckRequested = false
+        notifyListeners()
+        return CheckFinish(finished = true, shouldRecheck = shouldRecheck)
     }
 
     /**
@@ -155,20 +197,49 @@ object AppstoreState {
      * Never overwrites a live result.
      */
     @Synchronized
-    fun restore(catalog: CatalogManifest, plan: List<PlanItem>, checkedAtWallMs: Long) {
-        if (this.catalog != null) return
-        this.catalog = catalog
-        this.plan = plan
-        this.lastCheckWallMs = checkedAtWallMs
+    fun beginInitialization(): Long? {
+        if (checking || initialization == Initialization.LOADING || catalog != null) return null
+        initializationGeneration++
+        initialization = Initialization.LOADING
+        lastError = null
         notifyListeners()
+        return initializationGeneration
     }
 
     @Synchronized
-    fun failCheck(reason: String) {        checking = false
+    fun restore(
+        catalog: CatalogManifest,
+        plan: List<PlanItem>,
+        checkedAtWallMs: Long,
+        generation: Long = initializationGeneration,
+    ): Boolean {
+        if (generation != initializationGeneration || this.catalog != null) return false
+        this.catalog = catalog
+        this.plan = plan
+        this.initialization = Initialization.READY
+        this.lastCheckWallMs = checkedAtWallMs
+        notifyListeners()
+        return true
+    }
+
+    @Synchronized
+    fun failInitialization(generation: Long, reason: String): Boolean {
+        if (generation != initializationGeneration || catalog != null) return false
+        initialization = Initialization.FAILED
+        lastError = reason
+        notifyListeners()
+        return true
+    }
+
+    @Synchronized
+    fun failCheck(generation: Long, reason: String): Boolean {
+        if (generation != initializationGeneration) return false
+        initialization = if (catalog == null) Initialization.FAILED else Initialization.READY
         lastError = reason
         lastCheckElapsedMs = SystemClock.elapsedRealtime()
         lastCheckWallMs = System.currentTimeMillis()
         notifyListeners()
+        return true
     }
 
     @Synchronized
@@ -210,6 +281,36 @@ object AppstoreState {
     @Synchronized
     fun allStatuses(): List<PackageStatus> = statuses.values.toList()
 
+    data class Snapshot(
+        val initialization: Initialization,
+        val catalog: CatalogManifest?,
+        val plan: List<PlanItem>,
+        val checking: Boolean,
+        val lastCheckWallMs: Long,
+        val lastError: String?,
+        val bundleRun: BundleRun?,
+        val statuses: List<PackageStatus>,
+        val busy: Boolean,
+    )
+
+    /** One coherent publication for MethodChannel clients. */
+    @Synchronized
+    fun snapshot(): Snapshot = Snapshot(
+        initialization = initialization,
+        catalog = catalog,
+        plan = plan,
+        checking = checking,
+        lastCheckWallMs = lastCheckWallMs,
+        lastError = lastError,
+        bundleRun = bundleRun,
+        statuses = statuses.values.toList(),
+        busy = checking || bundleRun?.running == true || statuses.values.any {
+            it.stage == Stage.DOWNLOADING ||
+                it.stage == Stage.INSTALLING ||
+                it.stage == Stage.AWAITING_USER
+        },
+    )
+
     /** True while anything is downloading or installing — the service stays foreground for this. */
     @Synchronized
     fun busy(): Boolean = checking || bundleRun?.running == true || statuses.values.any {
@@ -232,6 +333,9 @@ object AppstoreState {
         statuses.clear()
         catalog = null
         plan = emptyList()
+        initialization = Initialization.NOT_STARTED
+        initializationGeneration = 0L
+        recheckRequested = false
         checking = false
         lastError = null
         lastCheckElapsedMs = 0L

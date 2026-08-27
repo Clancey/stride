@@ -31,7 +31,8 @@ enum class InclineSpacing {
 }
 
 /**
- * Quick-pick ladders derived from a machine's own reported range.
+ * Quick-pick ladders derived from the intersection of a machine's reported range and Stride's
+ * installation clamps.
  *
  * ## Why this is shared rather than owned by one transport
  *
@@ -65,7 +66,25 @@ internal object MachinePresets {
     const val DECLINE_STEP_COARSE = 3.0
 
     /**
-     * The incline quick picks for a machine's reported range, at the rider's chosen [spacing].
+     * Speed quick picks over the range both the machine and this installation permit.
+     *
+     * Unlike the coordinator's command clamp, this keeps the machine's running-speed floor: zero
+     * must remain a valid stop command, but it is not a useful quick pick on a machine that starts at
+     * 1 mph.
+     */
+    fun speedLadder(min: Double, max: Double): List<Double> {
+        val range = effectiveRange(
+            min = min,
+            max = max,
+            absoluteMin = MachineCoordinator.MIN_SPEED_MPH,
+            absoluteMax = MachineCoordinator.MAX_SPEED_MPH,
+        ) ?: return emptyList()
+        return ladder(range.first, range.second, step = 1.0)
+    }
+
+    /**
+     * Incline quick picks for the machine's reported range intersected with the installation clamps,
+     * at the rider's chosen [spacing].
      *
      * ## Why the two sides of zero are not spaced the same
      *
@@ -75,9 +94,8 @@ internal object MachinePresets {
      * identically means picking a step that is too coarse at one end or too fine at the other.
      *
      * So this is two [ladder] calls split at zero and merged, not one call with a single step. Each
-     * half keeps [ladder]'s "both ends always present" guarantee, which is what puts the machine's
-     * true minimum and true maximum on the column even when neither sits on a step boundary — the
-     * -6 and the 40 in `-6, -3, 0, 5 … 40`.
+     * half keeps [ladder]'s "both ends always present" guarantee, which puts the effective minimum
+     * and maximum on the column even when neither sits on a step boundary.
      *
      * Zero is deliberately in both halves and de-duplicated. Flat is the value a rider reaches for
      * after a climb, and it is the one rung neither step is entitled to skip.
@@ -93,6 +111,16 @@ internal object MachinePresets {
      * being asked to be the only thing standing between a rider and a value the machine refused.
      */
     fun inclineLadder(min: Double, max: Double, spacing: InclineSpacing): List<Double> {
+        val range = effectiveRange(
+            min = min,
+            max = max,
+            absoluteMin = MachineCoordinator.MIN_INCLINE,
+            absoluteMax = MachineCoordinator.MAX_INCLINE,
+        ) ?: return emptyList()
+        return inclineLadderWithin(range.first, range.second, spacing)
+    }
+
+    private fun inclineLadderWithin(min: Double, max: Double, spacing: InclineSpacing): List<Double> {
         // Verbatim, not "step = 1.0 happens to be the same". This is the guarantee that a rider who
         // never opens the setting sees exactly the column they saw before it existed.
         if (spacing == InclineSpacing.FINE) return ladder(min, max, INCLINE_STEP_FINE)
@@ -109,6 +137,18 @@ internal object MachinePresets {
         val merged = sortedSetOf<Double>(reverseOrder())
         (decline + incline).forEach { merged += it.coerceIn(min, max) }
         return capMerged(merged.toList())
+    }
+
+    private fun effectiveRange(
+        min: Double,
+        max: Double,
+        absoluteMin: Double,
+        absoluteMax: Double,
+    ): Pair<Double, Double>? {
+        if (!min.isFinite() || !max.isFinite() || max < min) return null
+        val floor = maxOf(min, absoluteMin)
+        val ceiling = minOf(max, absoluteMax)
+        return if (floor <= ceiling) floor to ceiling else null
     }
 
     /**
@@ -166,11 +206,10 @@ internal object MachinePresets {
 
         val floor = ceil1(min)
         val ceiling = floor1(max)
-        // Rounding inward can cross the bounds over on a range narrower than 0.1; there is no
-        // honest button to offer in that case, so offer the one value both ends agree on.
-        // Coerced because rounding a sub-0.1 range can land outside it (min 2.55, max 2.57
-        // rounds to 2.6) and a preset the machine would refuse is worse than an ugly label.
-        if (ceiling < floor) return listOf(flatten(round1(min).coerceIn(min, max)))
+        // The rail parses its one-decimal label back into the command. If no tenth lies inside the
+        // range, there is no honest button to offer: carrying an unrounded endpoint such as 2.57
+        // would display as 2.6 and send 2.6, outside 2.55..2.57.
+        if (ceiling < floor) return emptyList()
 
         val out = sortedSetOf<Double>(reverseOrder())
         out += flatten(floor)

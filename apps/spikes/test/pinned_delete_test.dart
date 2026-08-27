@@ -46,6 +46,11 @@ void main() {
           switch (call.method) {
             case 'listApps':
               return installed;
+            case 'appstoreStatus':
+              return <String, Object?>{
+                'initialization': 'ready',
+                'items': <Object?>[],
+              };
             case 'uninstallApp':
               uninstallRequests.add(
                 (call.arguments as Map)['package'] as String? ?? '',

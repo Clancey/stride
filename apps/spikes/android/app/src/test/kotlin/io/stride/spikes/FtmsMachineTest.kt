@@ -414,6 +414,24 @@ class FtmsMachineTest {
     }
 
     @Test
+    fun `reported FTMS ranges are intersected with installation clamps`() {
+        val commands = FtmsMachineCommands(
+            FakeLink(
+                speedRange = FtmsCodec.SpeedRange(minKph = 1.6, maxKph = 32.0, stepKph = 0.1),
+                inclinationRange = FtmsCodec.InclinationRange(-6.0, 40.0, 0.5),
+            ),
+        )
+
+        val speed = commands.speedPresetsMph()!!
+        assertEquals(MachineCoordinator.MAX_SPEED_MPH, speed.first(), 1e-9)
+        assertEquals(speed.size, speed.distinct().size)
+
+        val incline = commands.inclinePresets(InclineSpacing.COARSE)!!
+        assertEquals(listOf(12.0, 10.0, 5.0, 0.0, -3.0), incline)
+        assertEquals(incline.size, incline.distinct().size)
+    }
+
+    @Test
     fun `presets are unknown rather than empty when the machine did not publish a range`() {
         val link = FakeLink(speedRange = null, inclinationRange = null)
         val commands = FtmsMachineCommands(link)

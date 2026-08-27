@@ -197,6 +197,15 @@ class DirectPresetLadderTest {
     }
 
     @Test
+    fun `a machine reporting over 12 mph stops at the installation ceiling`() {
+        val out = MachinePresets.speedLadder(1.0, 15.0)
+        assertEquals(12.0, out.first(), 1e-9)
+        assertEquals(1.0, out.last(), 1e-9)
+        assertEquals("duplicate buttons", out.size, out.distinct().size)
+        assertTrue(out.all { it in MachineCoordinator.MIN_SPEED_MPH..MachineCoordinator.MAX_SPEED_MPH })
+    }
+
+    @Test
     fun `a fractional floor is kept as its own button`() {
         // A machine whose slowest speed is 0.5 mph must still offer 0.5, or its slowest walk is
         // unreachable from the quick picks.
@@ -270,13 +279,8 @@ class DirectPresetLadderTest {
     }
 
     @Test
-    fun `the single button offered for a sub-tenth range stays inside that range`() {
-        // 2.55 rounds to 2.6, which is above the machine's maximum of 2.57 — a button that could
-        // only ever be clamped or refused. The rail may show an unrounded number; it may not show
-        // a number the machine would not accept.
-        val out = ladder(2.55, 2.57)
-        assertEquals("one button", 1, out.size)
-        assertTrue("offered ${out[0]} for a 2.55-2.57 machine", out[0] in 2.55..2.57)
+    fun `a sub-tenth range with no displayable command offers no button`() {
+        assertTrue(ladder(2.55, 2.57).isEmpty())
     }
 
     /**

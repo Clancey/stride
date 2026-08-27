@@ -459,16 +459,26 @@ about whether field 16 works. And **there is no per-field validity marker** — 
 checks only command status and total length, then consumes raw bytes in field order, so "the value
 is zero" and "I do not have this value" are the same bytes.
 
+Stride now makes the same source choice **for display only, and only while field 16 remains
+unproven**. The direct poll reads `KPH` back from the console alongside `ACTUAL_KPH`; until
+`ACTUAL_KPH` reports motion, the metric strip and its pace use that read-back setpoint. Once
+`ACTUAL_KPH` has reported motion on a link, its later zero is kept rather than hidden by the
+fallback. The raw `ACTUAL_KPH` remains a separate snapshot field throughout: `Observation`,
+`everReportedMotion`, deck movement, and stop confirmation never receive the commanded value.
+Outside a moving workout state — including pause and results — the fallback is disabled so a stale
+target cannot appear as live speed.
+
 The gate therefore also requires that this console has, at some point on this link, reported a
 speed above the moving threshold at all. Until it has, its zero is indistinguishable from a
 register stuck at zero and is treated as worth nothing. On an X22i exhibiting #34 the deck is never
 flattened, which is exactly where it sat before any of this existed.
 
-`Rpm` (field 5) is the obvious next avenue for a real motion signal on such a console: it is
-**read-only**, so it is a machine measurement rather than a setpoint, and it may carry roller or
-motor movement where field 16 is dead. Nobody has checked whether the X22i populates it, so nothing
-depends on it yet. Corroborating against `CURRENT_DISTANCE` failing to advance would serve too.
-Either would let that condition be strengthened — it must not be dropped.
+This does not turn a target into a measurement. The X22i reports `Rpm` (field 5) unsupported, so the
+remaining route to a real instantaneous displayed value is deriving it from `CURRENT_DISTANCE`.
+That register is integer metres on the direct path, however, and no sampling/filtering rule has yet
+been established that avoids presenting its quantisation as large speed jumps. Until that can be
+tested on hardware, the read-back setpoint is the same bounded display fallback iFit uses, not a
+claim about actual belt motion.
 
 `GRADE = 0` is clamped like any other incline, so a machine whose reported grade range excludes
 zero gets as flat as it goes rather than a value it would refuse — the same coercion `startWorkout`
@@ -663,15 +673,23 @@ that look alike" above rather than here, because the trap is that it looks wrong
   one that worked: the author's X22i accepted the init writes and the next `startWorkout()` drove the
   belt for about two minutes.
 
-  Three things about that result are worth stating plainly rather than filing as settled:
+  That first result did not settle the merged implementation: it was a single live observation
+  against an earlier revision that sent both fields in *one* frame.
 
-  1. **It is a single live observation**, and it was taken against an earlier revision that sent both
-     fields in *one* frame. It therefore no longer describes what Stride sends.
-  2. **The writes are ordered, and the order is load-bearing.** Field 108 arms a gate; field 95
+  **The merged two-frame implementation was re-confirmed live on an X22i on 2026-08-27.** Two runs
+  used a debug build from current `main`. In both, `startWorkout()` returned `Ok` and the belt ran.
+  That confirms the merged end-to-end path on the target hardware; it is not an independent wire
+  capture and does not prove the effect of each individual field in isolation. The deterministic
+  tests cover the frame boundaries, ordering, refusal and timeout paths, pending-start guard,
+  control gate, and FitPro2 / missing-capability no-op cases.
+
+  Two implementation details remain important:
+
+  1. **The writes are ordered, and the order is load-bearing.** Field 108 arms a gate; field 95
      removes one. Values inside one register block are ordered by field id (see the `startWorkout`
      note above), so batching them puts 95 *ahead* of 108 — backwards. They now go out as two frames,
-     108 first, and 95 is only sent once 108 has been acknowledged, so every way the sequence can
-     fail leaves the console more gated rather than less.
+     108 first, and 95 is only sent once 108 has been acknowledged, so the lockout is never cleared
+     unless the gate was armed first.
 
      This is what iFit does too, and the binary is unusually clear about it. Each setter goes through
      `FitnessConsoleBase.SetValue`, which starts its own `SetValueAsync`, and
@@ -698,7 +716,7 @@ that look alike" above rather than here, because the trap is that it looks wrong
      landed, the result is the ordinary `(108=1, 95=0)`. The guarantee is that **the lockout is never
      cleared unless the gate was armed first**, which is what excludes the one combination worse than
      doing nothing.
-  3. **`IsBeltBasedMachine()` is assumed, not read.** `DeviceExtensions.IsBeltBasedMachine` answers
+  2. **`IsBeltBasedMachine()` is assumed, not read.** `DeviceExtensions.IsBeltBasedMachine` answers
      it from the primary device in `DeviceInfoCmd`, and accepts `Treadmill` **and**
      `InclineTrainer` — the X22i is an incline trainer, so hardcoding true is right for this console
      and wrong in general. Stride has no primary device to consult: `DeviceInfo.address` is the bus
@@ -711,8 +729,7 @@ that look alike" above rather than here, because the trap is that it looks wrong
   two independent gates — `variantOf` reads the product id, and a 1750 resolves to `FITPRO2` — so it
   is a structural no-op on GlassOS-era consoles. Over BLE it is one gate, not two:
   `BleTransport.variant` is hardcoded `FITPRO1` and derives nothing from the device, so a
-  BLE-attached console is held by the capability check alone. Re-confirmation on an X22i against the
-  two-frame sequence is still wanted.
+  BLE-attached console is held by the capability check alone.
 - The preset **ladder step** is invented. No preset register exists in FitPro, so the direct path
   must synthesise the quick picks; the endpoints come from the machine's own MIN/MAX registers, but
   nothing corroborates the spacing between them.
