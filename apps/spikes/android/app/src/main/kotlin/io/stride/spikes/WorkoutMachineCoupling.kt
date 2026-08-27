@@ -227,12 +227,11 @@ object WorkoutMachineCoupling {
      * empties the queue and takes the front of it; these only ever append, so they cannot delay,
      * reorder ahead of, or queue in front of the one command that stops a belt.
      *
-     * Zero first, fan second. If the stop frame was lost, the re-assert is what actually stops the
-     * treadmill, and the fan is a comfort control that can wait behind it.
+     * The coordinator owns the whole follow-up sequence so its worker cannot enqueue the delayed
+     * flatten before this thread has enqueued fan-off.
      */
     private fun settleAfterEnd() {
-        MachineCoordinator.reassertZero()
-        MachineCoordinator.stopFan()
+        MachineCoordinator.settleAfterEnd()
     }
 
     /**

@@ -229,10 +229,10 @@ object MachineCoordinator {
      * "everything queued is stale", and a stop must keep meaning exactly that. This one means "the
      * workout those writes belonged to is over and something newer wants the machine".
      *
-     * It exists because the tidy-up costs round trips — a re-assert is two, the fan is a third —
-     * and each one can block for the console's full command timeout. A rider who ends a workout and
-     * immediately starts another would otherwise have their start queued behind the best part of a
-     * minute of writes for a session that no longer exists, which is long enough for
+     * It exists because the tidy-up costs multiple round trips, and each one can block for the
+     * console's full command timeout. A rider who ends a workout and immediately starts another
+     * would otherwise have their start queued behind writes for a session that no longer exists,
+     * which is long enough for
      * [WorkoutMachineCoupling]'s start watchdog to give up on a start that was never sent.
      */
     private val endGeneration = AtomicInteger(0)
@@ -965,15 +965,26 @@ object MachineCoordinator {
      * re-assert as a successful stop.
      *
      * Queued, never preempting. [stop] has already bumped the generation and taken the front of the
-     * queue by the time this is called, so this can only ever sit behind it. That ordering is not
-     * an accident of timing: the caller issues the stop first, and `submit` only ever appends.
+     * queue by the time this is called, so this sequence can only ever sit behind it.
+     *
+     * The three follow-ups are enqueued here, by one caller, in their wire order. The flatten job
+     * cannot be submitted from inside the zero job: the worker could do that before the ending
+     * thread submits fan-off, putting a 700 ms wait and a deck movement in front of the fan.
      */
-    fun reassertZero() {
+    @Synchronized
+    fun settleAfterEnd() {
         // Sampled here, on the caller's thread, so the checks inside the job compare against the
         // state this end belonged to rather than against whatever is current when it runs.
         val gen = generation.get()
         val end = endGeneration.get()
-        submit(REASSERT_LABEL, endGen = end, reportsOutcome = false) { commands ->
+        val fanRequest = beginFanRequest(GlassOsCommands.FAN_OFF, fanAdmission())
+        var firstAtRest: MachineLink.Observation? = null
+        submit(
+            REASSERT_LABEL,
+            endGen = end,
+            reportsOutcome = false,
+            jobGeneration = gen,
+        ) { commands ->
             // Through the same clamp as every other speed request, not as a raw zero. The floor
             // being 0 rather than the machine's reported minimum is a safety rule, and it is stated
             // in exactly one place (clampSpeed) so a second copy here cannot drift away from it.
@@ -992,68 +1003,46 @@ object MachineCoordinator {
                 )
                 return@submit speed.toOutcome()
             }
-            // The second sample is its own queued job rather than a sleep in this one, so the fan
-            // shutdown already waiting behind us is not delayed by a deck movement that may never
-            // be authorised.
-            submit(
-                "Flatten deck after rest recheck",
-                delayMs = DECK_RECHECK_MS,
-                endGen = end,
-                reportsOutcome = false,
-            ) { laterCommands ->
-                val observed = MachineLink.observation()
-                if (!mayFlattenDeck(atRest, observed)) {
-                    Log.i(
-                        TAG,
-                        "belt did not remain observably at rest (before=$atRest, observed=$observed); " +
-                            "leaving the deck where it is",
-                    )
-                    return@submit speed.toOutcome()
-                }
-                // Flat is the state a rider steps off onto, and it is the same state a workout is
-                // started in — a run should not end leaving the deck wherever the last hill put it.
-                //
-                // Clamped, so a machine whose reported grade range excludes zero gets as flat as it
-                // goes rather than a value it would refuse.
-                laterCommands.setInclinePercent(clampIncline(0.0)).toOutcome()
-            }
+            firstAtRest = atRest
             speed.toOutcome()
         }
-    }
-
-    /**
-     * Shut the fan off, because the workout is over.
-     *
-     * The missing half of [restoreFan]. Stride has turned the fan on at the start of every workout
-     * since that landed and has never turned it off, so a console left alone after a run sat there
-     * blowing until somebody noticed — issue #29.
-     *
-     * **Sent unconditionally, not gated on [lastFanState].** Skipping when Stride does not think it
-     * has a fan running looks like an easy saving and is a race: a restore can already be on the wire
-     * when the workout ends and can turn the fan on behind the stop. The accepted state cannot make
-     * that in-flight write safe, and the console has controls of its own.
-     *
-     * A refusal is not an error. It means this machine has no fan register that will take a write,
-     * which is a fact about the treadmill and not a failure of the end — swallowed for the same
-     * reason [restoreFan] swallows a speculative Auto.
-     *
-     * [StrideSettings.fanState] is deliberately untouched. That is the rider's remembered
-     * preference and the value the next [restoreFan] replays; recording an automatic shutdown into
-     * it would quietly teach the app that they want the fan off from now on.
-     */
-    fun stopFan() {
-        val end = endGeneration.get()
-        val request = beginFanRequest(GlassOsCommands.FAN_OFF, fanAdmission())
         submit(
             label = FAN_OFF_LABEL,
-            onDone = { finishFanRequest(request) },
+            onDone = { finishFanRequest(fanRequest) },
             endGen = end,
             reportsOutcome = false,
-            jobGeneration = request.admission.generation,
+            jobGeneration = gen,
         ) { commands ->
-            if (commands !== request.admission.transport) return@submit Outcome.Superseded
-            val ack = acceptFanWrite(request, commands.setFanState(GlassOsCommands.FAN_OFF))
+            if (commands !== fanRequest.admission.transport) return@submit Outcome.Superseded
+            val ack = acceptFanWrite(fanRequest, commands.setFanState(GlassOsCommands.FAN_OFF))
             if (ack is MachineAck.Refused) Outcome.Ok else ack.toOutcome()
+        }
+        submit(
+            "Flatten deck after rest recheck",
+            endGen = end,
+            reportsOutcome = false,
+            jobGeneration = gen,
+        ) { commands ->
+            val before = firstAtRest ?: return@submit Outcome.Ok
+            if (!settle(DECK_RECHECK_MS)) return@submit Outcome.Superseded
+            if (generation.get() != gen || endGeneration.get() != end) {
+                return@submit Outcome.Superseded
+            }
+            val observed = MachineLink.observation()
+            if (!mayFlattenDeck(before, observed)) {
+                Log.i(
+                    TAG,
+                    "belt did not remain observably at rest (before=$before, observed=$observed); " +
+                        "leaving the deck where it is",
+                )
+                return@submit Outcome.Ok
+            }
+            // Flat is the state a rider steps off onto, and it is the same state a workout is
+            // started in — a run should not end leaving the deck wherever the last hill put it.
+            //
+            // Clamped, so a machine whose reported grade range excludes zero gets as flat as it
+            // goes rather than a value it would refuse.
+            commands.setInclinePercent(clampIncline(0.0)).toOutcome()
         }
     }
 

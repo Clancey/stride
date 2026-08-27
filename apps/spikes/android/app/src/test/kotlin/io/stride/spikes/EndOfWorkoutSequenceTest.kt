@@ -45,6 +45,9 @@ class EndOfWorkoutSequenceTest {
         /** Run inside [setSpeedKph], to simulate something landing while the write is on the wire. */
         var duringSpeedWrite: (() -> Unit)? = null
 
+        /** Run after a fan write is recorded, before the worker advances to its next job. */
+        var duringFanWrite: (() -> Unit)? = null
+
         /** Held by every call while set, so a test can prove the *caller* is not the one blocking. */
         var blockUntil: CountDownLatch? = null
 
@@ -72,6 +75,7 @@ class EndOfWorkoutSequenceTest {
             fanEntered?.countDown()
             releaseFan?.await(5, TimeUnit.SECONDS)
             record("fan $state")
+            duringFanWrite?.invoke()
             fanThrows?.let { throw it }
             return fanAck
         }
@@ -113,6 +117,7 @@ class EndOfWorkoutSequenceTest {
         MachineCoordinator.setFan(GlassOsCommands.FAN_HIGH)
         awaitCalls(1)
         console.calls.clear()
+        publishObservation(null)
     }
 
     /** Wait for the worker to have made [count] calls, or fail the test rather than hang. */
@@ -138,8 +143,7 @@ class EndOfWorkoutSequenceTest {
     /** Exactly what [WorkoutMachineCoupling] issues for a definitive end, in its order. */
     private fun endWorkout() {
         MachineCoordinator.stop()
-        MachineCoordinator.reassertZero()
-        MachineCoordinator.stopFan()
+        MachineCoordinator.settleAfterEnd()
     }
 
     /**
@@ -151,17 +155,33 @@ class EndOfWorkoutSequenceTest {
     private fun endWorkoutAwaitingVerdict(): StopVerdict {
         val settled = java.util.concurrent.ArrayBlockingQueue<StopVerdict>(4)
         MachineCoordinator.stop { settled.add(it) }
-        MachineCoordinator.reassertZero()
-        MachineCoordinator.stopFan()
+        MachineCoordinator.settleAfterEnd()
         return settled.poll(15, TimeUnit.SECONDS)
             ?: throw AssertionError("the stop confirmation never settled")
     }
 
+    private fun publishObservation(observation: MachineLink.Observation?) {
+        MachineLink::class.java.getDeclaredField("latestObservation").also {
+            it.isAccessible = true
+            it.set(MachineLink, observation)
+        }
+    }
+
+    private fun stoppedObservation(seq: Long) = MachineLink.Observation(
+        seq = seq,
+        atMs = System.currentTimeMillis(),
+        speedMph = 0.0,
+        distanceMiles = 1.0,
+        workoutEpoch = 1L,
+        reportedMotionInWorkout = true,
+    )
+
     /**
      * The stop is first on the wire, and the settling writes queue behind it.
      *
-     * The ordering is not a nicety. `stop` empties the queue and takes the front of it; the two
-     * settling calls only ever append. If that ever inverts, a treadmill waits for a fan.
+     * The ordering is not a nicety. `stop` empties the queue and takes the front of it; the
+     * coordinator's settling sequence only appends. If that ever inverts, a treadmill waits for a
+     * fan.
      *
      * No incline here, and that is the assertion rather than an omission: nothing has told this
      * coordinator what the belt is doing, and [mayFlattenDeck] refuses to move a deck it cannot see
@@ -173,6 +193,17 @@ class EndOfWorkoutSequenceTest {
         awaitCalls(3)
         settle()
         assertEquals(listOf("stop", "speed 0.00", "fan 0"), console.calls)
+    }
+
+    @Test
+    fun `fan off is on the wire before a positively authorized flatten`() {
+        console.duringSpeedWrite = { publishObservation(stoppedObservation(10)) }
+        console.duringFanWrite = { publishObservation(stoppedObservation(11)) }
+
+        endWorkout()
+
+        awaitCalls(4)
+        assertEquals(listOf("stop", "speed 0.00", "fan 0", "incline 0.0"), console.calls)
     }
 
     /**
@@ -378,9 +409,8 @@ class EndOfWorkoutSequenceTest {
      */
     @Test
     fun `a stop during the re-assert cancels the rest of it`() {
-        // Every job is queued before the worker is allowed to touch any of them. Without the gate
-        // this test races the worker: if it reached setSpeedKph before stopFan had queued, the
-        // nested stop's queue.clear() would have nothing to clear and the fan job would survive.
+        // Every job is queued before the worker is allowed to touch any of them. The gate makes the
+        // nested stop deterministic: it clears the already-queued fan and flatten jobs.
         val gate = CountDownLatch(1)
         console.blockUntil = gate
         console.duringSpeedWrite = {
@@ -430,7 +460,7 @@ class EndOfWorkoutSequenceTest {
     }
 
     /**
-     * None of the three calls blocks the thread that ended the workout.
+     * Neither call blocks the thread that ended the workout.
      *
      * That thread is the one notifying every workout listener, and on the overlay it is the main
      * thread. A console that has stopped answering must cost a rider a slow fan, not a frozen
@@ -554,8 +584,7 @@ class EndOfWorkoutSequenceTest {
         console.blockUntil = gate
         val startedAt = System.nanoTime()
         MachineCoordinator.stop { }
-        MachineCoordinator.reassertZero()
-        MachineCoordinator.stopFan()
+        MachineCoordinator.settleAfterEnd()
         val elapsedMs = TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - startedAt)
         assertTrue("ending took ${elapsedMs}ms with the console wedged", elapsedMs < 500)
         gate.countDown()
