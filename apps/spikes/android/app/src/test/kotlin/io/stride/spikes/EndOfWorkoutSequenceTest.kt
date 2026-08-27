@@ -55,9 +55,6 @@ class EndOfWorkoutSequenceTest {
         var fanEntered: CountDownLatch? = null
         var releaseFan: CountDownLatch? = null
 
-        /** Signals that the stop reached this transport before its optional call gate. */
-        var stopEntered: CountDownLatch? = null
-
         private fun record(what: String) {
             blockUntil?.await(5, TimeUnit.SECONDS)
             calls += what
@@ -89,7 +86,6 @@ class EndOfWorkoutSequenceTest {
         override fun resume(): MachineAck = MachineAck.Ok
 
         override fun stop(): MachineAck {
-            stopEntered?.countDown()
             record("stop")
             return stopAck
         }
@@ -122,6 +118,7 @@ class EndOfWorkoutSequenceTest {
         awaitCalls(1)
         console.calls.clear()
         publishObservation(null)
+        MachineCoordinator.beforeCommandExecutionForTest = null
     }
 
     /** Wait for the worker to have made [count] calls, or fail the test rather than hang. */
@@ -209,18 +206,21 @@ class EndOfWorkoutSequenceTest {
     }
 
     @Test
-    fun `a rebind cannot capture settlement between the end stop and its follow-ups`() {
+    fun `a rebind after settlement validation cannot redirect its write`() {
         val oldConsole = console
-        val gate = CountDownLatch(1)
-        val stopEntered = CountDownLatch(1)
-        oldConsole.blockUntil = gate
-        oldConsole.stopEntered = stopEntered
+        val validated = CountDownLatch(1)
+        val release = CountDownLatch(1)
+        MachineCoordinator.beforeCommandExecutionForTest = {
+            MachineCoordinator.beforeCommandExecutionForTest = null
+            validated.countDown()
+            release.await(5, TimeUnit.SECONDS)
+        }
 
         MachineCoordinator.stopAndSettle()
-        assertTrue("stop never reached the original transport", stopEntered.await(5, TimeUnit.SECONDS))
+        assertTrue("settlement never reached its post-validation barrier", validated.await(5, TimeUnit.SECONDS))
         console = RecordingConsole()
         MachineCoordinator.rebind(console)
-        gate.countDown()
+        release.countDown()
 
         settle()
         assertTrue("the replacement transport must receive no old-workout writes", console.calls.isEmpty())

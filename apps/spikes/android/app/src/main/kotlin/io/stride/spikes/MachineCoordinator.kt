@@ -222,6 +222,9 @@ object MachineCoordinator {
     private val queue = LinkedBlockingDeque<Job>()
     private val generation = AtomicInteger(0)
 
+    @Volatile
+    internal var beforeCommandExecutionForTest: (() -> Unit)? = null
+
     /**
      * Retires the writes that tidy up after a finished workout.
      *
@@ -615,6 +618,7 @@ object MachineCoordinator {
     /** Caller holds this object's monitor. */
     private fun enqueueStop(onSettled: ((StopVerdict) -> Unit)?): StopConfirmation? {
         val gen = generation.incrementAndGet()
+        val stopCommands = commands
         queue.clear()
         pendingFanRequest = null
         // Sampled on the caller's thread, before the job can possibly run, so "readings newer than
@@ -629,7 +633,8 @@ object MachineCoordinator {
                 STOP_LABEL,
                 onDone = { outcome -> watcher?.onAck(outcome is Outcome.Ok) },
             ) {
-                val c = commands ?: return@Job Outcome.Failed("No link to the console")
+                if (commands !== stopCommands) return@Job Outcome.Superseded
+                val c = stopCommands ?: return@Job Outcome.Failed("No link to the console")
                 c.stop().toOutcome()
             },
         )
@@ -1067,6 +1072,7 @@ object MachineCoordinator {
 
     // -------------------------------------------------------------- plumbing
 
+    @Synchronized
     private fun submit(
         label: String,
         delayMs: Long = 0L,
@@ -1074,13 +1080,14 @@ object MachineCoordinator {
         speedGen: Int? = null,
         endGen: Int? = null,
         reportsOutcome: Boolean = true,
-        jobGeneration: Int = generation.get(),
+        jobGeneration: Int? = null,
         // MachineCommands, not GlassOsCommands: the coordinator owns the clamps and the ramp and
         // must not know which wire is underneath it. That split is what lets the direct register
         // path substitute for GlassOS without a second copy of any of the safety rules.
         run: (MachineCommands) -> Outcome,
     ) {
-        val gen = jobGeneration
+        val gen = jobGeneration ?: generation.get()
+        val boundCommands = commands
         queue.addLast(
             Job(gen, label, onDone, speedGen, endGen, reportsOutcome) {
                 if (delayMs > 0) {
@@ -1099,13 +1106,17 @@ object MachineCoordinator {
                 // A workout's tidy-up is worth nothing to the workout that replaced it, and it
                 // holds the worker for a round trip it could be spending on a start.
                 if (endGen != null && endGeneration.get() != endGen) return@Job Outcome.Superseded
+                beforeCommandExecutionForTest?.invoke()
+                // Validation and transport capture are separate in time on the worker, so invoke
+                // the captured transport rather than rereading this volatile field after a rebind.
+                if (commands !== boundCommands) return@Job Outcome.Superseded
                 // Deliberately not short-circuited on [MachineLink.consoleDetached]. Refusing here
                 // without touching the wire would be faster, but it also makes the app's own
                 // reading of the console the thing that decides whether a rider may use their
                 // treadmill — and a single stale or wrong poll would then lock them out with no
                 // way to overrule it. The console gets asked every time; a detached one answers by
                 // timing out, and that failure is now shown with a retry rather than swallowed.
-                val c = commands ?: return@Job Outcome.Failed("No link to the console")
+                val c = boundCommands ?: return@Job Outcome.Failed("No link to the console")
                 run(c)
             },
         )
