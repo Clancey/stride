@@ -32,11 +32,13 @@ void main() {
 
   Map<String, dynamic> status({
     List<Map<String, dynamic>>? items,
+    String initialization = 'ready',
     bool mayInstallNow = true,
     bool workoutIdle = true,
     String holdReason = '',
     String? lastError,
   }) => <String, dynamic>{
+    'initialization': initialization,
     'checking': false,
     'busy': false,
     'serviceRunning': true,
@@ -53,6 +55,8 @@ void main() {
     test('an empty map decodes to a usable, inert status', () {
       final decoded = AppstoreStatus.fromMap(const <String, dynamic>{});
       expect(decoded.items, isEmpty);
+      expect(decoded.initialization, AppstoreInitialization.notStarted);
+      expect(decoded.initializing, isTrue);
       expect(decoded.pendingCount, 0);
       expect(decoded.selfUpdate, isNull);
       // Defaulting mayInstallNow to false is the safe direction: the buttons
@@ -66,6 +70,16 @@ void main() {
       });
       expect(decoded.checking, isTrue);
       expect(decoded.items, isEmpty);
+    });
+
+    test('loading is distinct from an answered empty catalog', () {
+      final loading = AppstoreStatus.fromMap(status(initialization: 'loading'));
+      final ready = AppstoreStatus.fromMap(status(initialization: 'ready'));
+
+      expect(loading.initializing, isTrue);
+      expect(ready.initializing, isFalse);
+      expect(loading.items, isEmpty);
+      expect(ready.items, isEmpty);
     });
 
     test('an unknown stage decodes to idle rather than throwing', () {
@@ -288,10 +302,9 @@ void main() {
           bundles: <Map<String, dynamic>>[bundle()],
         ),
       );
-      expect(
-        decoded.available.map((i) => i.package),
-        <String>['com.example.solo'],
-      );
+      expect(decoded.available.map((i) => i.package), <String>[
+        'com.example.solo',
+      ]);
       expect(decoded.updates, isEmpty);
       expect(decoded.pendingCount, 0);
     });

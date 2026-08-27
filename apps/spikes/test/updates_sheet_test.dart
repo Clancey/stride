@@ -39,6 +39,7 @@ void main() {
 
   Map<String, Object?> statusWith(List<Map<String, Object?>> items) =>
       <String, Object?>{
+        'initialization': 'ready',
         'checking': false,
         'busy': false,
         'serviceRunning': true,

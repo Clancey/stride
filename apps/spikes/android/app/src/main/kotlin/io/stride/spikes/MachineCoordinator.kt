@@ -165,6 +165,34 @@ object MachineCoordinator {
 
     private const val FAN_OFF_LABEL = "Fan off (workout ended)"
 
+    private data class FanAdmission(
+        val generation: Int,
+        val transport: MachineCommands?,
+    )
+
+    private data class FanRequest(
+        val state: Int,
+        val requestedAt: Long,
+        val admission: FanAdmission,
+    )
+
+    private data class AcceptedFanState(
+        val state: Int,
+        val acceptedAt: Long,
+    )
+
+    internal data class FanRequestSnapshot(
+        val state: Int,
+        val at: Long,
+        val pending: Boolean,
+    )
+
+    class FanRestoreToken internal constructor(
+        internal val generation: Int,
+        internal val endGeneration: Int,
+        internal val transport: MachineCommands?,
+    )
+
     private data class Job(
         val generation: Int,
         val label: String,
@@ -289,6 +317,8 @@ object MachineCoordinator {
         // a machine we are no longer talking to.
         endGeneration.incrementAndGet()
         queue.clear()
+        pendingFanRequest = null
+        acceptedFanState = null
         this.commands = commands
         if (commands != null && !running) {
             running = true
@@ -366,15 +396,21 @@ object MachineCoordinator {
      * encodes a related discovery — GlassOS only publishes telemetry *during* a workout, so
      * adopting a live one is how metrics start flowing at all.
      */
-    fun startWorkout(onDone: ((Outcome) -> Unit)? = null) {
+    fun startWorkout(onDone: ((Outcome, FanRestoreToken) -> Unit)? = null) {
         // A new workout retires the previous one's tidy-up. Those writes are queued ahead of this
         // one and each can block for the console's command timeout; letting them run first would
         // spend that time putting a finished session to bed while a rider stands on the belt
         // waiting for "Starting…" to become a workout.
-        endGeneration.incrementAndGet()
+        val token = synchronized(this) {
+            FanRestoreToken(generation.get(), endGeneration.incrementAndGet(), commands)
+        }
         MachineLink.beginWorkoutEvidence()
-        submit("Start workout", onDone = onDone) {
-            val gen = generation.get()
+        submit(
+            label = "Start workout",
+            onDone = { outcome -> onDone?.invoke(outcome, token) },
+            jobGeneration = token.generation,
+        ) {
+            val gen = token.generation
             // Connect first, always. It is cheap on a console that is already attached — it just
             // answers with the current state — and it is the difference between working and not on one
             // that is not. A rider pressing Start is the one moment we know they want the machine, so
@@ -409,8 +445,9 @@ object MachineCoordinator {
                 reads++
             }
 
-            val moving = (MachineLink.speedMph ?: 0.0) > BELT_MOVING_MPH
-            if (shouldAdoptWorkout(state, MachineLink.speedMph)) {
+            val observedSpeed = MachineLink.observedSpeedMph
+            val moving = (observedSpeed ?: 0.0) > BELT_MOVING_MPH
+            if (shouldAdoptWorkout(state, observedSpeed)) {
                 Log.i(TAG, "console already running with the belt moving; adopting the existing workout")
                 return@submit Outcome.Ok
             }
@@ -557,9 +594,11 @@ object MachineCoordinator {
      * ([GlassOsTelemetry.reading] returns null once no `workoutId` is stamped). Waiting for the ack
      * can mean waiting past the only window in which the deceleration is visible.
      */
+    @Synchronized
     fun stop(onSettled: ((StopVerdict) -> Unit)? = null) {
         val gen = generation.incrementAndGet()
         queue.clear()
+        pendingFanRequest = null
         // Sampled on the caller's thread, before the job can possibly run, so "readings newer than
         // the stop" is anchored to the instant the rider asked for it rather than to whenever the
         // worker got round to it.
@@ -728,7 +767,7 @@ object MachineCoordinator {
         // belt keeps accelerating after the rider has asked it not to. The generation is bumped
         // before anything is queued so the new jobs carry the new value.
         val gen = speedGeneration.incrementAndGet()
-        val current = MachineLink.speedMph
+        val current = MachineLink.observedSpeedMph
         if (current == null || target <= current || target - current <= MAX_STEP_UP_MPH) {
             submit(label = "Speed ${format(target)} mph", speedGen = gen, onDone = onDone) {
                 it.setSpeedKph(target * MPH_TO_KPH).toOutcome()
@@ -768,41 +807,92 @@ object MachineCoordinator {
      * Set the console fan.
      *
      * Queued with everything else even though it cannot move the belt, so a fan write can never
-     * overlap a speed write on the wire. The last state is remembered here rather than read back,
-     * because the rider's choice should survive a console that reports the fan lazily.
+     * overlap a speed write on the wire. The request is visible while queued and in flight, but
+     * [lastFanState] advances only after the machine accepts it.
      */
     fun setFan(state: Int) {
-        lastFanState = state
-        submit("Fan ${GlassOsCommands.fanStateName(state)}") { it.setFanState(state).toOutcome() }
+        val request = beginFanRequest(state, fanAdmission())
+        submit(
+            label = "Fan ${GlassOsCommands.fanStateName(state)}",
+            onDone = { finishFanRequest(request) },
+            jobGeneration = request.admission.generation,
+        ) { commands ->
+            if (commands !== request.admission.transport) return@submit Outcome.Superseded
+            acceptFanWrite(request, commands.setFanState(state)).toOutcome()
+        }
     }
 
     /**
-     * The fan state Stride last asked for, or null if it has not asked this run.
+     * The last fan state a machine accepted, or null when this transport has accepted none.
      *
-     * **A request, never a reading.** The console has its own fan button and Stride never hears it
-     * pressed, so this can be confidently wrong the moment the rider uses it. Anything drawing a
-     * fan value must prefer [MachineLink.fanState], which is the machine's own answer, and must
-     * never style this like a measurement — see [MachineLink.fanReadout].
+     * **Accepted is still not measured.** The console has its own fan button and Stride never hears
+     * it pressed, so this can be confidently wrong the moment the rider uses it. Anything drawing a
+     * fan value must prefer [MachineLink.fanState], which is the machine's own answer.
      *
-     * Kept in memory only; [StrideSettings] owns the value that outlives the process.
+     * Cleared on [rebind], because an acknowledgement from one machine is not evidence about the
+     * next. [StrideSettings] owns the rider preference that outlives a transport and the process.
      */
-    @Volatile
-    var lastFanState: Int? = null
-        private set(value) {
-            field = value
-            // Stamped here rather than at each call site so no future writer can forget. The
-            // readout compares this against the timestamp of the snapshot it is holding, and a
-            // request with no time on it cannot be told from one the machine has already answered.
-            lastFanStateAt = System.currentTimeMillis()
-        }
+    val lastFanState: Int? get() = acceptedFanState?.state
 
     /**
-     * When [lastFanState] was last written, on `System.currentTimeMillis` — the same clock
-     * [MachineLink.fanStateAt] reports, because the two are only ever used by comparing them.
+     * When [lastFanState] was accepted, on `System.currentTimeMillis` — the same clock carried by
+     * [MachineLink.FanTelemetry], because the two are only ever used by comparing them.
      */
+    val lastFanStateAt: Long get() = acceptedFanState?.acceptedAt ?: 0L
+
+    /**
+     * The newest fan intent that the readout should show: a queued/in-flight request first, then the
+     * last accepted state. A refused, failed, superseded, or transport-less write never remains here.
+     */
+    val lastFanRequest: Int? get() = fanRequestSnapshot()?.state
+
+    /** When [lastFanRequest] was requested or accepted, on `System.currentTimeMillis`. */
+    val lastFanRequestAt: Long get() = fanRequestSnapshot()?.at ?: 0L
+
+    /**
+     * One coherent state/time pair for consumers that compare this intent with a machine reading.
+     * Reading the two public compatibility accessors separately can span a settling write.
+     */
+    internal fun fanRequestSnapshot(): FanRequestSnapshot? {
+        val pending = pendingFanRequest
+        if (pending != null) return FanRequestSnapshot(pending.state, pending.requestedAt, pending = true)
+        val accepted = acceptedFanState ?: return null
+        return FanRequestSnapshot(accepted.state, accepted.acceptedAt, pending = false)
+    }
+
     @Volatile
-    var lastFanStateAt: Long = 0L
-        private set
+    private var pendingFanRequest: FanRequest? = null
+
+    @Volatile
+    private var acceptedFanState: AcceptedFanState? = null
+
+    @Synchronized
+    private fun fanAdmission(): FanAdmission = FanAdmission(generation.get(), commands)
+
+    @Synchronized
+    private fun beginFanRequest(state: Int, admission: FanAdmission): FanRequest =
+        FanRequest(state, System.currentTimeMillis(), admission).also {
+            // A stop/rebind between deciding the request and publishing it has already retired it.
+            if (admission.generation == generation.get() && admission.transport === commands) {
+                pendingFanRequest = it
+            }
+        }
+
+    private fun finishFanRequest(request: FanRequest) {
+        if (pendingFanRequest === request) pendingFanRequest = null
+    }
+
+    @Synchronized
+    private fun acceptFanWrite(request: FanRequest, ack: MachineAck): MachineAck {
+        if (
+            ack is MachineAck.Ok &&
+            request.admission.generation == generation.get() &&
+            request.admission.transport === commands
+        ) {
+            acceptedFanState = AcceptedFanState(request.state, System.currentTimeMillis())
+        }
+        return ack
+    }
 
     /**
      * Restore the fan for a starting workout.
@@ -821,16 +911,31 @@ object MachineCoordinator {
      * once". A machine that refuses is not an error — it is a machine without an automatic fan, and
      * it has just told us so, which is why the refusal is swallowed here and remembered there.
      */
-    fun restoreFan(remembered: Int?) {
-        submit("Restore fan") { commands ->
+    fun restoreFan(remembered: Int?, token: FanRestoreToken) {
+        val admission = synchronized(this) {
+            if (
+                token.generation != generation.get() ||
+                token.endGeneration != endGeneration.get() ||
+                token.transport !== commands
+            ) {
+                return
+            }
+            FanAdmission(token.generation, token.transport)
+        }
+        var request = remembered?.let { beginFanRequest(it, admission) }
+        submit(
+            label = "Restore fan",
+            onDone = { request?.let(::finishFanRequest) },
+            endGen = token.endGeneration,
+            jobGeneration = token.generation,
+        ) { commands ->
+            if (commands !== admission.transport) return@submit Outcome.Superseded
             val speculative = remembered == null
             val target = remembered
                 ?: if (commands.autoFanSupported() != false) GlassOsCommands.FAN_AUTO else null
                 ?: return@submit Outcome.Ok
-            val ack = commands.setFanState(target)
-            // Only remember a state the machine actually took. Recording a speculative Auto that was
-            // refused would make every later restore replay a command this console has rejected.
-            if (ack is MachineAck.Ok || !speculative) lastFanState = target
+            val activeRequest = request ?: beginFanRequest(target, admission).also { request = it }
+            val ack = acceptFanWrite(activeRequest, commands.setFanState(target))
             if (speculative && ack is MachineAck.Refused) Outcome.Ok else ack.toOutcome()
         }
     }
@@ -924,11 +1029,9 @@ object MachineCoordinator {
      * blowing until somebody noticed — issue #29.
      *
      * **Sent unconditionally, not gated on [lastFanState].** Skipping when Stride does not think it
-     * has a fan running looks like an easy saving and is a race: `restoreFan` records the state
-     * from inside its own queued job, so a restore still in flight when the workout ends would be
-     * invisible here — and would then turn the fan on immediately behind the stop, which is
-     * precisely the state this is supposed to leave the machine out of. [lastFanState] is also only
-     * ever Stride's own last *request*; the console has its own controls.
+     * has a fan running looks like an easy saving and is a race: a restore can already be on the wire
+     * when the workout ends and can turn the fan on behind the stop. The accepted state cannot make
+     * that in-flight write safe, and the console has controls of its own.
      *
      * A refusal is not an error. It means this machine has no fan register that will take a write,
      * which is a fact about the treadmill and not a failure of the end — swallowed for the same
@@ -940,11 +1043,16 @@ object MachineCoordinator {
      */
     fun stopFan() {
         val end = endGeneration.get()
-        submit(FAN_OFF_LABEL, endGen = end, reportsOutcome = false) { commands ->
-            val ack = commands.setFanState(GlassOsCommands.FAN_OFF)
-            // Only a state the machine actually took. Recording it optimistically would leave the
-            // overlay's fan pills claiming "Off" over a fan that is still running.
-            if (ack is MachineAck.Ok) lastFanState = GlassOsCommands.FAN_OFF
+        val request = beginFanRequest(GlassOsCommands.FAN_OFF, fanAdmission())
+        submit(
+            label = FAN_OFF_LABEL,
+            onDone = { finishFanRequest(request) },
+            endGen = end,
+            reportsOutcome = false,
+            jobGeneration = request.admission.generation,
+        ) { commands ->
+            if (commands !== request.admission.transport) return@submit Outcome.Superseded
+            val ack = acceptFanWrite(request, commands.setFanState(GlassOsCommands.FAN_OFF))
             if (ack is MachineAck.Refused) Outcome.Ok else ack.toOutcome()
         }
     }
@@ -958,12 +1066,13 @@ object MachineCoordinator {
         speedGen: Int? = null,
         endGen: Int? = null,
         reportsOutcome: Boolean = true,
+        jobGeneration: Int = generation.get(),
         // MachineCommands, not GlassOsCommands: the coordinator owns the clamps and the ramp and
         // must not know which wire is underneath it. That split is what lets the direct register
         // path substitute for GlassOS without a second copy of any of the safety rules.
         run: (MachineCommands) -> Outcome,
     ) {
-        val gen = generation.get()
+        val gen = jobGeneration
         queue.addLast(
             Job(gen, label, onDone, speedGen, endGen, reportsOutcome) {
                 if (delayMs > 0) {
@@ -1133,7 +1242,7 @@ private const val DISTANCE_STILL_MILES = 1e-6
  * @param beforeStop the observation current when the stop was queued, or null if nothing was fresh.
  *   It may **complete** the pair of agreeing readings below; it may never be the whole of it.
  * @param postStop every observation taken *after* the stop was queued, oldest first. Readings from
- *   before it are not evidence about it and must never appear here — [MachineLink.speedMph] is
+ *   before it are not evidence about it and must never appear here — [MachineLink.observedSpeedMph] is
  *   believed for four seconds, so a reading taken before a stop is still "fresh" after it.
  *
  * ## Four conditions, all required
@@ -1366,10 +1475,9 @@ internal fun shouldEscalate(
  * Binding that evidence to the workout matters: motion reported during yesterday's workout cannot
  * vouch for a register that has gone dead during this one.
  *
- * The obvious next avenue, if a real motion signal is wanted on such a console: `Rpm` is field 5
- * and **read-only** on FitPro1, which makes it a machine measurement rather than a setpoint, so it
- * may carry roller or motor movement where field 16 is dead. Nobody has checked whether the X22i
- * populates it, so nothing here builds on it — but that is where to look.
+ * `Rpm` is field 5 and read-only on FitPro1, but the X22i reports it unsupported. A future real
+ * motion signal on this console therefore has to come from another measured register rather than
+ * from the commanded speed.
  *
  * `CURRENT_DISTANCE` supplies a second, deliberately asymmetric check across two readings that both
  * claim the belt is at rest. Starting the window before deceleration would veto every successful
@@ -1378,7 +1486,7 @@ internal fun shouldEscalate(
  * nothing: a quantized register can remain unchanged for seconds while a belt moves. The speed
  * evidence above remains independently mandatory.
  *
- * **Null is not permission.** [MachineLink.speedMph] is null when the snapshot is stale or the
+ * **Null is not permission.** [MachineLink.observedSpeedMph] is null when the snapshot is stale or the
  * machine could not be asked, and "we cannot see the belt" has to mean "do not move anything",
  * matching the rule the start path already holds itself to: probably-stopped is not a basis for
  * moving a treadmill. The cost of being wrong in this direction is a deck left on a hill, which is

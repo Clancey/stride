@@ -33,18 +33,20 @@ class InclineLadderTest {
      * hand-written list, so this keeps holding if the helper is ever legitimately changed.
      */
     @Test
-    fun `fine is the ladder that shipped, value for value`() {
+    fun `fine preserves the original spacing inside the effective range`() {
         listOf(
             -6.0 to 40.0,
             -3.0 to 12.0,
             0.0 to 12.0,
             0.5 to 4.0,
             2.5 to 2.7,
-            -10.0 to -2.0,
+            -3.0 to -2.0,
         ).forEach { (min, max) ->
+            val floor = maxOf(min, MachineCoordinator.MIN_INCLINE)
+            val ceiling = minOf(max, MachineCoordinator.MAX_INCLINE)
             assertEquals(
                 "fine must equal the 1% ladder for $min..$max",
-                MachinePresets.ladder(min, max, 1.0),
+                MachinePresets.ladder(floor, ceiling, 1.0),
                 MachinePresets.inclineLadder(min, max, fine),
             )
         }
@@ -64,21 +66,23 @@ class InclineLadderTest {
 
     // ---- the shape the issue asked for --------------------------------------------------------
 
-    /** The worked example from issue #27: an X22i reporting -6% to 40%. */
+    /** An X22i reports -6% to 40%, but this installation permits only -3% to 12%. */
     @Test
-    fun `a wide incline trainer range gives 5 percent up and 3 percent down`() {
+    fun `a wide incline trainer range is intersected with installation clamps`() {
         assertEquals(
-            listOf(40.0, 35.0, 30.0, 25.0, 20.0, 15.0, 10.0, 5.0, 0.0, -3.0, -6.0),
+            listOf(12.0, 10.0, 5.0, 0.0, -3.0),
             coarse(-6.0, 40.0),
         )
     }
 
-    /** The same range at the default, for contrast: 40 buttons with the middle eaten by the cap. */
+    /** Fine spacing keeps both effective endpoints without duplicate clamped commands. */
     @Test
-    fun `the fine column on that machine is the one the issue is about`() {
+    fun `the fine column on that machine contains only effective values`() {
         val out = MachinePresets.inclineLadder(-6.0, 40.0, fine)
-        assertEquals(MachinePresets.MAX_PRESETS, out.size)
-        assertTrue("coarse must be dramatically shorter", coarse(-6.0, 40.0).size < out.size / 3)
+        assertEquals(12.0, out.first(), 1e-9)
+        assertEquals(-3.0, out.last(), 1e-9)
+        assertEquals("duplicate buttons", out.size, out.distinct().size)
+        assertTrue(out.all { it in MachineCoordinator.MIN_INCLINE..MachineCoordinator.MAX_INCLINE })
     }
 
     // ---- boundaries ---------------------------------------------------------------------------
@@ -86,7 +90,7 @@ class InclineLadderTest {
     /** A machine with no decline must not be handed decline buttons. */
     @Test
     fun `a range that is entirely at or above flat has no negative rungs`() {
-        assertEquals(listOf(15.0, 10.0, 5.0, 0.0), coarse(0.0, 15.0))
+        assertEquals(listOf(12.0, 10.0, 5.0, 0.0), coarse(0.0, 15.0))
         assertEquals(listOf(12.0, 10.0, 5.0, 2.0), coarse(2.0, 12.0))
         coarse(0.0, 15.0).forEach { assertTrue("$it is below the machine's floor", it >= 0.0) }
     }
@@ -99,7 +103,7 @@ class InclineLadderTest {
      */
     @Test
     fun `a range that is entirely below flat has no non-negative rungs`() {
-        assertEquals(listOf(-2.0, -3.0, -6.0, -9.0, -10.0), coarse(-10.0, -2.0))
+        assertEquals(listOf(-2.0, -3.0), coarse(-10.0, -2.0))
         coarse(-10.0, -2.0).forEach { assertTrue("$it is above the machine's ceiling", it <= -2.0) }
     }
 
@@ -108,7 +112,8 @@ class InclineLadderTest {
     fun `a range whose ends are equal offers exactly one button`() {
         assertEquals(listOf(5.0), coarse(5.0, 5.0))
         assertEquals(listOf(0.0), coarse(0.0, 0.0))
-        assertEquals(listOf(-4.0), coarse(-4.0, -4.0))
+        assertEquals(listOf(-3.0), coarse(-3.0, -3.0))
+        assertTrue(coarse(-4.0, -4.0).isEmpty())
     }
 
     /**
@@ -125,7 +130,7 @@ class InclineLadderTest {
             2.5 to 2.7,
             2.55 to 2.57,
             -0.05 to 0.04,
-            -10.0 to -2.0,
+            -3.0 to -2.0,
             0.0 to 0.5,
         ).forEach { (min, max) ->
             if (MachinePresets.inclineLadder(min, max, fine).isNotEmpty()) {
@@ -137,16 +142,11 @@ class InclineLadderTest {
         }
     }
 
-    /**
-     * A range too narrow for either step still offers the one value its ends agree on.
-     *
-     * 2.55 rounds to 2.6, above the machine's own maximum — a button that could only be refused.
-     */
+    /** A range containing no displayable tenth offers no button that parses outside the range. */
     @Test
-    fun `a sub-tenth range stays inside itself`() {
+    fun `a sub-tenth range with no representable command is empty`() {
         val out = coarse(2.55, 2.57)
-        assertEquals(1, out.size)
-        assertTrue("offered ${out[0]} for a 2.55-2.57 machine", out[0] in 2.55..2.57)
+        assertTrue("offered $out for a 2.55-2.57 machine", out.isEmpty())
     }
 
     // ---- what it may never do -----------------------------------------------------------------
@@ -160,7 +160,7 @@ class InclineLadderTest {
      * that clamps may be tightened and never widened.
      */
     @Test
-    fun `no rung ever falls outside the machine's reported range`() {
+    fun `no rung ever falls outside the machine and installation intersection`() {
         listOf(
             -6.0 to 40.0,
             -3.0 to 12.0,
@@ -173,26 +173,24 @@ class InclineLadderTest {
         ).forEach { (min, max) ->
             coarse(min, max).forEach { rung ->
                 assertTrue("$rung is outside $min..$max", rung in min..max)
+                assertTrue(
+                    "$rung is outside the installation clamp",
+                    rung in MachineCoordinator.MIN_INCLINE..MachineCoordinator.MAX_INCLINE,
+                )
             }
         }
     }
 
-    /**
-     * Both halves are capped at 40 on their own, so the merge can arrive with up to twice the
-     * budget. A range this wide is not a treadmill — it is a misdecoded register, which is the case
-     * [MachinePresets.MAX_PRESETS] exists for.
-     */
+    /** A wildly broad report cannot widen the installation range. */
     @Test
-    fun `a wildly decoded range is capped, keeping both ends and flat`() {
+    fun `a wildly decoded range is clamped, keeping effective ends and flat`() {
         val out = coarse(-3000.0, 3000.0)
 
         assertTrue("${out.size} buttons", out.size <= MachinePresets.MAX_PRESETS)
-        assertEquals(3000.0, out.first(), 1e-9)
-        assertEquals(-3000.0, out.last(), 1e-9)
-        // Flat survives a thinning that has no idea it is special. On a symmetric range a uniform
-        // sample lands either side of it.
-        assertTrue("flat was thinned away", out.contains(0.0))
-        assertEquals("no duplicates survived the cap", out.distinct().size, out.size)
+        assertEquals(MachineCoordinator.MAX_INCLINE, out.first(), 1e-9)
+        assertEquals(MachineCoordinator.MIN_INCLINE, out.last(), 1e-9)
+        assertTrue("flat was omitted", out.contains(0.0))
+        assertEquals("duplicate buttons", out.distinct().size, out.size)
         assertEquals("still descending", out.sortedDescending(), out)
     }
 

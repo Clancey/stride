@@ -8,9 +8,9 @@ import org.junit.Test
  * What the overlay is allowed to say about the fan.
  *
  * Stride holds two fan values and they are not the same kind of thing. `MachineLink.fanState` is
- * what the machine reported; `MachineCoordinator.lastFanState` is what Stride last asked for, and
- * the console has its own fan button that Stride never hears — so a request can be confidently
- * wrong the moment the rider presses it.
+ * what the machine reported; `MachineCoordinator.lastFanRequest` is Stride's pending or last
+ * accepted request, and the console has its own fan button that Stride never hears — so even an
+ * accepted request can be confidently wrong the moment the rider presses it.
  *
  * Item 9 of the safety checklist on `MachineLink.canCommand` is the rule these pin: the UI
  * distinguishes requested from confirmed from unknown, and never shows a requested value styled as
@@ -25,8 +25,16 @@ class FanReadoutTest {
         reportedAt: Long = 0L,
         requested: Int? = null,
         requestedAt: Long = 0L,
+        requestPending: Boolean = true,
         knownPresent: Boolean = true,
-    ) = MachineLink.fanReadout(reported, reportedAt, requested, requestedAt, knownPresent)
+    ) = MachineLink.fanReadout(
+        reported,
+        reportedAt,
+        requested,
+        requestedAt,
+        requestPending,
+        knownPresent,
+    )
 
     /** The plain case: the machine answered, so the answer is drawn as the reading it is. */
     @Test
@@ -113,6 +121,84 @@ class FanReadoutTest {
         )
     }
 
+    @Test
+    fun `accepted fan state never overrides available telemetry`() {
+        assertEquals(
+            MachineLink.FanReadout.Measured(GlassOsCommands.FAN_LOW),
+            readout(
+                reported = GlassOsCommands.FAN_LOW,
+                reportedAt = 100L,
+                requested = GlassOsCommands.FAN_HIGH,
+                requestedAt = 200L,
+                requestPending = false,
+            ),
+        )
+    }
+
+    @Test
+    fun `accepted fan state remains useful when telemetry is unavailable`() {
+        assertEquals(
+            MachineLink.FanReadout.Requested(GlassOsCommands.FAN_HIGH),
+            readout(
+                requested = GlassOsCommands.FAN_HIGH,
+                requestedAt = 200L,
+                requestPending = false,
+            ),
+        )
+    }
+
+    @Test
+    fun `fan picker highlights a pending request over older telemetry`() {
+        val readout = readout(
+            reported = GlassOsCommands.FAN_LOW,
+            reportedAt = 100L,
+            requested = GlassOsCommands.FAN_HIGH,
+            requestedAt = 200L,
+            requestPending = true,
+        )
+
+        assertEquals(GlassOsCommands.FAN_HIGH, MachineLink.fanSelection(readout))
+    }
+
+    @Test
+    fun `fan picker highlights telemetry over an accepted write`() {
+        val readout = readout(
+            reported = GlassOsCommands.FAN_LOW,
+            reportedAt = 100L,
+            requested = GlassOsCommands.FAN_HIGH,
+            requestedAt = 200L,
+            requestPending = false,
+        )
+
+        assertEquals(GlassOsCommands.FAN_LOW, MachineLink.fanSelection(readout))
+    }
+
+    @Test
+    fun `timed fan telemetry stays paired across pending request ordering`() {
+        val pending = MachineCoordinator.FanRequestSnapshot(
+            state = GlassOsCommands.FAN_HIGH,
+            at = 200L,
+            pending = true,
+        )
+
+        assertEquals(
+            MachineLink.FanReadout.Requested(GlassOsCommands.FAN_HIGH),
+            MachineLink.fanReadout(
+                MachineLink.FanTelemetry(GlassOsCommands.FAN_LOW, 100L),
+                pending,
+                knownPresent = true,
+            ),
+        )
+        assertEquals(
+            MachineLink.FanReadout.Measured(GlassOsCommands.FAN_LOW),
+            MachineLink.fanReadout(
+                MachineLink.FanTelemetry(GlassOsCommands.FAN_LOW, 300L),
+                pending,
+                knownPresent = true,
+            ),
+        )
+    }
+
     /**
      * A treadmill with no fan gets no fan cell at all — not one reading "Off", and not one reading
      * "Not measured" for the life of the machine.
@@ -125,10 +211,9 @@ class FanReadoutTest {
     /**
      * The trap that makes the presence gate load-bearing rather than decorative.
      *
-     * `MachineCoordinator.restoreFan` records its target whenever the rider has a remembered
-     * preference — the `!speculative` branch — regardless of whether the machine accepted it. So a
-     * treadmill with no fan can be carrying a `lastFanState` of High from a workout start that was
-     * refused. Without the gate the strip would draw a fan speed on a machine that has no fan.
+     * A restore request becomes visible while its write is queued or in flight, before the machine
+     * has accepted it. Without the gate that useful in-flight visibility would briefly draw a fan
+     * speed on a machine that may have no fan.
      */
     @Test
     fun `a stale request on a fanless machine shows nothing`() {

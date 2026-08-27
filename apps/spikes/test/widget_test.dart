@@ -1,13 +1,30 @@
 // Smoke test for the launcher shell and preserved Phase 0 diagnostics.
 
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:stride_spikes/main.dart';
+
+const MethodChannel _channel = MethodChannel('io.stride.spikes/bridge');
 
 void main() {
   testWidgets('launcher exposes diagnostics with every spike', (
     WidgetTester tester,
   ) async {
+    TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger
+        .setMockMethodCallHandler(_channel, (call) async {
+          if (call.method == 'appstoreStatus') {
+            return <String, Object?>{
+              'initialization': 'ready',
+              'items': <Object?>[],
+            };
+          }
+          return null;
+        });
+    addTearDown(
+      () => TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger
+          .setMockMethodCallHandler(_channel, null),
+    );
     tester.view.physicalSize = const Size(1280, 800);
     tester.view.devicePixelRatio = 1.0;
     addTearDown(tester.view.reset);

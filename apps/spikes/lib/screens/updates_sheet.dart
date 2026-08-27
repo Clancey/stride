@@ -178,9 +178,15 @@ class _UpdatesSheetState extends State<_UpdatesSheet> {
                 style: OutlinedButton.styleFrom(
                   minimumSize: const Size(0, StrideSpace.minTouch),
                 ),
-                onPressed: _status.checking ? null : _checkNow,
+                onPressed: _status.checking || _status.initializing
+                    ? null
+                    : _checkNow,
                 icon: const Icon(Icons.refresh_rounded),
-                label: Text(_status.checking ? 'Checking...' : 'Check now'),
+                label: Text(
+                  _status.checking || _status.initializing
+                      ? 'Loading...'
+                      : 'Check now',
+                ),
               ),
             ],
           ),
@@ -295,6 +301,7 @@ class _UpdatesSheetState extends State<_UpdatesSheet> {
   }
 
   String _headline() {
+    if (_status.initializing) return 'Loading the saved catalog...';
     if (_status.lastError != null) return _status.lastError!;
     if (_status.lastCheckWallMs <= 0) {
       return 'No catalog check has completed yet.';

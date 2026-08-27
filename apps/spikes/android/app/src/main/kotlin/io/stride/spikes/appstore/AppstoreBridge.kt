@@ -22,9 +22,10 @@ class AppstoreBridge(private val context: Context) {
 
     /** Everything the launcher needs to draw the updates sheet, in one round trip. */
     fun status(): Map<String, Any?> {
-        val plan = AppstoreState.plan
-        val statuses = AppstoreState.allStatuses().associateBy { it.packageName }
-        val catalog = AppstoreState.catalog
+        val snapshot = AppstoreState.snapshot()
+        val plan = snapshot.plan
+        val statuses = snapshot.statuses.associateBy { it.packageName }
+        val catalog = snapshot.catalog
         val bundledPackages = catalog?.bundledPackages ?: emptySet()
 
         val items = plan.map { item ->
@@ -68,7 +69,7 @@ class AppstoreBridge(private val context: Context) {
         val installedPackages = plan.mapNotNull { item ->
             item.packageName.takeIf { item is UpToDate || item is UpdateAvailable }
         }.toSet()
-        val run = AppstoreState.bundleRun
+        val run = snapshot.bundleRun
         val bundles = (catalog?.bundles ?: emptyList()).map { bundle ->
             val state = BundlePlan.state(bundle, installedPackages)
             mapOf(
@@ -93,13 +94,14 @@ class AppstoreBridge(private val context: Context) {
         }
 
         return mapOf(
-            "checking" to AppstoreState.checking,
-            "busy" to AppstoreState.busy(),
+            "initialization" to snapshot.initialization.name.lowercase(),
+            "checking" to snapshot.checking,
+            "busy" to snapshot.busy,
             "serviceRunning" to StrideAppstoreService.isRunning(),
-            "lastCheckWallMs" to AppstoreState.lastCheckWallMs,
-            "lastError" to AppstoreState.lastError,
+            "lastCheckWallMs" to snapshot.lastCheckWallMs,
+            "lastError" to snapshot.lastError,
             "catalogUrl" to StrideAppstoreService.catalogUrl(context),
-            "pendingCount" to UpdatePlan.pendingCount(AppstoreState.plan, bundledPackages),
+            "pendingCount" to UpdatePlan.pendingCount(plan, bundledPackages),
             "canRequestInstalls" to StrideAppstoreService.canRequestInstalls(context),
             "workoutIdle" to StrideAppstoreService.workoutIdle(),
             // The launcher disables install buttons on this rather than hiding them: an inert

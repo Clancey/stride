@@ -537,12 +537,12 @@ class DirectMachineSession(
      *
      * ## Where this is deliberately stricter than iFit
      *
-     * Two places, both chosen rather than copied:
+     * Three places, all chosen rather than copied:
      *
      * - **The gate write is awaited.** `InitializeConsole` does not await either setter and does not
      *   abort if one fails; both are fired and initialization continues regardless. Waiting for the
-     *   arming write means every way this sequence can fail leaves the console *more* gated than it
-     *   started, never less, which is worth one round-trip on a machine with a belt.
+     *   arming write excludes the unsafe ordering where the lockout clears before the gate is armed,
+     *   which is worth one round-trip on a machine with a belt.
      * - **The outcome is propagated.** iFit discards it. Here it becomes [StartGate], reaches
      *   [ConnectResult], and makes [authorisedWrite] refuse control — because a console whose gate
      *   state is unknown is not one to send speed or mode commands to. That is the same discipline
@@ -1127,6 +1127,15 @@ object FitProValues {
 class DirectMachineClient(private val session: DirectMachineSession) {
 
     /**
+     * Whether `ACTUAL_KPH` has demonstrated that it reports this belt's motion.
+     *
+     * Latched for this client/link. Once earned, a later actual zero is a real stopped reading and
+     * must not be replaced by a stale target. A replacement client starts unproven, just as
+     * [MachineLink.everReportedMotion] does after a transport change.
+     */
+    private var actualSpeedReportedMotion = false
+
+    /**
      * Read everything in one exchange. Returns null when the machine did not answer usefully.
      *
      * One frame rather than several because the protocol allows it and because values read in a
@@ -1156,8 +1165,17 @@ class DirectMachineClient(private val session: DirectMachineSession) {
         val mode = response.value(FitProCodec.Register.WORKOUT_MODE)
             ?.let(FitProCodec::decodeWorkoutMode)
             ?: FitProCodec.WorkoutMode.UNKNOWN
-        val speedMph = response.value(FitProCodec.Register.ACTUAL_KPH)
+        val actualSpeedMph = response.value(FitProCodec.Register.ACTUAL_KPH)
             ?.let { FitProValues.kphToMph(FitProCodec.decodeSpeed(it)) }
+        if ((actualSpeedMph ?: 0.0) > BELT_MOVING_MPH) actualSpeedReportedMotion = true
+        val setpointSpeedMph = response.value(FitProCodec.Register.KPH)
+            ?.let { FitProValues.kphToMph(FitProCodec.decodeSpeed(it)) }
+        // iFit makes this same source choice for belt machines. It is display-only: speedMph below
+        // remains ACTUAL_KPH, so MachineLink's observation and everReportedMotion latch never see a
+        // commanded target. Outside a moving workout state, do not resurrect a stale setpoint from
+        // a paused or stopped run.
+        val displaySpeedMph =
+            if (!actualSpeedReportedMotion && mode in SPEED_DISPLAY_MODES) setpointSpeedMph else actualSpeedMph
         val distanceMiles = response.value(FitProCodec.Register.CURRENT_DISTANCE)
             ?.let { FitProValues.metresToMiles(FitProCodec.decodeInt(it)) }
 
@@ -1179,11 +1197,12 @@ class DirectMachineClient(private val session: DirectMachineSession) {
         return GlassOsClient.Snapshot(
             consoleState = FitProValues.consoleStateName(mode),
             workoutId = workoutInstanceId(mode),
-            speedMph = speedMph,
+            speedMph = actualSpeedMph,
+            displaySpeedMph = displaySpeedMph,
             inclinePercent = response.value(FitProCodec.Register.ACTUAL_INCLINE)
                 ?.let(FitProCodec::decodeIncline),
             distanceMiles = distanceMiles,
-            paceMinPerMile = speedMph?.let(FitProValues::paceMinPerMile),
+            paceMinPerMile = displaySpeedMph?.let(FitProValues::paceMinPerMile),
             elapsedSeconds = response.value(FitProCodec.Register.RUNNING_TIME)
                 ?.let { FitProCodec.decodeInt(it).toLong() },
             calories = response.value(FitProCodec.Register.CURRENT_CALORIES)
@@ -1280,6 +1299,9 @@ class DirectMachineClient(private val session: DirectMachineSession) {
          * no read-only restriction (`vh/f.j`); only writes are checked (`th/a`).
          */
         val TELEMETRY: List<FitProCodec.Register> = listOf(
+            // Writable, but also readable: this is iFit's rider-facing speed source on belt
+            // machines and the display-only fallback for a dead ACTUAL_KPH register.
+            FitProCodec.Register.KPH,
             FitProCodec.Register.CURRENT_DISTANCE,
             FitProCodec.Register.RUNNING_TIME,
             FitProCodec.Register.WORKOUT_MODE,
@@ -1303,6 +1325,19 @@ class DirectMachineClient(private val session: DirectMachineSession) {
             FitProCodec.WorkoutMode.COOL_DOWN,
             FitProCodec.WorkoutMode.RESUME,
             FitProCodec.WorkoutMode.RESULTS,
+        )
+
+        /**
+         * States where a commanded target is meaningful as rider-facing live speed.
+         *
+         * Deliberately narrower than [WORKOUT_MODES]: pause and results still belong to the workout
+         * instance, but their belt is stopped while KPH may retain the last non-zero target.
+         */
+        val SPEED_DISPLAY_MODES: Set<FitProCodec.WorkoutMode> = setOf(
+            FitProCodec.WorkoutMode.RUNNING,
+            FitProCodec.WorkoutMode.WARM_UP,
+            FitProCodec.WorkoutMode.COOL_DOWN,
+            FitProCodec.WorkoutMode.RESUME,
         )
 
         /** Shared so two sessions in one process cannot mint the same instance id. */
@@ -1598,7 +1633,8 @@ class DirectMachineCommands(private val session: DirectMachineSession) : Machine
     }
 
     /**
-     * The speeds this machine will accept, as a ladder built from its own reported range.
+     * The speeds this machine will accept, as a ladder built from its reported range intersected
+     * with Stride's installation clamp.
      *
      * GlassOS publishes a list the console's designers chose; FitPro publishes no such list, only
      * `MIN_KPH` and `MAX_KPH`. Rather than leave the direct path with no quick picks — which would
@@ -1615,7 +1651,7 @@ class DirectMachineCommands(private val session: DirectMachineSession) : Machine
      */
     override fun speedPresetsMph(): List<Double>? {
         val limits = session.probe.limits ?: return null
-        return ladder(limits.minSpeedMph, limits.maxSpeedMph, step = 1.0)
+        return MachinePresets.speedLadder(limits.minSpeedMph, limits.maxSpeedMph)
     }
 
     /** As [speedPresetsMph], from `MIN_GRADE`/`MAX_GRADE`, in percent at the rider's [spacing]. */
