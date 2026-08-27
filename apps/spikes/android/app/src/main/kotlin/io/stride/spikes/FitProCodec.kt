@@ -423,11 +423,12 @@ object FitProCodec {
          * anything else that touches workout state:
          * `SetRequireStartRequested(IsBitFieldSupported(RequireStartRequested))`.
          *
-         * This is why `WORKOUT_MODE = RUNNING` was refused with a clean `FAILED` on the X22i even
-         * after every other precondition (unlock, supported-field checks) held: the console had
-         * never been told to leave whatever state it starts in. The earlier batched revision and
-         * the merged two-frame sequence have both driven an X22i belt on real hardware; the latter
-         * was re-confirmed twice from current `main` on 2026-08-27. See
+         * The complete field-108/field-95 initialization sequence resolved the clean
+         * `WORKOUT_MODE = RUNNING` refusal on the X22i after every other tested precondition
+         * (unlock, supported-field checks) held. The role of this field by itself is inferred from
+         * iFit's ordering rather than isolated by the hardware runs. The earlier batched revision
+         * and the merged two-frame sequence have both driven an X22i belt on real hardware; the
+         * latter was re-confirmed twice from current `main` on 2026-08-27. See
          * [DirectMachineSession.initializeStartGate] and `DIRECT_MACHINE_PROTOCOL.md`.
          */
         REQUIRE_START_REQUESTED(108, 1, readOnly = false),
