@@ -73,13 +73,6 @@ class LauncherHomeState extends State<LauncherHome>
     _workout.addListener(_syncGoalWithSession);
     _refreshAppstore();
     _refreshBackdrop();
-    // Slow on purpose. The badge only has to be right the next time someone
-    // looks at the launcher; the service is what keeps the console current, and
-    // polling it hard would burn cycles on a screen that is usually idle.
-    _appstorePoll = Timer.periodic(
-      const Duration(seconds: 30),
-      (_) => _refreshAppstore(),
-    );
   }
 
   /// Ending a workout clears its goal on the platform side, because the goal
@@ -213,7 +206,19 @@ class LauncherHomeState extends State<LauncherHome>
   Future<void> _refreshAppstore() async {
     final raw = await SpikeBridge.appstoreStatus();
     if (!mounted) return;
-    setState(() => _appstore = AppstoreStatus.fromMap(raw));
+    final status = AppstoreStatus.fromMap(raw);
+    setState(() => _appstore = status);
+    _appstorePoll?.cancel();
+    // Resolve the launch spinner promptly, then return to the deliberately slow
+    // badge cadence once initialization has answered. A missing method-channel
+    // response decodes as notStarted and stays visible, but must not create a
+    // permanent two-second retry loop.
+    _appstorePoll = Timer(
+      status.initialization == AppstoreInitialization.loading
+          ? const Duration(seconds: 2)
+          : const Duration(seconds: 30),
+      _refreshAppstore,
+    );
   }
 
   Future<void> _openUpdates() async {
@@ -303,6 +308,7 @@ class LauncherHomeState extends State<LauncherHome>
                             onGoal: _startWorkoutFlow,
                             goal: _goal,
                             updateCount: _appstore.actionableCount,
+                            updatesLoading: _appstore.initializing,
                             onUpdates: _openUpdates,
                           ),
                           const SizedBox(height: StrideSpace.lg),
@@ -695,6 +701,7 @@ class _LauncherHeader extends StatelessWidget {
     required this.onGoal,
     required this.goal,
     required this.updateCount,
+    required this.updatesLoading,
     required this.onUpdates,
   });
 
@@ -706,6 +713,7 @@ class _LauncherHeader extends StatelessWidget {
 
   /// Updates waiting to be installed, including Stride's own.
   final int updateCount;
+  final bool updatesLoading;
   final VoidCallback onUpdates;
 
   @override
@@ -763,9 +771,14 @@ class _LauncherHeader extends StatelessWidget {
           )
         else
           IconButton(
-            tooltip: 'Updates',
+            tooltip: updatesLoading ? 'Loading updates' : 'Updates',
             onPressed: onUpdates,
-            icon: const Icon(Icons.system_update_alt_rounded),
+            icon: updatesLoading
+                ? const SizedBox.square(
+                    dimension: 20,
+                    child: CircularProgressIndicator(strokeWidth: 2),
+                  )
+                : const Icon(Icons.system_update_alt_rounded),
           ),
         const SizedBox(width: StrideSpace.sm),
         IconButton(

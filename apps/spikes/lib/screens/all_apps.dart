@@ -259,6 +259,9 @@ class _AllAppsScreenState extends State<AllAppsScreen>
     final bundles = _store.offerableBundles;
 
     if (offered.isEmpty && blocked.isEmpty && bundles.isEmpty) {
+      if (_store.initializing && query.isEmpty) {
+        return const Center(child: CircularProgressIndicator());
+      }
       final empty = _StoreEmpty(
         status: _store,
         searching: query.isNotEmpty,
@@ -554,9 +557,15 @@ class _StoreEmpty extends StatelessWidget {
             if (!searching) ...[
               const SizedBox(height: StrideSpace.lg),
               OutlinedButton.icon(
-                onPressed: status.checking ? null : () => onCheckNow(),
+                onPressed: status.checking || status.initializing
+                    ? null
+                    : () => onCheckNow(),
                 icon: const Icon(Icons.refresh),
-                label: Text(status.checking ? 'Checking...' : 'Check now'),
+                label: Text(
+                  status.checking || status.initializing
+                      ? 'Loading...'
+                      : 'Check now',
+                ),
               ),
             ],
           ],
