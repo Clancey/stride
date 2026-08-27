@@ -55,6 +55,30 @@ class SpeedDisplayFallbackTest {
     }
 
     @Test
+    fun `a display fallback cannot satisfy a pending rail request`() {
+        val snapshot = client(
+            FakeWire(setpointKph = FitProValues.KPH_PER_MPH * 5.0, actualKph = 0.0),
+        ).read()!!
+        val requested = snapshot.displaySpeedMph!!
+        val pending = PendingSetpoint(tolerance = 0.3, graceMs = 5_000L)
+
+        // The rail is wired to raw speedMph. Feeding it the display fallback here would clear the
+        // request immediately and falsely turn the commanded rung into a measured one.
+        pending.request(value = requested, label = "5", nowMs = 0L, measured = snapshot.speedMph)
+        assertEquals(requested, pending.target!!, 0.001)
+        assertEquals(requested, pending.observe(snapshot.speedMph, nowMs = 1_000L)!!, 0.001)
+
+        val incorrectlyDisplayDriven = PendingSetpoint(tolerance = 0.3, graceMs = 5_000L)
+        incorrectlyDisplayDriven.request(
+            value = requested,
+            label = "5",
+            nowMs = 0L,
+            measured = snapshot.displaySpeedMph,
+        )
+        assertNull(incorrectlyDisplayDriven.target)
+    }
+
+    @Test
     fun `the fallback follows console readback rather than local command state`() {
         val wire = FakeWire(setpointKph = 3.2, actualKph = 0.0)
         val client = client(wire)

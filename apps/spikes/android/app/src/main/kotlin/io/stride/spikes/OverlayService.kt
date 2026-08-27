@@ -2168,10 +2168,12 @@ class OverlayService : Service() {
             accent = cyan,
             entries = presets,
             entrySuffix = "",
-            currentEntry = MachineLink.speedMph?.roundToInt()?.toString(),
+            // A fallback setpoint may be useful in the metric strip, but a solid rail pill means
+            // measured belt motion. Keep both the initial and live marks on raw ACTUAL_KPH.
+            currentEntry = MachineLink.observedSpeedMph?.roundToInt()?.toString(),
             gravity = Gravity.END or Gravity.TOP,
             usable = { MachineLink.canCommand() },
-            measured = { MachineLink.speedMph },
+            measured = { MachineLink.observedSpeedMph },
             pending = PendingSetpoint(tolerance = SPEED_ARRIVED_TOLERANCE, graceMs = PENDING_GRACE_MS),
             onPick = { mph ->
                 requestSetpoint(mayStart = true) { done ->
