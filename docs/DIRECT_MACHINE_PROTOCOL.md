@@ -459,16 +459,26 @@ about whether field 16 works. And **there is no per-field validity marker** — 
 checks only command status and total length, then consumes raw bytes in field order, so "the value
 is zero" and "I do not have this value" are the same bytes.
 
+Stride now makes the same source choice **for display only, and only while field 16 remains
+unproven**. The direct poll reads `KPH` back from the console alongside `ACTUAL_KPH`; until
+`ACTUAL_KPH` reports motion, the metric strip and its pace use that read-back setpoint. Once
+`ACTUAL_KPH` has reported motion on a link, its later zero is kept rather than hidden by the
+fallback. The raw `ACTUAL_KPH` remains a separate snapshot field throughout: `Observation`,
+`everReportedMotion`, deck movement, and stop confirmation never receive the commanded value.
+Outside a moving workout state — including pause and results — the fallback is disabled so a stale
+target cannot appear as live speed.
+
 The gate therefore also requires that this console has, at some point on this link, reported a
 speed above the moving threshold at all. Until it has, its zero is indistinguishable from a
 register stuck at zero and is treated as worth nothing. On an X22i exhibiting #34 the deck is never
 flattened, which is exactly where it sat before any of this existed.
 
-`Rpm` (field 5) is the obvious next avenue for a real motion signal on such a console: it is
-**read-only**, so it is a machine measurement rather than a setpoint, and it may carry roller or
-motor movement where field 16 is dead. Nobody has checked whether the X22i populates it, so nothing
-depends on it yet. Corroborating against `CURRENT_DISTANCE` failing to advance would serve too.
-Either would let that condition be strengthened — it must not be dropped.
+This does not turn a target into a measurement. The X22i reports `Rpm` (field 5) unsupported, so the
+remaining route to a real instantaneous displayed value is deriving it from `CURRENT_DISTANCE`.
+That register is integer metres on the direct path, however, and no sampling/filtering rule has yet
+been established that avoids presenting its quantisation as large speed jumps. Until that can be
+tested on hardware, the read-back setpoint is the same bounded display fallback iFit uses, not a
+claim about actual belt motion.
 
 `GRADE = 0` is clamped like any other incline, so a machine whose reported grade range excludes
 zero gets as flat as it goes rather than a value it would refuse — the same coercion `startWorkout`

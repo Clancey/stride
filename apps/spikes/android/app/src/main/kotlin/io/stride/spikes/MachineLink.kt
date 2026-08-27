@@ -571,8 +571,22 @@ object MachineLink {
     const val DISCONNECTED_REASON: String =
         "Stride is not linked to this machine yet. Speed, incline and fan stay on the console."
 
-    /** Current belt speed. Null means unknown — see the class note before drawing it. */
-    val speedMph: Double? get() = fresh()?.speedMph
+    /**
+     * Current rider-facing speed. Null means unknown — see the class note before drawing it.
+     *
+     * This can be a clearly isolated display fallback on a direct FitPro belt console whose actual
+     * speed register has never reported motion. Safety decisions use [observation], which is always
+     * built from the raw [GlassOsClient.Snapshot.speedMph] instead.
+     */
+    val speedMph: Double? get() = fresh()?.displaySpeedMph
+
+    /**
+     * Current machine-observed speed, never a display fallback.
+     *
+     * Coordinator code uses this for adoption, ramping, and deck movement so a commanded setpoint
+     * cannot become evidence about what the belt did.
+     */
+    internal val observedSpeedMph: Double? get() = fresh()?.speedMph
 
     /** Current incline percent. Null means unknown. */
     val inclinePercent: Double? get() = fresh()?.inclinePercent
@@ -580,7 +594,7 @@ object MachineLink {
     /** Distance covered this session, as measured by the machine. Null means unknown. */
     val distanceMiles: Double? get() = fresh()?.distanceMiles
 
-    /** Instantaneous pace, derived from measured speed only. Null means unknown. */
+    /** Instantaneous pace, derived from the same speed shown to the rider. Null means unknown. */
     val paceMinPerMile: Double? get() = fresh()?.paceMinPerMile
 
     /** Calories as the machine estimates them. Null means unknown. */
