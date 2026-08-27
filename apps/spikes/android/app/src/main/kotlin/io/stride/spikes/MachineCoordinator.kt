@@ -162,6 +162,22 @@ object MachineCoordinator {
 
     private const val FAN_OFF_LABEL = "Fan off (workout ended)"
 
+    private data class FanRequest(
+        val state: Int,
+        val requestedAt: Long,
+        val generation: Int,
+    )
+
+    private data class AcceptedFanState(
+        val state: Int,
+        val acceptedAt: Long,
+    )
+
+    internal data class FanRequestSnapshot(
+        val state: Int,
+        val at: Long,
+    )
+
     private data class Job(
         val generation: Int,
         val label: String,
@@ -286,6 +302,8 @@ object MachineCoordinator {
         // a machine we are no longer talking to.
         endGeneration.incrementAndGet()
         queue.clear()
+        pendingFanRequest = null
+        acceptedFanState = null
         this.commands = commands
         if (commands != null && !running) {
             running = true
@@ -556,6 +574,7 @@ object MachineCoordinator {
     fun stop(onSettled: ((StopVerdict) -> Unit)? = null) {
         val gen = generation.incrementAndGet()
         queue.clear()
+        pendingFanRequest = null
         // Sampled on the caller's thread, before the job can possibly run, so "readings newer than
         // the stop" is anchored to the instant the rider asked for it rather than to whenever the
         // worker got round to it.
@@ -764,41 +783,80 @@ object MachineCoordinator {
      * Set the console fan.
      *
      * Queued with everything else even though it cannot move the belt, so a fan write can never
-     * overlap a speed write on the wire. The last state is remembered here rather than read back,
-     * because the rider's choice should survive a console that reports the fan lazily.
+     * overlap a speed write on the wire. The request is visible while queued and in flight, but
+     * [lastFanState] advances only after the machine accepts it.
      */
     fun setFan(state: Int) {
-        lastFanState = state
-        submit("Fan ${GlassOsCommands.fanStateName(state)}") { it.setFanState(state).toOutcome() }
+        val request = beginFanRequest(state)
+        submit(
+            label = "Fan ${GlassOsCommands.fanStateName(state)}",
+            onDone = { finishFanRequest(request) },
+            jobGeneration = request.generation,
+        ) {
+            acceptFanWrite(request, it.setFanState(state)).toOutcome()
+        }
     }
 
     /**
-     * The fan state Stride last asked for, or null if it has not asked this run.
+     * The last fan state a machine accepted, or null when this transport has accepted none.
      *
-     * **A request, never a reading.** The console has its own fan button and Stride never hears it
-     * pressed, so this can be confidently wrong the moment the rider uses it. Anything drawing a
-     * fan value must prefer [MachineLink.fanState], which is the machine's own answer, and must
-     * never style this like a measurement — see [MachineLink.fanReadout].
+     * **Accepted is still not measured.** The console has its own fan button and Stride never hears
+     * it pressed, so this can be confidently wrong the moment the rider uses it. Anything drawing a
+     * fan value must prefer [MachineLink.fanState], which is the machine's own answer.
      *
-     * Kept in memory only; [StrideSettings] owns the value that outlives the process.
+     * Cleared on [rebind], because an acknowledgement from one machine is not evidence about the
+     * next. [StrideSettings] owns the rider preference that outlives a transport and the process.
      */
-    @Volatile
-    var lastFanState: Int? = null
-        private set(value) {
-            field = value
-            // Stamped here rather than at each call site so no future writer can forget. The
-            // readout compares this against the timestamp of the snapshot it is holding, and a
-            // request with no time on it cannot be told from one the machine has already answered.
-            lastFanStateAt = System.currentTimeMillis()
-        }
+    val lastFanState: Int? get() = acceptedFanState?.state
 
     /**
-     * When [lastFanState] was last written, on `System.currentTimeMillis` — the same clock
+     * When [lastFanState] was accepted, on `System.currentTimeMillis` — the same clock
      * [MachineLink.fanStateAt] reports, because the two are only ever used by comparing them.
      */
+    val lastFanStateAt: Long get() = acceptedFanState?.acceptedAt ?: 0L
+
+    /**
+     * The newest fan intent that the readout should show: a queued/in-flight request first, then the
+     * last accepted state. A refused, failed, superseded, or transport-less write never remains here.
+     */
+    val lastFanRequest: Int? get() = fanRequestSnapshot()?.state
+
+    /** When [lastFanRequest] was requested or accepted, on `System.currentTimeMillis`. */
+    val lastFanRequestAt: Long get() = fanRequestSnapshot()?.at ?: 0L
+
+    /**
+     * One coherent state/time pair for consumers that compare this intent with a machine reading.
+     * Reading the two public compatibility accessors separately can span a settling write.
+     */
+    internal fun fanRequestSnapshot(): FanRequestSnapshot? {
+        val pending = pendingFanRequest
+        if (pending != null) return FanRequestSnapshot(pending.state, pending.requestedAt)
+        val accepted = acceptedFanState ?: return null
+        return FanRequestSnapshot(accepted.state, accepted.acceptedAt)
+    }
+
     @Volatile
-    var lastFanStateAt: Long = 0L
-        private set
+    private var pendingFanRequest: FanRequest? = null
+
+    @Volatile
+    private var acceptedFanState: AcceptedFanState? = null
+
+    private fun beginFanRequest(state: Int, requestGeneration: Int = generation.get()): FanRequest =
+        FanRequest(state, System.currentTimeMillis(), requestGeneration).also {
+            // A stop/rebind between deciding the request and publishing it has already retired it.
+            if (requestGeneration == generation.get()) pendingFanRequest = it
+        }
+
+    private fun finishFanRequest(request: FanRequest) {
+        if (pendingFanRequest === request) pendingFanRequest = null
+    }
+
+    private fun acceptFanWrite(request: FanRequest, ack: MachineAck): MachineAck {
+        if (ack is MachineAck.Ok && request.generation == generation.get()) {
+            acceptedFanState = AcceptedFanState(request.state, System.currentTimeMillis())
+        }
+        return ack
+    }
 
     /**
      * Restore the fan for a starting workout.
@@ -818,15 +876,19 @@ object MachineCoordinator {
      * it has just told us so, which is why the refusal is swallowed here and remembered there.
      */
     fun restoreFan(remembered: Int?) {
-        submit("Restore fan") { commands ->
+        val gen = generation.get()
+        var request = remembered?.let { beginFanRequest(it, gen) }
+        submit(
+            label = "Restore fan",
+            onDone = { request?.let(::finishFanRequest) },
+            jobGeneration = gen,
+        ) { commands ->
             val speculative = remembered == null
             val target = remembered
                 ?: if (commands.autoFanSupported() != false) GlassOsCommands.FAN_AUTO else null
                 ?: return@submit Outcome.Ok
-            val ack = commands.setFanState(target)
-            // Only remember a state the machine actually took. Recording a speculative Auto that was
-            // refused would make every later restore replay a command this console has rejected.
-            if (ack is MachineAck.Ok || !speculative) lastFanState = target
+            val activeRequest = request ?: beginFanRequest(target, gen).also { request = it }
+            val ack = acceptFanWrite(activeRequest, commands.setFanState(target))
             if (speculative && ack is MachineAck.Refused) Outcome.Ok else ack.toOutcome()
         }
     }
@@ -901,11 +963,9 @@ object MachineCoordinator {
      * blowing until somebody noticed — issue #29.
      *
      * **Sent unconditionally, not gated on [lastFanState].** Skipping when Stride does not think it
-     * has a fan running looks like an easy saving and is a race: `restoreFan` records the state
-     * from inside its own queued job, so a restore still in flight when the workout ends would be
-     * invisible here — and would then turn the fan on immediately behind the stop, which is
-     * precisely the state this is supposed to leave the machine out of. [lastFanState] is also only
-     * ever Stride's own last *request*; the console has its own controls.
+     * has a fan running looks like an easy saving and is a race: a restore can already be on the wire
+     * when the workout ends and can turn the fan on behind the stop. The accepted state cannot make
+     * that in-flight write safe, and the console has controls of its own.
      *
      * A refusal is not an error. It means this machine has no fan register that will take a write,
      * which is a fact about the treadmill and not a failure of the end — swallowed for the same
@@ -917,11 +977,15 @@ object MachineCoordinator {
      */
     fun stopFan() {
         val end = endGeneration.get()
-        submit(FAN_OFF_LABEL, endGen = end, reportsOutcome = false) { commands ->
-            val ack = commands.setFanState(GlassOsCommands.FAN_OFF)
-            // Only a state the machine actually took. Recording it optimistically would leave the
-            // overlay's fan pills claiming "Off" over a fan that is still running.
-            if (ack is MachineAck.Ok) lastFanState = GlassOsCommands.FAN_OFF
+        val request = beginFanRequest(GlassOsCommands.FAN_OFF)
+        submit(
+            label = FAN_OFF_LABEL,
+            onDone = { finishFanRequest(request) },
+            endGen = end,
+            reportsOutcome = false,
+            jobGeneration = request.generation,
+        ) { commands ->
+            val ack = acceptFanWrite(request, commands.setFanState(GlassOsCommands.FAN_OFF))
             if (ack is MachineAck.Refused) Outcome.Ok else ack.toOutcome()
         }
     }
@@ -935,12 +999,13 @@ object MachineCoordinator {
         speedGen: Int? = null,
         endGen: Int? = null,
         reportsOutcome: Boolean = true,
+        jobGeneration: Int = generation.get(),
         // MachineCommands, not GlassOsCommands: the coordinator owns the clamps and the ramp and
         // must not know which wire is underneath it. That split is what lets the direct register
         // path substitute for GlassOS without a second copy of any of the safety rules.
         run: (MachineCommands) -> Outcome,
     ) {
-        val gen = generation.get()
+        val gen = jobGeneration
         queue.addLast(
             Job(gen, label, onDone, speedGen, endGen, reportsOutcome) {
                 if (delayMs > 0) {

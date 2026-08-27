@@ -680,8 +680,8 @@ object MachineLink {
      * not know.
      *
      * This is the only fan value in the app that is a reading. [MachineCoordinator.lastFanState] is
-     * Stride's last *request* and can be wrong the instant the rider touches the console's own fan
-     * button, which nothing in Stride ever hears about.
+     * only the last state a write acknowledgement supports and can be wrong the instant the rider
+     * touches the console's own fan button, which nothing in Stride ever hears about.
      */
     val fanState: Int? get() = fresh()?.fanState
 
@@ -714,7 +714,8 @@ object MachineLink {
      */
     @Volatile private var fanSeen: Boolean = false
 
-    fun fanKnownPresent(): Boolean = fanSeen || canCommandFan()
+    fun fanKnownPresent(): Boolean =
+        fanSeen || canCommandFan() || MachineCoordinator.lastFanState != null
 
     /**
      * What the overlay should say about the fan.
@@ -753,20 +754,21 @@ object MachineLink {
         // is under the rider's hand and Stride never hears it; the reading is the only thing that
         // ever does.
         if (reported != null) return FanReadout.Measured(reported)
-        // `knownPresent` gates the request, not just the blank, and it has to. `restoreFan` records
-        // its target whenever the rider has a remembered preference — `!speculative` — whether or
-        // not the machine took it, so a treadmill with no fan can be sitting on a `lastFanState` of
-        // High. Without this gate it would draw one.
+        // `knownPresent` gates the request, not just the blank. A request can be queued before the
+        // machine answers, and intent alone is not evidence that this treadmill has a fan.
         return if (knownPresent) FanReadout.Unknown else FanReadout.Absent
     }
 
-    fun fanReadout(): FanReadout = fanReadout(
-        reported = fanState,
-        reportedAt = fanStateAt,
-        requested = MachineCoordinator.lastFanState,
-        requestedAt = MachineCoordinator.lastFanStateAt,
-        knownPresent = fanKnownPresent(),
-    )
+    fun fanReadout(): FanReadout {
+        val requested = MachineCoordinator.fanRequestSnapshot()
+        return fanReadout(
+            reported = fanState,
+            reportedAt = fanStateAt,
+            requested = requested?.state,
+            requestedAt = requested?.at ?: 0L,
+            knownPresent = fanKnownPresent(),
+        )
+    }
 
     /** What is known about the fan, and how well. See [fanReadout]. */
     sealed class FanReadout {

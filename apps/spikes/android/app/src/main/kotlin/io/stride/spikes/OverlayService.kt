@@ -2750,8 +2750,8 @@ class OverlayService : Service() {
     /**
      * Which fan segment to light, best evidence first.
      *
-     * The machine's own answer outranks Stride's last request, which outranks the rider's
-     * remembered preference. That order used to start at the request, so a sheet opened on a fresh
+     * The machine's own answer outranks Stride's pending or accepted request, which outranks the
+     * rider's remembered preference. That order used to start at the request, so a sheet opened on a fresh
      * launch lit the pill for a setting chosen days ago on possibly a different treadmill — and
      * once the console's own fan button had been pressed, the lit pill was simply wrong.
      *
@@ -2761,7 +2761,7 @@ class OverlayService : Service() {
      * honestly, and it is deliberately not said twice in two different vocabularies.
      */
     private fun selectedFanSegment(): Int? =
-        MachineLink.fanState ?: MachineCoordinator.lastFanState ?: StrideSettings.fanState
+        MachineLink.fanState ?: MachineCoordinator.lastFanRequest ?: StrideSettings.fanState
 
     private fun refreshFanSegments() {
         if (fanSegmentViews.isEmpty()) return

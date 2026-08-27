@@ -48,6 +48,10 @@ class EndOfWorkoutSequenceTest {
         /** Held by every call while set, so a test can prove the *caller* is not the one blocking. */
         var blockUntil: CountDownLatch? = null
 
+        /** Signals and holds a fan write after it reaches the transport. */
+        var fanEntered: CountDownLatch? = null
+        var releaseFan: CountDownLatch? = null
+
         private fun record(what: String) {
             blockUntil?.await(5, TimeUnit.SECONDS)
             calls += what
@@ -65,6 +69,8 @@ class EndOfWorkoutSequenceTest {
         }
 
         override fun setFanState(state: Int): MachineAck {
+            fanEntered?.countDown()
+            releaseFan?.await(5, TimeUnit.SECONDS)
             record("fan $state")
             fanThrows?.let { throw it }
             return fanAck
@@ -102,9 +108,8 @@ class EndOfWorkoutSequenceTest {
         // console, where attach keeps the first one it was ever given.
         MachineCoordinator.rebind(console)
         MachineCoordinator.applyMachineLimits(null)
-        // A known fan state that is not Off, because [MachineCoordinator.lastFanState] is a
-        // singleton that outlives a test. Without this baseline, "the fan was turned off" would
-        // pass by inheriting whatever the previous test left behind.
+        // A known accepted fan state that is not Off. Without this baseline, "the fan was turned
+        // off" could pass while comparing null with state cleared by the rebind above.
         MachineCoordinator.setFan(GlassOsCommands.FAN_HIGH)
         awaitCalls(1)
         console.calls.clear()
@@ -195,10 +200,9 @@ class EndOfWorkoutSequenceTest {
      * The fan goes off even when Stride already believes it is off.
      *
      * Suppressing the write on [MachineCoordinator.lastFanState] looks like a free saving and is a
-     * race twice over. `restoreFan` records the state from inside its own queued job, so a restore
-     * still in flight when the workout ends is invisible to such a check and would turn the fan on
-     * right behind the stop; and `lastFanState` is only ever Stride's own last *request*, while the
-     * console has fan controls of its own. The write is cheap and a refusal is harmless.
+     * race twice over. A restore already in flight can turn the fan on right behind the stop, and an
+     * accepted state can be stale because the console has fan controls of its own. The write is
+     * cheap and a refusal is harmless.
      */
     @Test
     fun `the fan is turned off even when Stride thinks it already is`() {
@@ -212,6 +216,87 @@ class EndOfWorkoutSequenceTest {
             "an already-off fan is still told off; the console has its own controls",
             console.calls.contains("fan ${GlassOsCommands.FAN_OFF}"),
         )
+    }
+
+    @Test
+    fun `a refused remembered restore does not become fan state`() {
+        console.fanAck = MachineAck.Refused("fan unavailable")
+
+        MachineCoordinator.restoreFan(GlassOsCommands.FAN_MEDIUM)
+        awaitCalls(1)
+        settle()
+
+        assertEquals(GlassOsCommands.FAN_HIGH, MachineCoordinator.lastFanState)
+        assertEquals(GlassOsCommands.FAN_HIGH, MachineCoordinator.lastFanRequest)
+    }
+
+    @Test
+    fun `a manual fan request stays visible until the write settles`() {
+        val entered = CountDownLatch(1)
+        val release = CountDownLatch(1)
+        console.fanEntered = entered
+        console.releaseFan = release
+
+        MachineCoordinator.setFan(GlassOsCommands.FAN_LOW)
+        assertTrue("fan write never reached the transport", entered.await(5, TimeUnit.SECONDS))
+        assertEquals(GlassOsCommands.FAN_HIGH, MachineCoordinator.lastFanState)
+        assertEquals(GlassOsCommands.FAN_LOW, MachineCoordinator.lastFanRequest)
+
+        release.countDown()
+        awaitCalls(1)
+        settle()
+        assertEquals(GlassOsCommands.FAN_LOW, MachineCoordinator.lastFanState)
+        assertEquals(GlassOsCommands.FAN_LOW, MachineCoordinator.lastFanRequest)
+    }
+
+    @Test
+    fun `a fan write accepted after a stop is not recorded as state`() {
+        val entered = CountDownLatch(1)
+        val release = CountDownLatch(1)
+        console.fanEntered = entered
+        console.releaseFan = release
+
+        MachineCoordinator.setFan(GlassOsCommands.FAN_LOW)
+        assertTrue("fan write never reached the transport", entered.await(5, TimeUnit.SECONDS))
+        MachineCoordinator.stop()
+        release.countDown()
+
+        awaitCalls(2)
+        settle()
+        assertEquals(listOf("fan 1", "stop"), console.calls)
+        assertEquals(GlassOsCommands.FAN_HIGH, MachineCoordinator.lastFanState)
+        assertEquals(GlassOsCommands.FAN_HIGH, MachineCoordinator.lastFanRequest)
+    }
+
+    @Test
+    fun `rebind clears fan evidence accepted by the previous machine`() {
+        assertEquals(GlassOsCommands.FAN_HIGH, MachineCoordinator.lastFanState)
+
+        console = RecordingConsole()
+        MachineCoordinator.rebind(console)
+
+        assertEquals(null, MachineCoordinator.lastFanState)
+        assertEquals(null, MachineCoordinator.lastFanRequest)
+    }
+
+    @Test
+    fun `fan off follows a restore already in flight when end wins the race`() {
+        val entered = CountDownLatch(1)
+        val release = CountDownLatch(1)
+        console.fanEntered = entered
+        console.releaseFan = release
+
+        MachineCoordinator.restoreFan(GlassOsCommands.FAN_MEDIUM)
+        assertTrue("restore never reached the transport", entered.await(5, TimeUnit.SECONDS))
+        endWorkout()
+        assertEquals(GlassOsCommands.FAN_OFF, MachineCoordinator.lastFanRequest)
+
+        console.releaseFan = null
+        release.countDown()
+        awaitCalls(4)
+        settle()
+        assertEquals(listOf("fan 2", "stop", "speed 0.00", "fan 0"), console.calls)
+        assertEquals(GlassOsCommands.FAN_OFF, MachineCoordinator.lastFanState)
     }
 
     /**

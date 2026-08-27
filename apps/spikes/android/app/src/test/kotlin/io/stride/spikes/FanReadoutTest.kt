@@ -8,9 +8,9 @@ import org.junit.Test
  * What the overlay is allowed to say about the fan.
  *
  * Stride holds two fan values and they are not the same kind of thing. `MachineLink.fanState` is
- * what the machine reported; `MachineCoordinator.lastFanState` is what Stride last asked for, and
- * the console has its own fan button that Stride never hears — so a request can be confidently
- * wrong the moment the rider presses it.
+ * what the machine reported; `MachineCoordinator.lastFanRequest` is Stride's pending or last
+ * accepted request, and the console has its own fan button that Stride never hears — so even an
+ * accepted request can be confidently wrong the moment the rider presses it.
  *
  * Item 9 of the safety checklist on `MachineLink.canCommand` is the rule these pin: the UI
  * distinguishes requested from confirmed from unknown, and never shows a requested value styled as
@@ -125,10 +125,9 @@ class FanReadoutTest {
     /**
      * The trap that makes the presence gate load-bearing rather than decorative.
      *
-     * `MachineCoordinator.restoreFan` records its target whenever the rider has a remembered
-     * preference — the `!speculative` branch — regardless of whether the machine accepted it. So a
-     * treadmill with no fan can be carrying a `lastFanState` of High from a workout start that was
-     * refused. Without the gate the strip would draw a fan speed on a machine that has no fan.
+     * A restore request becomes visible while its write is queued or in flight, before the machine
+     * has accepted it. Without the gate that useful in-flight visibility would briefly draw a fan
+     * speed on a machine that may have no fan.
      */
     @Test
     fun `a stale request on a fanless machine shows nothing`() {
