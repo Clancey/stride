@@ -83,6 +83,17 @@ class RailPresetsTest {
         assertEquals(listOf("12", "10", "-3"), entries)
     }
 
+    @Test
+    fun `range validation uses the displayed command rather than the raw endpoint`() {
+        val entries = railPresetEntries(
+            published = listOf(2.57),
+            ladder = listOf(2.57),
+            floor = 2.55,
+            ceiling = 2.57,
+        )
+        assertTrue("2.57 displays and parses as an out-of-range 2.6", entries.isEmpty())
+    }
+
     /** A real range still narrows the ladder — that behaviour is the point of having limits. */
     @Test
     fun `limits narrow the ladder`() {

@@ -2073,6 +2073,8 @@ class OverlayService : Service() {
             entrySuffix = "%",
             currentEntry = MachineLink.inclinePercent?.roundToInt()?.toString(),
             gravity = Gravity.START or Gravity.TOP,
+            minimumAllowed = floor,
+            maximumAllowed = ceiling,
             // Live whenever a command could travel at all. The console declining setpoints from
             // idle is a state a tap can fix, not a reason to grey the column out — see requestSetpoint.
             usable = { MachineLink.canCommand() },
@@ -2194,6 +2196,8 @@ class OverlayService : Service() {
             entrySuffix = "",
             currentEntry = MachineLink.speedMph?.roundToInt()?.toString(),
             gravity = Gravity.END or Gravity.TOP,
+            minimumAllowed = floor,
+            maximumAllowed = ceiling,
             usable = { MachineLink.canCommand() },
             measured = { MachineLink.speedMph },
             pending = PendingSetpoint(tolerance = SPEED_ARRIVED_TOLERANCE, graceMs = PENDING_GRACE_MS),
@@ -2270,6 +2274,8 @@ class OverlayService : Service() {
         entrySuffix: String,
         currentEntry: String?,
         gravity: Int,
+        minimumAllowed: Double,
+        maximumAllowed: Double,
         usable: () -> Boolean,
         measured: () -> Double?,
         pending: PendingSetpoint,
@@ -2312,17 +2318,23 @@ class OverlayService : Service() {
                 // exactly what gets sent. Parsing can only fail if a preset is not a number, in
                 // which case sending nothing is the right answer.
                 val tapped = entry.toDoubleOrNull()
-                if (tapped == null || !usable()) {
+                if (tapped == null || tapped !in minimumAllowed..maximumAllowed || !usable()) {
                     showMachineControlUnavailable()
                     return@railEntryButton
                 }
                 val now = SystemClock.uptimeMillis()
                 // A quick second tap types a tenth onto the first: 5 then 5 is 5.5, 6 then 4 is 6.4.
-                val composed = composeSetpoint(lastPick, lastPickAt, tapped, now, COMPOSE_WINDOW_MS)
-                val value = composed ?: tapped
-                // A composed value has consumed its first digit; a plain pick becomes the next
-                // first digit. Either way a third tap starts over rather than compounding.
-                lastPick = if (composed == null) tapped else null
+                val resolved = resolveRailTap(
+                    previous = lastPick,
+                    previousAtMs = lastPickAt,
+                    tapped = tapped,
+                    nowMs = now,
+                    windowMs = COMPOSE_WINDOW_MS,
+                    minimumAllowed = minimumAllowed,
+                    maximumAllowed = maximumAllowed,
+                )
+                val value = resolved.value
+                lastPick = resolved.nextPrevious
                 lastPickAt = now
                 onPick(value)
                 // Mark the tap immediately. The belt will take seconds to get here and telemetry
@@ -3415,7 +3427,7 @@ internal fun formatRailPreset(value: Double): String =
     if (value == kotlin.math.round(value) && kotlin.math.abs(value) < Int.MAX_VALUE) {
         value.toInt().toString()
     } else {
-        "%.1f".format(value)
+        String.format(Locale.US, "%.1f", value)
     }
 
 /**
@@ -3443,8 +3455,10 @@ internal fun railPresetEntries(
     floor: Double?,
     ceiling: Double?,
 ): List<String> {
-    fun List<Double>.withinLimits(): List<Double> = filter {
-        it.isFinite() && (floor == null || it >= floor) && (ceiling == null || it <= ceiling)
+    fun List<Double>.withinLimits(): List<Double> = mapNotNull { raw ->
+        if (!raw.isFinite()) return@mapNotNull null
+        val command = formatRailPreset(raw).toDoubleOrNull() ?: return@mapNotNull null
+        command.takeIf { (floor == null || it >= floor) && (ceiling == null || it <= ceiling) }
     }
     val values = published
         ?.takeIf { it.isNotEmpty() }
@@ -3476,6 +3490,8 @@ internal const val COMPOSE_WINDOW_MS = 1_000L
  *  - the first tap was not a whole number, so there is no digit to extend — a machine that
  *    publishes 7.5 as a preset is choosing its own steps and should not have them re-typed;
  *  - the second tap is not a single digit, because "12" cannot be a tenths place.
+ *  - the composed value falls outside [minimumAllowed]..[maximumAllowed], in which case the second
+ *    tap remains an ordinary independent pick.
  *
  * The sign of the first value is kept and the magnitude grows, so on an incline column -2 then 5
  * reads as -2.5, which is how it would be typed and how it would be read back.
@@ -3489,6 +3505,8 @@ internal fun composeSetpoint(
     tapped: Double,
     nowMs: Long,
     windowMs: Long,
+    minimumAllowed: Double,
+    maximumAllowed: Double,
 ): Double? {
     val first = previous ?: return null
     if (nowMs - previousAtMs !in 0 until windowMs) return null
@@ -3497,5 +3515,42 @@ internal fun composeSetpoint(
     val magnitude = kotlin.math.abs(first) + tapped / 10.0
     // Rounded because 6 + 4/10 is not exactly 6.4 in binary, and the value becomes a label.
     val rounded = kotlin.math.round(magnitude * 10.0) / 10.0
-    return if (first < 0.0) -rounded else rounded
+    val composed = if (first < 0.0) -rounded else rounded
+    return composed.takeIf { it in minimumAllowed..maximumAllowed }
+}
+
+internal data class ResolvedRailTap(
+    val value: Double,
+    val nextPrevious: Double?,
+)
+
+/**
+ * Resolve a rail tap and the digit state carried into the next tap.
+ *
+ * A rejected composition is the second button as an independent pick, not a request for the first
+ * value clipped to the range. It therefore becomes the next possible first digit.
+ */
+internal fun resolveRailTap(
+    previous: Double?,
+    previousAtMs: Long,
+    tapped: Double,
+    nowMs: Long,
+    windowMs: Long,
+    minimumAllowed: Double,
+    maximumAllowed: Double,
+): ResolvedRailTap {
+    val composed = composeSetpoint(
+        previous = previous,
+        previousAtMs = previousAtMs,
+        tapped = tapped,
+        nowMs = nowMs,
+        windowMs = windowMs,
+        minimumAllowed = minimumAllowed,
+        maximumAllowed = maximumAllowed,
+    )
+    return if (composed == null) {
+        ResolvedRailTap(value = tapped, nextPrevious = tapped)
+    } else {
+        ResolvedRailTap(value = composed, nextPrevious = null)
+    }
 }

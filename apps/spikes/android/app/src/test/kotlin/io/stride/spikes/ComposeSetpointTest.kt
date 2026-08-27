@@ -18,13 +18,21 @@ class ComposeSetpointTest {
 
     private val window = COMPOSE_WINDOW_MS
 
-    private fun compose(previous: Double?, tapped: Double, gapMs: Long): Double? =
+    private fun compose(
+        previous: Double?,
+        tapped: Double,
+        gapMs: Long,
+        minimumAllowed: Double = Double.NEGATIVE_INFINITY,
+        maximumAllowed: Double = Double.POSITIVE_INFINITY,
+    ): Double? =
         composeSetpoint(
             previous = previous,
             previousAtMs = 10_000L,
             tapped = tapped,
             nowMs = 10_000L + gapMs,
             windowMs = window,
+            minimumAllowed = minimumAllowed,
+            maximumAllowed = maximumAllowed,
         )
 
     /** The two examples, exactly as asked for. */
@@ -92,6 +100,48 @@ class ComposeSetpointTest {
     @Test
     fun `a negative second tap is a new choice`() {
         assertNull(compose(3.0, -1.0, 200))
+    }
+
+    @Test
+    fun `speed composition cannot exceed the effective ceiling`() {
+        assertNull(compose(6.0, 5.0, 200, minimumAllowed = 1.0, maximumAllowed = 6.0))
+        assertEquals(5.5, compose(5.0, 5.0, 200, minimumAllowed = 1.0, maximumAllowed = 6.0))
+    }
+
+    @Test
+    fun `incline composition cannot cross the effective floor`() {
+        assertNull(compose(-3.0, 5.0, 200, minimumAllowed = -3.0, maximumAllowed = 12.0))
+        assertEquals(-2.5, compose(-2.0, 5.0, 200, minimumAllowed = -3.0, maximumAllowed = 12.0))
+    }
+
+    @Test
+    fun `an out of range composition sends the second tap independently`() {
+        val resolved = resolveRailTap(
+            previous = 6.0,
+            previousAtMs = 10_000L,
+            tapped = 5.0,
+            nowMs = 10_200L,
+            windowMs = window,
+            minimumAllowed = 1.0,
+            maximumAllowed = 6.0,
+        )
+        assertEquals(5.0, resolved.value, 1e-9)
+        assertEquals(5.0, resolved.nextPrevious!!, 1e-9)
+    }
+
+    @Test
+    fun `a valid composition consumes the first digit`() {
+        val resolved = resolveRailTap(
+            previous = -2.0,
+            previousAtMs = 10_000L,
+            tapped = 5.0,
+            nowMs = 10_200L,
+            windowMs = window,
+            minimumAllowed = -3.0,
+            maximumAllowed = 12.0,
+        )
+        assertEquals(-2.5, resolved.value, 1e-9)
+        assertNull(resolved.nextPrevious)
     }
 
     /** Binary arithmetic must not leak into a label: 6 + 4/10 is not exactly 6.4. */

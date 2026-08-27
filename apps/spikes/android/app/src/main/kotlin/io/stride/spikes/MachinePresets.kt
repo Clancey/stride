@@ -206,11 +206,10 @@ internal object MachinePresets {
 
         val floor = ceil1(min)
         val ceiling = floor1(max)
-        // Rounding inward can cross the bounds over on a range narrower than 0.1; there is no
-        // honest button to offer in that case, so offer the one value both ends agree on.
-        // Coerced because rounding a sub-0.1 range can land outside it (min 2.55, max 2.57
-        // rounds to 2.6) and a preset the machine would refuse is worse than an ugly label.
-        if (ceiling < floor) return listOf(flatten(round1(min).coerceIn(min, max)))
+        // The rail parses its one-decimal label back into the command. If no tenth lies inside the
+        // range, there is no honest button to offer: carrying an unrounded endpoint such as 2.57
+        // would display as 2.6 and send 2.6, outside 2.55..2.57.
+        if (ceiling < floor) return emptyList()
 
         val out = sortedSetOf<Double>(reverseOrder())
         out += flatten(floor)

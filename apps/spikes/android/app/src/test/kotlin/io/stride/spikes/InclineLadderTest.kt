@@ -142,16 +142,11 @@ class InclineLadderTest {
         }
     }
 
-    /**
-     * A range too narrow for either step still offers the one value its ends agree on.
-     *
-     * 2.55 rounds to 2.6, above the machine's own maximum — a button that could only be refused.
-     */
+    /** A range containing no displayable tenth offers no button that parses outside the range. */
     @Test
-    fun `a sub-tenth range stays inside itself`() {
+    fun `a sub-tenth range with no representable command is empty`() {
         val out = coarse(2.55, 2.57)
-        assertEquals(1, out.size)
-        assertTrue("offered ${out[0]} for a 2.55-2.57 machine", out[0] in 2.55..2.57)
+        assertTrue("offered $out for a 2.55-2.57 machine", out.isEmpty())
     }
 
     // ---- what it may never do -----------------------------------------------------------------
