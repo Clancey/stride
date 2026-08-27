@@ -23,7 +23,14 @@ class StopConfirmationTest {
 
     /** A poll, as [MachineLink] publishes them. */
     private fun reading(seq: Long, speed: Double?, distance: Double? = 1.0) =
-        MachineLink.Observation(seq = seq, atMs = seq * 500L, speedMph = speed, distanceMiles = distance)
+        MachineLink.Observation(
+            seq = seq,
+            atMs = seq * 500L,
+            speedMph = speed,
+            distanceMiles = distance,
+            workoutEpoch = 1L,
+            reportedMotionInWorkout = true,
+        )
 
     /** Two agreeing readings of a belt at rest that covered no ground between them. */
     private fun stoppedBelt() = listOf(

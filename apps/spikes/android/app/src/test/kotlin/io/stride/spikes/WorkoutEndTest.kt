@@ -23,6 +23,30 @@ import org.junit.Test
  * [consoleFollowUp] are pure.
  */
 class WorkoutEndTest {
+    private fun reading(
+        seq: Long,
+        speed: Double?,
+        distance: Double? = 1.0,
+        workoutEpoch: Long? = 1L,
+        reportedMotion: Boolean = true,
+    ) = MachineLink.Observation(
+        seq = seq,
+        atMs = seq * 500L,
+        speedMph = speed,
+        distanceMiles = distance,
+        workoutEpoch = workoutEpoch,
+        reportedMotionInWorkout = reportedMotion,
+    )
+
+    private fun mayFlatten(
+        speed: Double?,
+        seenMotion: Boolean,
+        fromDistance: Double? = 1.0,
+        toDistance: Double? = fromDistance,
+    ) = mayFlattenDeck(
+        reading(10, speed = 0.0, distance = fromDistance, reportedMotion = seenMotion),
+        reading(11, speed = speed, distance = toDistance, reportedMotion = seenMotion),
+    )
 
     /** The feature, stated directly: End is the one transition that settles the machine. */
     @Test
@@ -199,15 +223,15 @@ class WorkoutEndTest {
      */
     @Test
     fun `a stopped belt on a console that reports motion may have its deck flattened`() {
-        assertTrue(mayFlattenDeck(0.0, everReportedMotion = true))
+        assertTrue(mayFlatten(0.0, seenMotion = true))
         // Rounding noise around a stop is still a stop.
-        assertTrue(mayFlattenDeck(0.05, everReportedMotion = true))
+        assertTrue(mayFlatten(0.05, seenMotion = true))
     }
 
     @Test
     fun `a moving belt keeps its deck`() {
-        assertFalse(mayFlattenDeck(0.5, everReportedMotion = true))
-        assertFalse(mayFlattenDeck(6.0, everReportedMotion = true))
+        assertFalse(mayFlatten(0.5, seenMotion = true))
+        assertFalse(mayFlatten(6.0, seenMotion = true))
     }
 
     /**
@@ -220,8 +244,9 @@ class WorkoutEndTest {
      */
     @Test
     fun `an unreadable belt keeps its deck`() {
-        assertFalse("null speed is not permission to move anything", mayFlattenDeck(null, true))
-        assertFalse(mayFlattenDeck(null, false))
+        assertFalse("null speed is not permission to move anything", mayFlatten(null, true))
+        assertFalse(mayFlatten(null, false))
+        assertFalse(mayFlatten(0.0, true, fromDistance = null, toDistance = null))
     }
 
     /**
@@ -240,13 +265,79 @@ class WorkoutEndTest {
     fun `a console that has never reported motion is never believed when it reports zero`() {
         assertFalse(
             "a stuck-at-zero speed register must not license moving the deck (#34)",
-            mayFlattenDeck(0.0, everReportedMotion = false),
+            mayFlatten(0.0, seenMotion = false),
         )
-        assertFalse(mayFlattenDeck(0.05, everReportedMotion = false))
+        assertFalse(mayFlatten(0.05, seenMotion = false))
     }
 
     /**
-     * The two conditions are an AND, and neither one alone is enough.
+     * **Issue #46.** Motion once and then a dead speed register does not move the deck when distance
+     * reveals that the belt kept travelling.
+     */
+    @Test
+    fun `distance advancing vetoes a lying zero after reported motion`() {
+        assertFalse(
+            mayFlatten(
+                speed = 0.0,
+                seenMotion = true,
+                fromDistance = 1.20,
+                toDistance = 1.21,
+            ),
+        )
+    }
+
+    /**
+     * An unchanged distance is neutral, never a second vote for rest.
+     *
+     * This models a coarse register that has not reached its next quantum. It cannot overrule a
+     * moving speed reading, and it cannot make a zero credible when this workout never reported
+     * motion. When the independent speed conditions do establish rest, the unchanged distance does
+     * not veto them.
+     */
+    @Test
+    fun `quantized non-advancing distance never grants a rest conclusion`() {
+        assertFalse(mayFlatten(speed = 4.0, seenMotion = true, fromDistance = 1.20, toDistance = 1.20))
+        assertFalse(mayFlatten(speed = 0.0, seenMotion = false, fromDistance = 1.20, toDistance = 1.20))
+        assertTrue(mayFlatten(speed = 0.0, seenMotion = true, fromDistance = 1.20, toDistance = 1.20))
+    }
+
+    /** Motion from a completed workout cannot vouch for a zero reported by the next one. */
+    @Test
+    fun `motion credibility is reset between workouts`() {
+        val tracker = WorkoutMotionTracker()
+        val first = tracker.observe("workout-1", "WORKOUT", 4.0)
+        assertTrue(first.reportedMotion)
+        // The explicit boundary covers FTMS, whose synthetic workout id is constant and whose IDLE
+        // poll may be dropped between sessions.
+        tracker.reset()
+        val second = tracker.observe("workout-1", "WORKOUT", 0.0)
+        assertFalse(second.reportedMotion)
+        assertFalse(
+            mayFlattenDeck(
+                reading(10, 0.0, workoutEpoch = second.epoch, reportedMotion = second.reportedMotion),
+                reading(11, 0.0, workoutEpoch = second.epoch, reportedMotion = second.reportedMotion),
+            ),
+        )
+    }
+
+    /** A stale sample, or one from a replacement workout, cannot authorize a physical movement. */
+    @Test
+    fun `flattening needs a newer observation from the same workout`() {
+        val before = reading(10, 0.0, workoutEpoch = 1L)
+        assertFalse(mayFlattenDeck(before, before))
+        assertFalse(mayFlattenDeck(before, reading(11, 0.0, workoutEpoch = 2L)))
+    }
+
+    /** Normal deceleration is outside the distance window and therefore does not veto a later rest. */
+    @Test
+    fun `distance covered while stopping does not veto two later rest readings`() {
+        val firstRest = reading(11, 0.0, distance = 1.25)
+        val secondRest = reading(12, 0.0, distance = 1.25)
+        assertTrue(mayFlattenDeck(firstRest, secondRest))
+    }
+
+    /**
+     * The speed and workout conditions are an AND, and neither one alone is enough.
      *
      * Pinned as a table because the failure that matters is a future refactor keeping one half.
      */
@@ -264,7 +355,7 @@ class WorkoutEndTest {
             assertEquals(
                 "speed=$speed everReportedMotion=$seenMotion",
                 expected,
-                mayFlattenDeck(speed, seenMotion),
+                mayFlatten(speed, seenMotion),
             )
         }
     }

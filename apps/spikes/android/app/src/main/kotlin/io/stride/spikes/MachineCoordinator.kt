@@ -124,6 +124,9 @@ object MachineCoordinator {
      */
     private const val STOP_CONFIRM_SAMPLE_MS = 200L
 
+    /** One fast-poll interval plus scheduling slack between two claimed-at-rest deck samples. */
+    private const val DECK_RECHECK_MS = 700L
+
     /** Pause after a clearing stop, so the console's state read reflects it. */
     private const val CLEAR_SETTLE_MS = 300L
 
@@ -369,6 +372,7 @@ object MachineCoordinator {
         // spend that time putting a finished session to bed while a rider stands on the belt
         // waiting for "Starting…" to become a workout.
         endGeneration.incrementAndGet()
+        MachineLink.beginWorkoutEvidence()
         submit("Start workout", onDone = onDone) {
             val gen = generation.get()
             // Connect first, always. It is cheap on a console that is already attached — it just
@@ -874,22 +878,41 @@ object MachineCoordinator {
             // deck movement belongs to a session that is over — moving it anyway would be this
             // job's writes outliving the generation that authorised them.
             if (generation.get() != gen || endGeneration.get() != end) return@submit Outcome.Superseded
-            val observed = MachineLink.speedMph
-            if (!mayFlattenDeck(observed, MachineLink.everReportedMotion)) {
+            val atRest = MachineLink.observation()
+            if (!mayBeginFlattenCheck(atRest)) {
                 Log.i(
                     TAG,
-                    "belt not observably at rest (speed=$observed, " +
-                        "everReportedMotion=${MachineLink.everReportedMotion}); " +
+                    "belt not observably at rest after the zero re-assert (observed=$atRest); " +
                         "leaving the deck where it is",
                 )
                 return@submit speed.toOutcome()
             }
-            // Flat is the state a rider steps off onto, and it is the same state a workout is
-            // started in — a run should not end leaving the deck wherever the last hill put it.
-            //
-            // Clamped, so a machine whose reported grade range excludes zero gets as flat as it
-            // goes rather than a value it would refuse.
-            commands.setInclinePercent(clampIncline(0.0)).toOutcome()
+            // The second sample is its own queued job rather than a sleep in this one, so the fan
+            // shutdown already waiting behind us is not delayed by a deck movement that may never
+            // be authorised.
+            submit(
+                "Flatten deck after rest recheck",
+                delayMs = DECK_RECHECK_MS,
+                endGen = end,
+                reportsOutcome = false,
+            ) { laterCommands ->
+                val observed = MachineLink.observation()
+                if (!mayFlattenDeck(atRest, observed)) {
+                    Log.i(
+                        TAG,
+                        "belt did not remain observably at rest (before=$atRest, observed=$observed); " +
+                            "leaving the deck where it is",
+                    )
+                    return@submit speed.toOutcome()
+                }
+                // Flat is the state a rider steps off onto, and it is the same state a workout is
+                // started in — a run should not end leaving the deck wherever the last hill put it.
+                //
+                // Clamped, so a machine whose reported grade range excludes zero gets as flat as it
+                // goes rather than a value it would refuse.
+                laterCommands.setInclinePercent(clampIncline(0.0)).toOutcome()
+            }
+            speed.toOutcome()
         }
     }
 
@@ -1337,22 +1360,23 @@ internal fun shouldEscalate(
  *   value is zero" from "I do not have this value", so the two are identical on the wire by
  *   construction.
  *
- * So the reading alone is not the question. [everReportedMotion] asks whether this console's speed
- * register has *ever* said anything but zero on this link; until it has, a zero from it is
- * indistinguishable from a register stuck at zero and is worth nothing. See
- * [MachineLink.everReportedMotion].
+ * So the reading alone is not the question. [MachineLink.Observation.reportedMotionInWorkout] asks
+ * whether this console's speed register said anything but zero in the workout being ended; until it
+ * has, a zero from it is indistinguishable from a register stuck at zero and is worth nothing.
+ * Binding that evidence to the workout matters: motion reported during yesterday's workout cannot
+ * vouch for a register that has gone dead during this one.
  *
  * The obvious next avenue, if a real motion signal is wanted on such a console: `Rpm` is field 5
  * and **read-only** on FitPro1, which makes it a machine measurement rather than a setpoint, so it
  * may carry roller or motor movement where field 16 is dead. Nobody has checked whether the X22i
  * populates it, so nothing here builds on it — but that is where to look.
  *
- * Corroborating against `CURRENT_DISTANCE` failing to advance would work too, and issue #39's
- * [stopVerdict] now does exactly that for the stronger question of whether a *stop* is confirmed —
- * but only in the one direction that is safe under an unmeasured quantum: distance advancing may
- * refuse a confirmation, distance standing still may never grant one. The same veto would tighten
- * this gate and has deliberately been left off it, so that #39 could not change #36's behaviour on
- * the way past. Either would let this be strengthened. It must not be weakened.
+ * `CURRENT_DISTANCE` supplies a second, deliberately asymmetric check across two readings that both
+ * claim the belt is at rest. Starting the window before deceleration would veto every successful
+ * stop merely because stopping covers ground. An increase in the at-rest window is monotone positive
+ * evidence of travel, so it vetoes the movement even when speed claims zero. No increase grants
+ * nothing: a quantized register can remain unchanged for seconds while a belt moves. The speed
+ * evidence above remains independently mandatory.
  *
  * **Null is not permission.** [MachineLink.speedMph] is null when the snapshot is stale or the
  * machine could not be asked, and "we cannot see the belt" has to mean "do not move anything",
@@ -1360,5 +1384,24 @@ internal fun shouldEscalate(
  * moving a treadmill. The cost of being wrong in this direction is a deck left on a hill, which is
  * exactly where it sat before any of this existed.
  */
-internal fun mayFlattenDeck(observedSpeedMph: Double?, everReportedMotion: Boolean): Boolean =
-    everReportedMotion && observedSpeedMph != null && observedSpeedMph <= BELT_MOVING_MPH
+internal fun mayFlattenDeck(
+    firstAtRest: MachineLink.Observation?,
+    observed: MachineLink.Observation?,
+): Boolean {
+    if (!mayBeginFlattenCheck(firstAtRest) || !mayBeginFlattenCheck(observed)) return false
+    checkNotNull(firstAtRest)
+    checkNotNull(observed)
+    if (observed.seq <= firstAtRest.seq) return false
+    if (observed.workoutEpoch != firstAtRest.workoutEpoch) return false
+    val from = firstAtRest.distanceMiles ?: return false
+    val to = observed.distanceMiles ?: return false
+    if (to - from > DISTANCE_STILL_MILES) return false
+    return true
+}
+
+/** Conditions each observation must satisfy independently; distance is deliberately absent. */
+private fun mayBeginFlattenCheck(observed: MachineLink.Observation?): Boolean =
+    observed?.workoutEpoch != null &&
+        observed.reportedMotionInWorkout &&
+        observed.speedMph != null &&
+        observed.speedMph <= BELT_MOVING_MPH

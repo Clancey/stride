@@ -459,10 +459,14 @@ about whether field 16 works. And **there is no per-field validity marker** — 
 checks only command status and total length, then consumes raw bytes in field order, so "the value
 is zero" and "I do not have this value" are the same bytes.
 
-The gate therefore also requires that this console has, at some point on this link, reported a
-speed above the moving threshold at all. Until it has, its zero is indistinguishable from a
-register stuck at zero and is treated as worth nothing. On an X22i exhibiting #34 the deck is never
-flattened, which is exactly where it sat before any of this existed.
+The gate therefore also requires that this console has reported a speed above the moving threshold
+in the workout being ended. Evidence from an earlier workout cannot vouch for a register that has
+since gone dead. It then requires two newer, same-workout observations that both claim rest and
+compares their distance. Starting that window only after the belt claims rest avoids treating normal
+deceleration as continued motion. An increase vetoes flattening even when speed claims zero. Missing
+or unchanged distance grants nothing — a quantized distance register can remain unchanged while the
+belt moves — so the independent speed conditions remain mandatory. On an X22i exhibiting #34 the
+deck is never flattened, which is exactly where it sat before any of this existed.
 
 `Rpm` (field 5) is the obvious next avenue for a real motion signal on such a console: it is
 **read-only**, so it is a machine measurement rather than a setpoint, and it may carry roller or

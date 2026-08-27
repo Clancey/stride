@@ -35,6 +35,55 @@ import android.util.Log
  * watchdog in plan section 3.1; here it only governs what is displayed, since nothing can be
  * commanded yet.
  */
+internal data class WorkoutMotionEvidence(
+    val epoch: Long?,
+    val reportedMotion: Boolean,
+)
+
+/**
+ * Binds the speed register's credibility to one workout rather than to the life of a link.
+ *
+ * GlassOS and the direct transport provide distinct workout ids. FTMS only provides a presence
+ * marker, so its epoch turns over after a positively observed idle state. PAUSED and RESULTS keep
+ * the current epoch: those are still the workout whose end-of-workout tidy-up may be running.
+ */
+internal class WorkoutMotionTracker {
+    private var nextEpoch = 0L
+    private var epoch: Long? = null
+    private var sourceId: String? = null
+    private var reportedMotion = false
+
+    @Synchronized
+    fun observe(workoutId: String?, consoleState: String?, speedMph: Double?): WorkoutMotionEvidence {
+        if (!workoutId.isNullOrEmpty()) {
+            if (epoch == null || (sourceId != null && sourceId != workoutId)) {
+                nextEpoch += 1
+                epoch = nextEpoch
+                reportedMotion = false
+            }
+            sourceId = workoutId
+        } else if (consoleState in NO_WORKOUT_STATES) {
+            epoch = null
+            sourceId = null
+            reportedMotion = false
+        }
+        if (epoch != null && (speedMph ?: 0.0) > BELT_MOVING_MPH) reportedMotion = true
+        return WorkoutMotionEvidence(epoch, reportedMotion)
+    }
+
+    @Synchronized
+    fun reset() {
+        epoch = null
+        sourceId = null
+        reportedMotion = false
+    }
+
+    private companion object {
+        val NO_WORKOUT_STATES =
+            setOf("DISCONNECTED", "IDLE", "SAFETY_KEY_REMOVED", "LOCKED", "SLEEP", "DEMO", "ERROR")
+    }
+}
+
 object MachineLink {
 
     /** What to draw when a reading is unknown. Never substitute a zero, and never a bare dash. */
@@ -352,9 +401,14 @@ object MachineLink {
         val atMs: Long,
         val speedMph: Double?,
         val distanceMiles: Double?,
+        /** The workout this poll belongs to, distinct from every completed workout on this link. */
+        val workoutEpoch: Long?,
+        /** Whether this workout, not merely this link, has produced a credible motion reading. */
+        val reportedMotionInWorkout: Boolean,
     )
 
     @Volatile private var latestObservation: Observation? = null
+    private val workoutMotion = WorkoutMotionTracker()
 
     /**
      * How many polls have succeeded on this link.
@@ -378,6 +432,17 @@ object MachineLink {
      */
     fun observation(): Observation? =
         latestObservation?.takeIf { System.currentTimeMillis() - it.atMs <= FRESHNESS_MS }
+
+    /**
+     * Starts a new workout's credibility window.
+     *
+     * Usually the transport's workout id turns the epoch over. FTMS has only a constant presence
+     * marker, though, so a dropped IDLE poll could otherwise carry motion evidence into the next
+     * workout. The app's own start boundary is positive lifecycle evidence and closes that gap.
+     */
+    fun beginWorkoutEvidence() {
+        workoutMotion.reset()
+    }
 
     /**
      * Whether this machine has ever, on this link, reported a speed that means the belt is moving.
@@ -1258,6 +1323,7 @@ object MachineLink {
         // would make a fresh reading on the new transport compare as older than a stop issued on
         // the previous one.
         latestObservation = null
+        workoutMotion.reset()
         // A different machine has to earn the benefit of the doubt again. Carrying this across a
         // transport swap would let an honest console vouch for the register of the one that
         // replaced it.
@@ -1322,14 +1388,22 @@ object MachineLink {
                 snapshot = read
                 val at = System.currentTimeMillis()
                 snapshotAt = at
+                val motion = workoutMotion.observe(read.workoutId, read.consoleState, read.speedMph)
+                if ((read.speedMph ?: 0.0) > BELT_MOVING_MPH) everReportedMotion = true
                 // Published as one object, after the snapshot, so a stop confirmation gets a speed
                 // and a distance that came off the same poll. See Observation.
                 readingSeq += 1
-                latestObservation = Observation(readingSeq, at, read.speedMph, read.distanceMiles)
+                latestObservation = Observation(
+                    readingSeq,
+                    at,
+                    read.speedMph,
+                    read.distanceMiles,
+                    motion.epoch,
+                    motion.reportedMotion,
+                )
                 // Latched, never cleared by a later zero. The question this answers is not "is the
                 // belt moving now" — that is what the snapshot is for — but "does this console's
                 // speed register ever say anything but zero". See everReportedMotion and issue #34.
-                if ((read.speedMph ?: 0.0) > BELT_MOVING_MPH) everReportedMotion = true
                 // Positive evidence only, and latched: see [fanSeen]. Either answer proves a fan
                 // exists, and neither can be un-proved by a poll that failed to reach the console.
                 if (read.fanWritable == true || read.fanState != null) fanSeen = true
