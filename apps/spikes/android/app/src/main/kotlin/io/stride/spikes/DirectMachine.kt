@@ -537,12 +537,12 @@ class DirectMachineSession(
      *
      * ## Where this is deliberately stricter than iFit
      *
-     * Two places, both chosen rather than copied:
+     * Three places, all chosen rather than copied:
      *
      * - **The gate write is awaited.** `InitializeConsole` does not await either setter and does not
      *   abort if one fails; both are fired and initialization continues regardless. Waiting for the
-     *   arming write means every way this sequence can fail leaves the console *more* gated than it
-     *   started, never less, which is worth one round-trip on a machine with a belt.
+     *   arming write excludes the unsafe ordering where the lockout clears before the gate is armed,
+     *   which is worth one round-trip on a machine with a belt.
      * - **The outcome is propagated.** iFit discards it. Here it becomes [StartGate], reaches
      *   [ConnectResult], and makes [authorisedWrite] refuse control — because a console whose gate
      *   state is unknown is not one to send speed or mode commands to. That is the same discipline
