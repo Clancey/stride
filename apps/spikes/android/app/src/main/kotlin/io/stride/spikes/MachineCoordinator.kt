@@ -830,8 +830,8 @@ object MachineCoordinator {
     val lastFanState: Int? get() = acceptedFanState?.state
 
     /**
-     * When [lastFanState] was accepted, on `System.currentTimeMillis` — the same clock
-     * [MachineLink.fanStateAt] reports, because the two are only ever used by comparing them.
+     * When [lastFanState] was accepted, on `System.currentTimeMillis` — the same clock carried by
+     * [MachineLink.FanTelemetry], because the two are only ever used by comparing them.
      */
     val lastFanStateAt: Long get() = acceptedFanState?.acceptedAt ?: 0L
 

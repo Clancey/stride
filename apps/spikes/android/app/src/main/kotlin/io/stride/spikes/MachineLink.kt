@@ -328,8 +328,13 @@ object MachineLink {
      */
     const val MPS_TO_MPH = 2.2369362920544
 
-    @Volatile private var snapshot: GlassOsClient.Snapshot? = null
-    @Volatile private var snapshotAt: Long = 0L
+    private data class TimedSnapshot(
+        val value: GlassOsClient.Snapshot,
+        val at: Long,
+    )
+
+    // Keep the poll value and its time in one volatile publication; fan ordering depends on the pair.
+    @Volatile private var timedSnapshot: TimedSnapshot? = null
     @Volatile private var client: GlassOsClient? = null
 
     /**
@@ -342,7 +347,7 @@ object MachineLink {
      * mismatched pair there is not a cosmetic race.
      *
      * [seq] is what ties a reading to a moment. It is a count of polls, deliberately not a
-     * timestamp: [snapshotAt] is wall-clock, and an NTP correction or a timezone change mid-run
+     * timestamp: [TimedSnapshot.at] is wall-clock, and an NTP correction or a timezone change mid-run
      * must never be able to make a reading taken *before* a stop look like one taken after it.
      */
     data class Observation(
@@ -510,11 +515,13 @@ object MachineLink {
     private var connectHandler: Handler? = null
 
     /** Null unless we hold a snapshot that is still fresh. Every reading below goes through this. */
-    private fun fresh(): GlassOsClient.Snapshot? {
-        val s = snapshot ?: return null
-        if (System.currentTimeMillis() - snapshotAt > FRESHNESS_MS) return null
-        return s
+    private fun freshTimed(): TimedSnapshot? {
+        val timed = timedSnapshot ?: return null
+        if (System.currentTimeMillis() - timed.at > FRESHNESS_MS) return null
+        return timed
     }
+
+    private fun fresh(): GlassOsClient.Snapshot? = freshTimed()?.value
 
     val status: Status
         get() = if (fresh() != null && !consoleDetached) Status.LINKED else Status.DISCONNECTED
@@ -683,16 +690,19 @@ object MachineLink {
      * only the last state a write acknowledgement supports and can be wrong the instant the rider
      * touches the console's own fan button, which nothing in Stride ever hears about.
      */
-    val fanState: Int? get() = fresh()?.fanState
+    val fanState: Int? get() = fanTelemetry()?.state
 
     /**
-     * When the snapshot behind [fanState] was taken, on the same clock as [MachineCoordinator]
-     * stamps a request. Zero when there has never been one.
+     * One poll's fan state and timestamp, published and consumed as one immutable value.
      *
-     * Exposed because "which of these two is newer" is the whole question the readout answers, and
-     * a comparison against a timestamp the caller cannot see is not a comparison anyone can check.
+     * Keeping these together is load-bearing: pairing an old state with a new timestamp can make
+     * stale telemetry incorrectly outrank a pending request, while the opposite pairing can hide a
+     * current machine reading.
      */
-    val fanStateAt: Long get() = snapshotAt
+    internal data class FanTelemetry(val state: Int?, val at: Long)
+
+    internal fun fanTelemetry(): FanTelemetry? =
+        freshTimed()?.let { FanTelemetry(it.value.fanState, it.at) }
 
     const val FAN_MAX: Int = 3
 
@@ -769,17 +779,34 @@ object MachineLink {
         return if (knownPresent) FanReadout.Unknown else FanReadout.Absent
     }
 
-    fun fanReadout(): FanReadout {
-        val requested = MachineCoordinator.fanRequestSnapshot()
-        return fanReadout(
-            reported = fanState,
-            reportedAt = fanStateAt,
+    internal fun fanReadout(
+        telemetry: FanTelemetry?,
+        requested: MachineCoordinator.FanRequestSnapshot?,
+        knownPresent: Boolean,
+    ): FanReadout =
+        fanReadout(
+            reported = telemetry?.state,
+            reportedAt = telemetry?.at ?: 0L,
             requested = requested?.state,
             requestedAt = requested?.at ?: 0L,
             requestPending = requested?.pending == true,
-            knownPresent = fanKnownPresent(),
+            knownPresent = knownPresent,
         )
+
+    fun fanReadout(): FanReadout =
+        fanReadout(fanTelemetry(), MachineCoordinator.fanRequestSnapshot(), fanKnownPresent())
+
+    /**
+     * Which state a fan picker should highlight, using the exact same evidence ordering as
+     * [fanReadout]. A pending request may outrank an older poll; an accepted write never does.
+     */
+    internal fun fanSelection(readout: FanReadout): Int? = when (readout) {
+        is FanReadout.Measured -> readout.state
+        is FanReadout.Requested -> readout.state
+        FanReadout.Absent, FanReadout.Unknown -> null
     }
+
+    fun fanSelection(): Int? = fanSelection(fanReadout())
 
     /** What is known about the fan, and how well. See [fanReadout]. */
     sealed class FanReadout {
@@ -1263,8 +1290,7 @@ object MachineLink {
         // call it started before the rider switched away. See GlassOsClient.close.
         client?.let { runCatching { it.close() } }
         client = null
-        snapshot = null
-        snapshotAt = 0L
+        timedSnapshot = null
         // Cleared with the snapshot, for the same reason: a reading belongs to the machine that
         // produced it. [readingSeq] is deliberately *not* reset — it is a monotonic ordering used
         // to tell a reading taken before a stop from one taken after it, and restarting the count
@@ -1332,9 +1358,8 @@ object MachineLink {
                 null
             }
             if (read != null) {
-                snapshot = read
                 val at = System.currentTimeMillis()
-                snapshotAt = at
+                timedSnapshot = TimedSnapshot(read, at)
                 // Published as one object, after the snapshot, so a stop confirmation gets a speed
                 // and a distance that came off the same poll. See Observation.
                 readingSeq += 1

@@ -147,6 +147,58 @@ class FanReadoutTest {
         )
     }
 
+    @Test
+    fun `fan picker highlights a pending request over older telemetry`() {
+        val readout = readout(
+            reported = GlassOsCommands.FAN_LOW,
+            reportedAt = 100L,
+            requested = GlassOsCommands.FAN_HIGH,
+            requestedAt = 200L,
+            requestPending = true,
+        )
+
+        assertEquals(GlassOsCommands.FAN_HIGH, MachineLink.fanSelection(readout))
+    }
+
+    @Test
+    fun `fan picker highlights telemetry over an accepted write`() {
+        val readout = readout(
+            reported = GlassOsCommands.FAN_LOW,
+            reportedAt = 100L,
+            requested = GlassOsCommands.FAN_HIGH,
+            requestedAt = 200L,
+            requestPending = false,
+        )
+
+        assertEquals(GlassOsCommands.FAN_LOW, MachineLink.fanSelection(readout))
+    }
+
+    @Test
+    fun `timed fan telemetry stays paired across pending request ordering`() {
+        val pending = MachineCoordinator.FanRequestSnapshot(
+            state = GlassOsCommands.FAN_HIGH,
+            at = 200L,
+            pending = true,
+        )
+
+        assertEquals(
+            MachineLink.FanReadout.Requested(GlassOsCommands.FAN_HIGH),
+            MachineLink.fanReadout(
+                MachineLink.FanTelemetry(GlassOsCommands.FAN_LOW, 100L),
+                pending,
+                knownPresent = true,
+            ),
+        )
+        assertEquals(
+            MachineLink.FanReadout.Measured(GlassOsCommands.FAN_LOW),
+            MachineLink.fanReadout(
+                MachineLink.FanTelemetry(GlassOsCommands.FAN_LOW, 300L),
+                pending,
+                knownPresent = true,
+            ),
+        )
+    }
+
     /**
      * A treadmill with no fan gets no fan cell at all — not one reading "Off", and not one reading
      * "Not measured" for the life of the machine.
