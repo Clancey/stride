@@ -291,7 +291,22 @@ class GlassOsClient(private val context: Context) {
     data class Snapshot(
         val consoleState: String?,
         val workoutId: String?,
+        /**
+         * Speed reported as a machine observation.
+         *
+         * Safety code reads this field. A commanded target must never be substituted here: an ack
+         * says what the console accepted, not what the belt did.
+         */
         val speedMph: Double?,
+        /**
+         * Speed suitable for the rider-facing metric, which normally equals [speedMph].
+         *
+         * FitPro belt consoles are the exception. Some, including the X22i in issue #34, return a
+         * well-formed zero for `ACTUAL_KPH` while moving. The direct client follows iFit's own
+         * belt-machine display rule until that register proves itself, while leaving [speedMph]
+         * untouched for observations and stop confirmation.
+         */
+        val displaySpeedMph: Double? = speedMph,
         val inclinePercent: Double?,
         val distanceMiles: Double?,
         val paceMinPerMile: Double?,

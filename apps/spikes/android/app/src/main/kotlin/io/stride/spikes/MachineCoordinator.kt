@@ -405,8 +405,9 @@ object MachineCoordinator {
                 reads++
             }
 
-            val moving = (MachineLink.speedMph ?: 0.0) > BELT_MOVING_MPH
-            if (shouldAdoptWorkout(state, MachineLink.speedMph)) {
+            val observedSpeed = MachineLink.observedSpeedMph
+            val moving = (observedSpeed ?: 0.0) > BELT_MOVING_MPH
+            if (shouldAdoptWorkout(state, observedSpeed)) {
                 Log.i(TAG, "console already running with the belt moving; adopting the existing workout")
                 return@submit Outcome.Ok
             }
@@ -724,7 +725,7 @@ object MachineCoordinator {
         // belt keeps accelerating after the rider has asked it not to. The generation is bumped
         // before anything is queued so the new jobs carry the new value.
         val gen = speedGeneration.incrementAndGet()
-        val current = MachineLink.speedMph
+        val current = MachineLink.observedSpeedMph
         if (current == null || target <= current || target - current <= MAX_STEP_UP_MPH) {
             submit(label = "Speed ${format(target)} mph", speedGen = gen, onDone = onDone) {
                 it.setSpeedKph(target * MPH_TO_KPH).toOutcome()
@@ -874,7 +875,7 @@ object MachineCoordinator {
             // deck movement belongs to a session that is over — moving it anyway would be this
             // job's writes outliving the generation that authorised them.
             if (generation.get() != gen || endGeneration.get() != end) return@submit Outcome.Superseded
-            val observed = MachineLink.speedMph
+            val observed = MachineLink.observedSpeedMph
             if (!mayFlattenDeck(observed, MachineLink.everReportedMotion)) {
                 Log.i(
                     TAG,
@@ -1110,7 +1111,7 @@ private const val DISTANCE_STILL_MILES = 1e-6
  * @param beforeStop the observation current when the stop was queued, or null if nothing was fresh.
  *   It may **complete** the pair of agreeing readings below; it may never be the whole of it.
  * @param postStop every observation taken *after* the stop was queued, oldest first. Readings from
- *   before it are not evidence about it and must never appear here — [MachineLink.speedMph] is
+ *   before it are not evidence about it and must never appear here — [MachineLink.observedSpeedMph] is
  *   believed for four seconds, so a reading taken before a stop is still "fresh" after it.
  *
  * ## Four conditions, all required
@@ -1342,10 +1343,9 @@ internal fun shouldEscalate(
  * indistinguishable from a register stuck at zero and is worth nothing. See
  * [MachineLink.everReportedMotion].
  *
- * The obvious next avenue, if a real motion signal is wanted on such a console: `Rpm` is field 5
- * and **read-only** on FitPro1, which makes it a machine measurement rather than a setpoint, so it
- * may carry roller or motor movement where field 16 is dead. Nobody has checked whether the X22i
- * populates it, so nothing here builds on it — but that is where to look.
+ * `Rpm` is field 5 and read-only on FitPro1, but the X22i reports it unsupported. A future real
+ * motion signal on this console therefore has to come from another measured register rather than
+ * from the commanded speed.
  *
  * Corroborating against `CURRENT_DISTANCE` failing to advance would work too, and issue #39's
  * [stopVerdict] now does exactly that for the stronger question of whether a *stop* is confirmed —
@@ -1354,7 +1354,7 @@ internal fun shouldEscalate(
  * this gate and has deliberately been left off it, so that #39 could not change #36's behaviour on
  * the way past. Either would let this be strengthened. It must not be weakened.
  *
- * **Null is not permission.** [MachineLink.speedMph] is null when the snapshot is stale or the
+ * **Null is not permission.** [MachineLink.observedSpeedMph] is null when the snapshot is stale or the
  * machine could not be asked, and "we cannot see the belt" has to mean "do not move anything",
  * matching the rule the start path already holds itself to: probably-stopped is not a basis for
  * moving a treadmill. The cost of being wrong in this direction is a deck left on a hill, which is
