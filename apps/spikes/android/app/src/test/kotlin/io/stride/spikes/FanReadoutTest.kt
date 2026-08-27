@@ -25,8 +25,16 @@ class FanReadoutTest {
         reportedAt: Long = 0L,
         requested: Int? = null,
         requestedAt: Long = 0L,
+        requestPending: Boolean = true,
         knownPresent: Boolean = true,
-    ) = MachineLink.fanReadout(reported, reportedAt, requested, requestedAt, knownPresent)
+    ) = MachineLink.fanReadout(
+        reported,
+        reportedAt,
+        requested,
+        requestedAt,
+        requestPending,
+        knownPresent,
+    )
 
     /** The plain case: the machine answered, so the answer is drawn as the reading it is. */
     @Test
@@ -109,6 +117,32 @@ class FanReadoutTest {
                 reportedAt = 100L,
                 requested = GlassOsCommands.FAN_HIGH,
                 requestedAt = 200L,
+            ),
+        )
+    }
+
+    @Test
+    fun `accepted fan state never overrides available telemetry`() {
+        assertEquals(
+            MachineLink.FanReadout.Measured(GlassOsCommands.FAN_LOW),
+            readout(
+                reported = GlassOsCommands.FAN_LOW,
+                reportedAt = 100L,
+                requested = GlassOsCommands.FAN_HIGH,
+                requestedAt = 200L,
+                requestPending = false,
+            ),
+        )
+    }
+
+    @Test
+    fun `accepted fan state remains useful when telemetry is unavailable`() {
+        assertEquals(
+            MachineLink.FanReadout.Requested(GlassOsCommands.FAN_HIGH),
+            readout(
+                requested = GlassOsCommands.FAN_HIGH,
+                requestedAt = 200L,
+                requestPending = false,
             ),
         )
     }

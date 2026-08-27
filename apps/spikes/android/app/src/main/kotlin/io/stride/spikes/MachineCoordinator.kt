@@ -162,10 +162,15 @@ object MachineCoordinator {
 
     private const val FAN_OFF_LABEL = "Fan off (workout ended)"
 
+    private data class FanAdmission(
+        val generation: Int,
+        val transport: MachineCommands?,
+    )
+
     private data class FanRequest(
         val state: Int,
         val requestedAt: Long,
-        val generation: Int,
+        val admission: FanAdmission,
     )
 
     private data class AcceptedFanState(
@@ -176,6 +181,13 @@ object MachineCoordinator {
     internal data class FanRequestSnapshot(
         val state: Int,
         val at: Long,
+        val pending: Boolean,
+    )
+
+    class FanRestoreToken internal constructor(
+        internal val generation: Int,
+        internal val endGeneration: Int,
+        internal val transport: MachineCommands?,
     )
 
     private data class Job(
@@ -381,14 +393,20 @@ object MachineCoordinator {
      * encodes a related discovery — GlassOS only publishes telemetry *during* a workout, so
      * adopting a live one is how metrics start flowing at all.
      */
-    fun startWorkout(onDone: ((Outcome) -> Unit)? = null) {
+    fun startWorkout(onDone: ((Outcome, FanRestoreToken) -> Unit)? = null) {
         // A new workout retires the previous one's tidy-up. Those writes are queued ahead of this
         // one and each can block for the console's command timeout; letting them run first would
         // spend that time putting a finished session to bed while a rider stands on the belt
         // waiting for "Starting…" to become a workout.
-        endGeneration.incrementAndGet()
-        submit("Start workout", onDone = onDone) {
-            val gen = generation.get()
+        val token = synchronized(this) {
+            FanRestoreToken(generation.get(), endGeneration.incrementAndGet(), commands)
+        }
+        submit(
+            label = "Start workout",
+            onDone = { outcome -> onDone?.invoke(outcome, token) },
+            jobGeneration = token.generation,
+        ) {
+            val gen = token.generation
             // Connect first, always. It is cheap on a console that is already attached — it just
             // answers with the current state — and it is the difference between working and not on one
             // that is not. A rider pressing Start is the one moment we know they want the machine, so
@@ -571,6 +589,7 @@ object MachineCoordinator {
      * ([GlassOsTelemetry.reading] returns null once no `workoutId` is stamped). Waiting for the ack
      * can mean waiting past the only window in which the deceleration is visible.
      */
+    @Synchronized
     fun stop(onSettled: ((StopVerdict) -> Unit)? = null) {
         val gen = generation.incrementAndGet()
         queue.clear()
@@ -787,13 +806,14 @@ object MachineCoordinator {
      * [lastFanState] advances only after the machine accepts it.
      */
     fun setFan(state: Int) {
-        val request = beginFanRequest(state)
+        val request = beginFanRequest(state, fanAdmission())
         submit(
             label = "Fan ${GlassOsCommands.fanStateName(state)}",
             onDone = { finishFanRequest(request) },
-            jobGeneration = request.generation,
-        ) {
-            acceptFanWrite(request, it.setFanState(state)).toOutcome()
+            jobGeneration = request.admission.generation,
+        ) { commands ->
+            if (commands !== request.admission.transport) return@submit Outcome.Superseded
+            acceptFanWrite(request, commands.setFanState(state)).toOutcome()
         }
     }
 
@@ -830,9 +850,9 @@ object MachineCoordinator {
      */
     internal fun fanRequestSnapshot(): FanRequestSnapshot? {
         val pending = pendingFanRequest
-        if (pending != null) return FanRequestSnapshot(pending.state, pending.requestedAt)
+        if (pending != null) return FanRequestSnapshot(pending.state, pending.requestedAt, pending = true)
         val accepted = acceptedFanState ?: return null
-        return FanRequestSnapshot(accepted.state, accepted.acceptedAt)
+        return FanRequestSnapshot(accepted.state, accepted.acceptedAt, pending = false)
     }
 
     @Volatile
@@ -841,18 +861,29 @@ object MachineCoordinator {
     @Volatile
     private var acceptedFanState: AcceptedFanState? = null
 
-    private fun beginFanRequest(state: Int, requestGeneration: Int = generation.get()): FanRequest =
-        FanRequest(state, System.currentTimeMillis(), requestGeneration).also {
+    @Synchronized
+    private fun fanAdmission(): FanAdmission = FanAdmission(generation.get(), commands)
+
+    @Synchronized
+    private fun beginFanRequest(state: Int, admission: FanAdmission): FanRequest =
+        FanRequest(state, System.currentTimeMillis(), admission).also {
             // A stop/rebind between deciding the request and publishing it has already retired it.
-            if (requestGeneration == generation.get()) pendingFanRequest = it
+            if (admission.generation == generation.get() && admission.transport === commands) {
+                pendingFanRequest = it
+            }
         }
 
     private fun finishFanRequest(request: FanRequest) {
         if (pendingFanRequest === request) pendingFanRequest = null
     }
 
+    @Synchronized
     private fun acceptFanWrite(request: FanRequest, ack: MachineAck): MachineAck {
-        if (ack is MachineAck.Ok && request.generation == generation.get()) {
+        if (
+            ack is MachineAck.Ok &&
+            request.admission.generation == generation.get() &&
+            request.admission.transport === commands
+        ) {
             acceptedFanState = AcceptedFanState(request.state, System.currentTimeMillis())
         }
         return ack
@@ -875,19 +906,30 @@ object MachineCoordinator {
      * once". A machine that refuses is not an error — it is a machine without an automatic fan, and
      * it has just told us so, which is why the refusal is swallowed here and remembered there.
      */
-    fun restoreFan(remembered: Int?) {
-        val gen = generation.get()
-        var request = remembered?.let { beginFanRequest(it, gen) }
+    fun restoreFan(remembered: Int?, token: FanRestoreToken) {
+        val admission = synchronized(this) {
+            if (
+                token.generation != generation.get() ||
+                token.endGeneration != endGeneration.get() ||
+                token.transport !== commands
+            ) {
+                return
+            }
+            FanAdmission(token.generation, token.transport)
+        }
+        var request = remembered?.let { beginFanRequest(it, admission) }
         submit(
             label = "Restore fan",
             onDone = { request?.let(::finishFanRequest) },
-            jobGeneration = gen,
+            endGen = token.endGeneration,
+            jobGeneration = token.generation,
         ) { commands ->
+            if (commands !== admission.transport) return@submit Outcome.Superseded
             val speculative = remembered == null
             val target = remembered
                 ?: if (commands.autoFanSupported() != false) GlassOsCommands.FAN_AUTO else null
                 ?: return@submit Outcome.Ok
-            val activeRequest = request ?: beginFanRequest(target, gen).also { request = it }
+            val activeRequest = request ?: beginFanRequest(target, admission).also { request = it }
             val ack = acceptFanWrite(activeRequest, commands.setFanState(target))
             if (speculative && ack is MachineAck.Refused) Outcome.Ok else ack.toOutcome()
         }
@@ -977,14 +1019,15 @@ object MachineCoordinator {
      */
     fun stopFan() {
         val end = endGeneration.get()
-        val request = beginFanRequest(GlassOsCommands.FAN_OFF)
+        val request = beginFanRequest(GlassOsCommands.FAN_OFF, fanAdmission())
         submit(
             label = FAN_OFF_LABEL,
             onDone = { finishFanRequest(request) },
             endGen = end,
             reportsOutcome = false,
-            jobGeneration = request.generation,
+            jobGeneration = request.admission.generation,
         ) { commands ->
+            if (commands !== request.admission.transport) return@submit Outcome.Superseded
             val ack = acceptFanWrite(request, commands.setFanState(GlassOsCommands.FAN_OFF))
             if (ack is MachineAck.Refused) Outcome.Ok else ack.toOutcome()
         }

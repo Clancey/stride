@@ -127,6 +127,14 @@ class EndOfWorkoutSequenceTest {
         Thread.sleep(250)
     }
 
+    /** Obtain the immutable machine/start identity that authorizes a restore. */
+    private fun fanRestoreToken(): MachineCoordinator.FanRestoreToken {
+        val tokens = java.util.concurrent.ArrayBlockingQueue<MachineCoordinator.FanRestoreToken>(1)
+        MachineCoordinator.startWorkout { _, token -> tokens.add(token) }
+        return tokens.poll(5, TimeUnit.SECONDS)
+            ?: throw AssertionError("start did not return a fan restore token")
+    }
+
     /** Exactly what [WorkoutMachineCoupling] issues for a definitive end, in its order. */
     private fun endWorkout() {
         MachineCoordinator.stop()
@@ -222,7 +230,7 @@ class EndOfWorkoutSequenceTest {
     fun `a refused remembered restore does not become fan state`() {
         console.fanAck = MachineAck.Refused("fan unavailable")
 
-        MachineCoordinator.restoreFan(GlassOsCommands.FAN_MEDIUM)
+        MachineCoordinator.restoreFan(GlassOsCommands.FAN_MEDIUM, fanRestoreToken())
         awaitCalls(1)
         settle()
 
@@ -280,13 +288,36 @@ class EndOfWorkoutSequenceTest {
     }
 
     @Test
+    fun `an old transport acknowledgement cannot become new transport evidence`() {
+        val oldConsole = console
+        val entered = CountDownLatch(1)
+        val release = CountDownLatch(1)
+        oldConsole.fanEntered = entered
+        oldConsole.releaseFan = release
+
+        MachineCoordinator.setFan(GlassOsCommands.FAN_LOW)
+        assertTrue("fan write never reached the old transport", entered.await(5, TimeUnit.SECONDS))
+        console = RecordingConsole()
+        MachineCoordinator.rebind(console)
+        release.countDown()
+
+        val deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(5)
+        while (oldConsole.calls.isEmpty() && System.nanoTime() < deadline) Thread.sleep(5)
+        settle()
+        assertEquals(listOf("fan 1"), oldConsole.calls)
+        assertTrue("the new transport must not receive the old write", console.calls.isEmpty())
+        assertEquals(null, MachineCoordinator.lastFanState)
+        assertEquals(null, MachineCoordinator.lastFanRequest)
+    }
+
+    @Test
     fun `fan off follows a restore already in flight when end wins the race`() {
         val entered = CountDownLatch(1)
         val release = CountDownLatch(1)
         console.fanEntered = entered
         console.releaseFan = release
 
-        MachineCoordinator.restoreFan(GlassOsCommands.FAN_MEDIUM)
+        MachineCoordinator.restoreFan(GlassOsCommands.FAN_MEDIUM, fanRestoreToken())
         assertTrue("restore never reached the transport", entered.await(5, TimeUnit.SECONDS))
         endWorkout()
         assertEquals(GlassOsCommands.FAN_OFF, MachineCoordinator.lastFanRequest)
@@ -297,6 +328,45 @@ class EndOfWorkoutSequenceTest {
         settle()
         assertEquals(listOf("fan 2", "stop", "speed 0.00", "fan 0"), console.calls)
         assertEquals(GlassOsCommands.FAN_OFF, MachineCoordinator.lastFanState)
+    }
+
+    @Test
+    fun `a restore submitted after end cannot turn the fan back on`() {
+        val token = fanRestoreToken()
+
+        endWorkout()
+        MachineCoordinator.restoreFan(GlassOsCommands.FAN_MEDIUM, token)
+
+        awaitCalls(3)
+        settle()
+        assertEquals(listOf("stop", "speed 0.00", "fan 0"), console.calls)
+        assertEquals(GlassOsCommands.FAN_OFF, MachineCoordinator.lastFanState)
+    }
+
+    @Test
+    fun `a newer start retires the previous starts fan restore token`() {
+        val staleToken = fanRestoreToken()
+        fanRestoreToken()
+
+        MachineCoordinator.restoreFan(GlassOsCommands.FAN_MEDIUM, staleToken)
+
+        settle()
+        assertTrue("a stale start must not restore the fan", console.calls.isEmpty())
+        assertEquals(GlassOsCommands.FAN_HIGH, MachineCoordinator.lastFanState)
+    }
+
+    @Test
+    fun `a rebind retires the previous machines fan restore token`() {
+        val staleToken = fanRestoreToken()
+        console = RecordingConsole()
+        MachineCoordinator.rebind(console)
+
+        MachineCoordinator.restoreFan(GlassOsCommands.FAN_MEDIUM, staleToken)
+
+        settle()
+        assertTrue("the new transport must not receive the old restore", console.calls.isEmpty())
+        assertEquals(null, MachineCoordinator.lastFanState)
+        assertEquals(null, MachineCoordinator.lastFanRequest)
     }
 
     /**

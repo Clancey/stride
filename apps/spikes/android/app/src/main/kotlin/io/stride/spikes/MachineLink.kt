@@ -739,6 +739,7 @@ object MachineLink {
         reportedAt: Long,
         requested: Int?,
         requestedAt: Long,
+        requestPending: Boolean = true,
         knownPresent: Boolean,
     ): FanReadout {
         // A request Stride made *after* the last snapshot was taken cannot possibly be in it, so the
@@ -747,13 +748,22 @@ object MachineLink {
         // watches the strip insist on Low for a poll. Shown as a request until a reading taken
         // afterwards either confirms it or contradicts it; no grace timer is needed, because the
         // very next poll settles it either way.
-        if (requested != null && knownPresent && (reported == null || requestedAt > reportedAt)) {
+        if (
+            requestPending &&
+            requested != null &&
+            knownPresent &&
+            (reported == null || requestedAt > reportedAt)
+        ) {
             return FanReadout.Requested(requested)
         }
         // Otherwise the reading wins, even against a disagreeing request. The console's fan button
         // is under the rider's hand and Stride never hears it; the reading is the only thing that
         // ever does.
         if (reported != null) return FanReadout.Measured(reported)
+        // An accepted write is useful evidence when the machine cannot report a state, but unlike a
+        // pending write it never suppresses telemetry: acknowledgement says the command landed, not
+        // that the fan remained there after the rider used the console's own controls.
+        if (requested != null && knownPresent) return FanReadout.Requested(requested)
         // `knownPresent` gates the request, not just the blank. A request can be queued before the
         // machine answers, and intent alone is not evidence that this treadmill has a fan.
         return if (knownPresent) FanReadout.Unknown else FanReadout.Absent
@@ -766,6 +776,7 @@ object MachineLink {
             reportedAt = fanStateAt,
             requested = requested?.state,
             requestedAt = requested?.at ?: 0L,
+            requestPending = requested?.pending == true,
             knownPresent = fanKnownPresent(),
         )
     }
