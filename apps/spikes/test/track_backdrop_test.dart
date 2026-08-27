@@ -42,6 +42,11 @@ void main() {
               return true;
             case 'listApps':
               return <Object?>[];
+            case 'appstoreStatus':
+              return <String, Object?>{
+                'initialization': 'ready',
+                'items': <Object?>[],
+              };
             default:
               return null;
           }
@@ -163,6 +168,12 @@ void main() {
         .setMockMethodCallHandler(_channel, (call) async {
           if (call.method == 'trackFloorGet') {
             throw PlatformException(code: 'unavailable');
+          }
+          if (call.method == 'appstoreStatus') {
+            return <String, Object?>{
+              'initialization': 'ready',
+              'items': <Object?>[],
+            };
           }
           return call.method == 'listApps' ? <Object?>[] : null;
         });

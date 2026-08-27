@@ -4,6 +4,7 @@ import org.junit.After
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNotNull
+import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Test
 
@@ -57,7 +58,7 @@ class AppstoreStateRestoreTest {
     fun `restore surfaces the pending update and the time it was actually found`() {
         val cat = catalog(entry("com.example.app", versionCode = 9))
         val checkedAt = 1_700_000_000_000L
-        val generation = AppstoreState.beginInitialization()
+        val generation = AppstoreState.beginInitialization()!!
 
         AppstoreState.restore(cat, planFor(cat, installedVersion = 8), checkedAt, generation)
 
@@ -70,7 +71,7 @@ class AppstoreStateRestoreTest {
     @Test
     fun `restore does not claim a check just happened`() {
         val cat = catalog(entry("com.example.app", versionCode = 9))
-        val generation = AppstoreState.beginInitialization()
+        val generation = AppstoreState.beginInitialization()!!
         AppstoreState.restore(
             cat,
             planFor(cat, installedVersion = 8),
@@ -90,7 +91,7 @@ class AppstoreStateRestoreTest {
         // because completeCheck stamps SystemClock.elapsedRealtime, which is not available off
         // hardware - the guard being tested is the same one either way.
         val live = catalog(entry("com.example.app", versionCode = 12))
-        val generation = AppstoreState.beginInitialization()
+        val generation = AppstoreState.beginInitialization()!!
         AppstoreState.restore(live, planFor(live, installedVersion = 12), 500L, generation)
 
         val stale = catalog(entry("com.example.app", versionCode = 9))
@@ -104,7 +105,7 @@ class AppstoreStateRestoreTest {
     @Test
     fun `late cached restore cannot overwrite a check that started after it`() {
         val stale = catalog(entry("com.example.app", versionCode = 9))
-        val generation = AppstoreState.beginInitialization()
+        val generation = AppstoreState.beginInitialization()!!
 
         AppstoreState.beginCheck()
         val restored = AppstoreState.restore(
@@ -121,7 +122,7 @@ class AppstoreStateRestoreTest {
 
     @Test
     fun `failed initialization is distinguishable from an empty catalog`() {
-        val generation = AppstoreState.beginInitialization()
+        val generation = AppstoreState.beginInitialization()!!
 
         AppstoreState.failInitialization(generation, "cache corrupt")
         val snapshot = AppstoreState.snapshot()
@@ -134,9 +135,10 @@ class AppstoreStateRestoreTest {
     @Test
     fun `a check that cannot start resolves loading as failed`() {
         AppstoreState.beginInitialization()
-        val generation = AppstoreState.beginCheck()
+        val request = AppstoreState.beginCheck()
 
-        AppstoreState.failCheck(generation, "update service could not start")
+        AppstoreState.failCheck(request.generation, "update service could not start")
+        AppstoreState.finishCheck(request.generation)
         val snapshot = AppstoreState.snapshot()
 
         assertEquals(AppstoreState.Initialization.FAILED, snapshot.initialization)
@@ -149,11 +151,13 @@ class AppstoreStateRestoreTest {
         val staleCatalog = catalog(entry("com.example.app", versionCode = 9))
         val currentCatalog = catalog(entry("com.example.app", versionCode = 12))
         val stale = AppstoreState.beginCheck()
+        AppstoreState.failCheck(stale.generation, "first request ended")
+        AppstoreState.finishCheck(stale.generation)
         val current = AppstoreState.beginCheck()
 
         assertFalse(
             AppstoreState.completeCheck(
-                stale,
+                stale.generation,
                 staleCatalog,
                 planFor(staleCatalog, installedVersion = 8),
             ),
@@ -163,11 +167,13 @@ class AppstoreStateRestoreTest {
 
         assertTrue(
             AppstoreState.completeCheck(
-                current,
+                current.generation,
                 currentCatalog,
                 planFor(currentCatalog, installedVersion = 8),
             ),
         )
+        assertTrue(AppstoreState.snapshot().checking)
+        assertTrue(AppstoreState.finishCheck(current.generation).finished)
         assertFalse(AppstoreState.snapshot().checking)
         assertEquals(12L, AppstoreState.snapshot().catalog!!.apps.single().versionCode)
     }
@@ -175,16 +181,51 @@ class AppstoreStateRestoreTest {
     @Test
     fun `stale failure cannot fail or finish a newer check`() {
         val stale = AppstoreState.beginCheck()
+        AppstoreState.failCheck(stale.generation, "first request ended")
+        AppstoreState.finishCheck(stale.generation)
         val current = AppstoreState.beginCheck()
 
-        assertFalse(AppstoreState.failCheck(stale, "old request failed"))
+        assertFalse(AppstoreState.failCheck(stale.generation, "old request failed"))
         val stillChecking = AppstoreState.snapshot()
         assertTrue(stillChecking.checking)
         assertEquals(null, stillChecking.lastError)
 
-        assertTrue(AppstoreState.failCheck(current, "current request failed"))
+        assertTrue(AppstoreState.failCheck(current.generation, "current request failed"))
+        AppstoreState.finishCheck(current.generation)
         val failed = AppstoreState.snapshot()
         assertFalse(failed.checking)
         assertEquals("current request failed", failed.lastError)
+    }
+
+    @Test
+    fun `completed check retains side effect ownership until explicitly finished`() {
+        val cat = catalog(entry("com.example.app", versionCode = 12))
+        val owner = AppstoreState.beginCheck()
+        assertTrue(
+            AppstoreState.completeCheck(
+                owner.generation,
+                cat,
+                planFor(cat, installedVersion = 8),
+            ),
+        )
+
+        val overlapping = AppstoreState.beginCheck()
+
+        assertFalse(overlapping.shouldRun)
+        assertEquals(owner.generation, overlapping.generation)
+        assertTrue(AppstoreState.snapshot().checking)
+        val finished = AppstoreState.finishCheck(owner.generation)
+        assertTrue(finished.finished)
+        assertTrue(finished.shouldRecheck)
+        assertTrue(AppstoreState.beginCheck().shouldRun)
+    }
+
+    @Test
+    fun `repeated startup cannot supersede an active check with cache restoration`() {
+        val active = AppstoreState.beginCheck()
+
+        assertNull(AppstoreState.beginInitialization())
+        assertTrue(AppstoreState.snapshot().checking)
+        assertEquals(active.generation, AppstoreState.beginCheck().generation)
     }
 }

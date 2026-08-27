@@ -69,6 +69,7 @@ object AppstoreState {
     private val listeners = mutableListOf<() -> Unit>()
     private val statuses = LinkedHashMap<String, PackageStatus>()
     private var initializationGeneration = 0L
+    private var recheckRequested = false
 
     @Volatile
     var initialization: Initialization = Initialization.NOT_STARTED
@@ -134,14 +135,21 @@ object AppstoreState {
     var lastError: String? = null
         private set
 
+    data class CheckRequest(val generation: Long, val shouldRun: Boolean)
+    data class CheckFinish(val finished: Boolean, val shouldRecheck: Boolean)
+
     @Synchronized
-    fun beginCheck(): Long {
+    fun beginCheck(): CheckRequest {
+        if (checking) {
+            recheckRequested = true
+            return CheckRequest(initializationGeneration, shouldRun = false)
+        }
         initializationGeneration++
         if (catalog == null) initialization = Initialization.LOADING
         checking = true
         lastError = null
         notifyListeners()
-        return initializationGeneration
+        return CheckRequest(initializationGeneration, shouldRun = true)
     }
 
     @Synchronized
@@ -154,7 +162,6 @@ object AppstoreState {
         this.catalog = catalog
         this.plan = plan
         this.initialization = Initialization.READY
-        this.checking = false
         this.lastError = null
         this.lastCheckElapsedMs = SystemClock.elapsedRealtime()
         this.lastCheckWallMs = System.currentTimeMillis()
@@ -164,6 +171,18 @@ object AppstoreState {
         statuses.keys.retainAll(known)
         notifyListeners()
         return true
+    }
+
+    @Synchronized
+    fun finishCheck(generation: Long): CheckFinish {
+        if (generation != initializationGeneration || !checking) {
+            return CheckFinish(finished = false, shouldRecheck = false)
+        }
+        checking = false
+        val shouldRecheck = recheckRequested
+        recheckRequested = false
+        notifyListeners()
+        return CheckFinish(finished = true, shouldRecheck = shouldRecheck)
     }
 
     /**
@@ -178,12 +197,11 @@ object AppstoreState {
      * Never overwrites a live result.
      */
     @Synchronized
-    fun beginInitialization(): Long {
+    fun beginInitialization(): Long? {
+        if (checking || initialization == Initialization.LOADING || catalog != null) return null
         initializationGeneration++
-        if (catalog == null) {
-            initialization = Initialization.LOADING
-            lastError = null
-        }
+        initialization = Initialization.LOADING
+        lastError = null
         notifyListeners()
         return initializationGeneration
     }
@@ -217,7 +235,6 @@ object AppstoreState {
     fun failCheck(generation: Long, reason: String): Boolean {
         if (generation != initializationGeneration) return false
         initialization = if (catalog == null) Initialization.FAILED else Initialization.READY
-        checking = false
         lastError = reason
         lastCheckElapsedMs = SystemClock.elapsedRealtime()
         lastCheckWallMs = System.currentTimeMillis()
@@ -318,6 +335,7 @@ object AppstoreState {
         plan = emptyList()
         initialization = Initialization.NOT_STARTED
         initializationGeneration = 0L
+        recheckRequested = false
         checking = false
         lastError = null
         lastCheckElapsedMs = 0L

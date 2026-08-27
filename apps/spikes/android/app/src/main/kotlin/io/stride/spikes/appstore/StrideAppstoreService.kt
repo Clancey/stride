@@ -115,8 +115,17 @@ class StrideAppstoreService : Service() {
             // Reaching here means startForeground() itself refused, not that we were too slow.
             Log.e(TAG, "no foreground notification after two attempts; doing no work")
             if (intent?.action == ACTION_CHECK || intent?.action == null) {
-                val generation = intent?.checkGeneration() ?: AppstoreState.beginCheck()
-                AppstoreState.failCheck(generation, "update service could not start")
+                val generation = intent?.checkGeneration()
+                if (generation != null) {
+                    AppstoreState.failCheck(generation, "update service could not start")
+                    finishCheck(generation)
+                } else {
+                    val request = AppstoreState.beginCheck()
+                    if (request.shouldRun) {
+                        AppstoreState.failCheck(request.generation, "update service could not start")
+                        finishCheck(request.generation)
+                    }
+                }
             }
             // Safe to stop, and worth doing. If we arrived by the deadline-free route there is no
             // promise outstanding, so this is a clean exit. If we arrived by the timed route then
@@ -149,8 +158,13 @@ class StrideAppstoreService : Service() {
             }
 
             else -> {
-                val generation = intent?.checkGeneration() ?: AppstoreState.beginCheck()
-                worker.execute { check(generation) }
+                val generation = intent?.checkGeneration()
+                if (generation != null) {
+                    worker.execute { check(generation) }
+                } else {
+                    val request = AppstoreState.beginCheck()
+                    if (request.shouldRun) worker.execute { check(request.generation) }
+                }
             }
         }
         // START_STICKY would have the platform restart us with a null intent after a kill, which
@@ -177,6 +191,26 @@ class StrideAppstoreService : Service() {
 
     /** Fetch, parse, classify, then act on whatever the plan says is safe to act on. */
     private fun check(generation: Long) {
+        try {
+            performCheck(generation)
+        } catch (e: Exception) {
+            AppstoreState.failCheck(
+                generation,
+                "catalog check failed: ${e.message ?: e.javaClass.simpleName}",
+            )
+            Log.w(TAG, "catalog check failed", e)
+        } finally {
+            finishCheck(generation)
+        }
+    }
+
+    private fun finishCheck(generation: Long) {
+        if (AppstoreState.finishCheck(generation).shouldRecheck) {
+            check(this)
+        }
+    }
+
+    private fun performCheck(generation: Long) {
         recordCheckStarted(this)
         val url = catalogUrl(this)
         val body = try {
@@ -337,8 +371,8 @@ class StrideAppstoreService : Service() {
                     "${bundle.name} is installed."
                 },
             )
-            val generation = AppstoreState.beginCheck()
-            worker.execute { check(generation) }
+            val request = AppstoreState.beginCheck()
+            if (request.shouldRun) worker.execute { check(request.generation) }
             return
         }
 
@@ -536,16 +570,19 @@ class StrideAppstoreService : Service() {
             // Publish and invalidate any cache restore before asking Android to enqueue the service.
             // Waiting for onStartCommand leaves a window where stale cache can win after a manual
             // check has already been requested.
-            val generation = AppstoreState.beginCheck()
+            val request = AppstoreState.beginCheck()
+            if (!request.shouldRun) return
             try {
                 start(context, ACTION_CHECK) {
-                    it.putExtra(EXTRA_CHECK_GENERATION, generation)
+                    it.putExtra(EXTRA_CHECK_GENERATION, request.generation)
                 }
             } catch (e: Exception) {
                 AppstoreState.failCheck(
-                    generation,
+                    request.generation,
                     "update service could not start: ${e.message}",
                 )
+                val shouldRecheck = AppstoreState.finishCheck(request.generation).shouldRecheck
+                if (shouldRecheck) check(context)
                 throw e
             }
         }
@@ -581,7 +618,7 @@ class StrideAppstoreService : Service() {
                 return
             }
 
-            val generation = AppstoreState.beginInitialization()
+            val generation = AppstoreState.beginInitialization() ?: return
             startup.initialize(
                 shouldCheck = false,
                 check = {},
