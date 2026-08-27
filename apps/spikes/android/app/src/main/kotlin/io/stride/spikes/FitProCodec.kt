@@ -425,10 +425,9 @@ object FitProCodec {
          *
          * This is why `WORKOUT_MODE = RUNNING` was refused with a clean `FAILED` on the X22i even
          * after every other precondition (unlock, supported-field checks) held: the console had
-         * never been told to leave whatever state it starts in. Observed once on real hardware —
-         * the belt ran for about two minutes — against an earlier revision that batched this write
-         * with field 95. Stride now sends the two separately and in iFit's order, so that single
-         * observation does not describe the current sequence; see
+         * never been told to leave whatever state it starts in. The earlier batched revision and
+         * the merged two-frame sequence have both driven an X22i belt on real hardware; the latter
+         * was re-confirmed twice from current `main` on 2026-08-27. See
          * [DirectMachineSession.initializeStartGate] and `DIRECT_MACHINE_PROTOCOL.md`.
          */
         REQUIRE_START_REQUESTED(108, 1, readOnly = false),
