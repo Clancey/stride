@@ -115,7 +115,8 @@ class StrideAppstoreService : Service() {
             // Reaching here means startForeground() itself refused, not that we were too slow.
             Log.e(TAG, "no foreground notification after two attempts; doing no work")
             if (intent?.action == ACTION_CHECK || intent?.action == null) {
-                AppstoreState.failCheck("update service could not start")
+                val generation = intent?.checkGeneration() ?: AppstoreState.beginCheck()
+                AppstoreState.failCheck(generation, "update service could not start")
             }
             // Safe to stop, and worth doing. If we arrived by the deadline-free route there is no
             // promise outstanding, so this is a clean exit. If we arrived by the timed route then
@@ -147,7 +148,10 @@ class StrideAppstoreService : Service() {
                 if (bundleId != null) worker.execute { advanceBundle(bundleId) }
             }
 
-            else -> worker.execute { check() }
+            else -> {
+                val generation = intent?.checkGeneration() ?: AppstoreState.beginCheck()
+                worker.execute { check(generation) }
+            }
         }
         // START_STICKY would have the platform restart us with a null intent after a kill, which
         // would silently turn a one-shot install request into a catalog check. That is harmless but
@@ -172,13 +176,13 @@ class StrideAppstoreService : Service() {
     // ------------------------------------------------------------------ check
 
     /** Fetch, parse, classify, then act on whatever the plan says is safe to act on. */
-    private fun check() {
+    private fun check(generation: Long) {
         recordCheckStarted(this)
         val url = catalogUrl(this)
         val body = try {
             fetchCatalog(url)
         } catch (e: Exception) {
-            AppstoreState.failCheck("could not reach the catalog: ${e.message}")
+            AppstoreState.failCheck(generation, "could not reach the catalog: ${e.message}")
             Log.w(TAG, "catalog fetch failed from $url", e)
             return
         }
@@ -186,13 +190,13 @@ class StrideAppstoreService : Service() {
         val catalog = try {
             CatalogManifest.parse(body)
         } catch (e: CatalogFormatException) {
-            AppstoreState.failCheck("catalog is not usable: ${e.message}")
+            AppstoreState.failCheck(generation, "catalog is not usable: ${e.message}")
             Log.w(TAG, "catalog rejected", e)
             return
         }
 
         val plan = UpdatePlan.compute(catalog, installedApps(), deviceProfile())
-        AppstoreState.completeCheck(catalog, plan)
+        if (!AppstoreState.completeCheck(generation, catalog, plan)) return
         // Only cache what parsed. Storing the raw body first would let one bad deploy poison every
         // subsequent start with a catalog we already know we cannot read.
         cacheCatalog(this, body)
@@ -333,8 +337,8 @@ class StrideAppstoreService : Service() {
                     "${bundle.name} is installed."
                 },
             )
-            AppstoreState.beginCheck()
-            worker.execute { check() }
+            val generation = AppstoreState.beginCheck()
+            worker.execute { check(generation) }
             return
         }
 
@@ -454,6 +458,7 @@ class StrideAppstoreService : Service() {
         const val ACTION_INSTALL_BUNDLE = "io.stride.spikes.APPSTORE_INSTALL_BUNDLE"
         const val EXTRA_PACKAGE = "io.stride.spikes.APPSTORE_PACKAGE"
         const val EXTRA_BUNDLE = "io.stride.spikes.APPSTORE_BUNDLE"
+        const val EXTRA_CHECK_GENERATION = "io.stride.spikes.APPSTORE_CHECK_GENERATION"
 
         /**
          * Where the catalog lives: the public
@@ -531,11 +536,16 @@ class StrideAppstoreService : Service() {
             // Publish and invalidate any cache restore before asking Android to enqueue the service.
             // Waiting for onStartCommand leaves a window where stale cache can win after a manual
             // check has already been requested.
-            AppstoreState.beginCheck()
+            val generation = AppstoreState.beginCheck()
             try {
-                start(context, ACTION_CHECK)
+                start(context, ACTION_CHECK) {
+                    it.putExtra(EXTRA_CHECK_GENERATION, generation)
+                }
             } catch (e: Exception) {
-                AppstoreState.failCheck("update service could not start: ${e.message}")
+                AppstoreState.failCheck(
+                    generation,
+                    "update service could not start: ${e.message}",
+                )
                 throw e
             }
         }
@@ -557,11 +567,24 @@ class StrideAppstoreService : Service() {
         fun checkOnStart(context: Context) {
             val prefs = context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
             val last = prefs.getLong(KEY_LAST_CHECK, 0L)
-            val generation = AppstoreState.beginInitialization()
             val appContext = context.applicationContext
+            val shouldCheck = UpdatePlan.shouldCheckOnStart(last, System.currentTimeMillis())
+            if (shouldCheck) {
+                startup.initialize(
+                    shouldCheck = true,
+                    check = { check(appContext) },
+                    restore = {},
+                    // check() has already published the generation-bound failure. This boundary
+                    // keeps a platform start exception from escaping MainActivity startup.
+                    onFailure = { error -> Log.w(TAG, "startup check could not be enqueued", error) },
+                )
+                return
+            }
+
+            val generation = AppstoreState.beginInitialization()
             startup.initialize(
-                shouldCheck = UpdatePlan.shouldCheckOnStart(last, System.currentTimeMillis()),
-                check = { check(appContext) },
+                shouldCheck = false,
+                check = {},
                 restore = { restoreCached(appContext, generation) },
                 onFailure = { error ->
                     Log.w(TAG, "cached catalog initialization failed", error)
@@ -750,3 +773,6 @@ internal fun Context.canRequestPackageInstallsCompat(): Boolean =
 /** Package-visibility helper kept next to its only caller. */
 internal fun PackageManager.isInstalled(packageName: String): Boolean =
     runCatching { getPackageInfo(packageName, 0) }.isSuccess
+
+private fun Intent.checkGeneration(): Long? =
+    getLongExtra(StrideAppstoreService.EXTRA_CHECK_GENERATION, 0L).takeIf { it > 0L }

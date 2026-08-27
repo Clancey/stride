@@ -2,7 +2,9 @@ package io.stride.spikes.appstore
 
 import org.junit.After
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNotNull
+import org.junit.Assert.assertTrue
 import org.junit.Test
 
 /**
@@ -132,13 +134,57 @@ class AppstoreStateRestoreTest {
     @Test
     fun `a check that cannot start resolves loading as failed`() {
         AppstoreState.beginInitialization()
-        AppstoreState.beginCheck()
+        val generation = AppstoreState.beginCheck()
 
-        AppstoreState.failCheck("update service could not start")
+        AppstoreState.failCheck(generation, "update service could not start")
         val snapshot = AppstoreState.snapshot()
 
         assertEquals(AppstoreState.Initialization.FAILED, snapshot.initialization)
         assertEquals(false, snapshot.checking)
         assertEquals("update service could not start", snapshot.lastError)
+    }
+
+    @Test
+    fun `stale success cannot publish or finish a newer check`() {
+        val staleCatalog = catalog(entry("com.example.app", versionCode = 9))
+        val currentCatalog = catalog(entry("com.example.app", versionCode = 12))
+        val stale = AppstoreState.beginCheck()
+        val current = AppstoreState.beginCheck()
+
+        assertFalse(
+            AppstoreState.completeCheck(
+                stale,
+                staleCatalog,
+                planFor(staleCatalog, installedVersion = 8),
+            ),
+        )
+        assertTrue(AppstoreState.snapshot().checking)
+        assertEquals(null, AppstoreState.snapshot().catalog)
+
+        assertTrue(
+            AppstoreState.completeCheck(
+                current,
+                currentCatalog,
+                planFor(currentCatalog, installedVersion = 8),
+            ),
+        )
+        assertFalse(AppstoreState.snapshot().checking)
+        assertEquals(12L, AppstoreState.snapshot().catalog!!.apps.single().versionCode)
+    }
+
+    @Test
+    fun `stale failure cannot fail or finish a newer check`() {
+        val stale = AppstoreState.beginCheck()
+        val current = AppstoreState.beginCheck()
+
+        assertFalse(AppstoreState.failCheck(stale, "old request failed"))
+        val stillChecking = AppstoreState.snapshot()
+        assertTrue(stillChecking.checking)
+        assertEquals(null, stillChecking.lastError)
+
+        assertTrue(AppstoreState.failCheck(current, "current request failed"))
+        val failed = AppstoreState.snapshot()
+        assertFalse(failed.checking)
+        assertEquals("current request failed", failed.lastError)
     }
 }

@@ -32,6 +32,25 @@ class AppstoreStartupTest {
     }
 
     @Test
+    fun `synchronous service start failure is reported instead of escaping launch`() {
+        var failure: Exception? = null
+        val executor = Executors.newSingleThreadExecutor()
+
+        try {
+            AppstoreStartup(executor).initialize(
+                shouldCheck = true,
+                check = { throw SecurityException("service unavailable") },
+                restore = { throw AssertionError("restore must not run") },
+                onFailure = { failure = it },
+            )
+
+            assertTrue(failure is SecurityException)
+        } finally {
+            executor.shutdownNow()
+        }
+    }
+
+    @Test
     fun `startup work leaves the calling thread before doing expensive work`() {
         val caller = Thread.currentThread()
         val entered = CountDownLatch(1)

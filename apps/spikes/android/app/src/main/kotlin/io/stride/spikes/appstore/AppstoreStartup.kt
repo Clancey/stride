@@ -13,7 +13,11 @@ internal class AppstoreStartup(private val executor: Executor) {
         onFailure: (Exception) -> Unit,
     ) {
         if (shouldCheck) {
-            check()
+            try {
+                check()
+            } catch (e: Exception) {
+                onFailure(e)
+            }
         } else {
             run(restore, onFailure)
         }

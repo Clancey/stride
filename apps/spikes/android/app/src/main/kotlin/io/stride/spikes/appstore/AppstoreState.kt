@@ -135,16 +135,22 @@ object AppstoreState {
         private set
 
     @Synchronized
-    fun beginCheck() {
+    fun beginCheck(): Long {
         initializationGeneration++
         if (catalog == null) initialization = Initialization.LOADING
         checking = true
         lastError = null
         notifyListeners()
+        return initializationGeneration
     }
 
     @Synchronized
-    fun completeCheck(catalog: CatalogManifest, plan: List<PlanItem>) {
+    fun completeCheck(
+        generation: Long,
+        catalog: CatalogManifest,
+        plan: List<PlanItem>,
+    ): Boolean {
+        if (generation != initializationGeneration) return false
         this.catalog = catalog
         this.plan = plan
         this.initialization = Initialization.READY
@@ -157,6 +163,7 @@ object AppstoreState {
         val known = plan.map { it.packageName }.toSet()
         statuses.keys.retainAll(known)
         notifyListeners()
+        return true
     }
 
     /**
@@ -207,13 +214,15 @@ object AppstoreState {
     }
 
     @Synchronized
-    fun failCheck(reason: String) {
+    fun failCheck(generation: Long, reason: String): Boolean {
+        if (generation != initializationGeneration) return false
         initialization = if (catalog == null) Initialization.FAILED else Initialization.READY
         checking = false
         lastError = reason
         lastCheckElapsedMs = SystemClock.elapsedRealtime()
         lastCheckWallMs = System.currentTimeMillis()
         notifyListeners()
+        return true
     }
 
     @Synchronized
