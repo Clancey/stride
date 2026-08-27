@@ -320,6 +320,18 @@ class WorkoutEndTest {
         )
     }
 
+    @Test
+    fun `a poll started before the workout boundary cannot restore old motion evidence`() {
+        val tracker = WorkoutMotionTracker()
+        val oldPoll = tracker.capture()
+
+        tracker.reset()
+        val stale = tracker.observe(oldPoll, "ftms-workout", "WORKOUT", 4.0)
+
+        assertEquals(null, stale.epoch)
+        assertFalse(stale.reportedMotion)
+    }
+
     /** A stale sample, or one from a replacement workout, cannot authorize a physical movement. */
     @Test
     fun `flattening needs a newer observation from the same workout`() {
