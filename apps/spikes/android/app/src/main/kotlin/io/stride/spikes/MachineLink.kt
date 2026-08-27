@@ -12,6 +12,45 @@ import android.os.SystemClock
 import android.util.Log
 
 /**
+ * Serializes publication against invalidation without making telemetry readers hold a lock.
+ *
+ * A poll captures a generation before blocking on I/O. Publishing and invalidating both take the
+ * same lock, so there are only two outcomes: either publication finishes first and invalidation
+ * clears it, or invalidation advances the generation first and publication is rejected.
+ */
+internal class PublicationGate {
+    private val lock = Any()
+    private var generation = 0L
+
+    fun capture(): Long = synchronized(lock) { generation }
+
+    fun publish(expected: Long, block: () -> Unit): Boolean = synchronized(lock) {
+        if (expected != generation) return@synchronized false
+        block()
+        true
+    }
+
+    fun invalidate(block: () -> Unit) = synchronized(lock) {
+        generation += 1
+        block()
+    }
+}
+
+internal class ReconnectResetLatch {
+    private val lost = java.util.concurrent.atomic.AtomicBoolean(false)
+
+    fun noteLost() {
+        lost.set(true)
+    }
+
+    fun takeLost(): Boolean = lost.compareAndSet(true, false)
+
+    fun clear() {
+        lost.set(false)
+    }
+}
+
+/**
  * Everything Stride knows about the physical machine.
  *
  * This exists to make "we cannot read the machine" and "we cannot move the machine" *structural*
@@ -333,7 +372,8 @@ object MachineLink {
     @Volatile private var snapshot: GlassOsClient.Snapshot? = null
     @Volatile private var snapshotAt: Long = 0L
     @Volatile private var client: GlassOsClient? = null
-    private val transportGeneration = java.util.concurrent.atomic.AtomicLong(0L)
+    private val publicationGate = PublicationGate()
+    private val glassOsReconnect = ReconnectResetLatch()
 
     /**
      * The running integral behind the overlay's vertical-gain figure.
@@ -1097,6 +1137,7 @@ object MachineLink {
      * [MachineCommands] and neither knows nor exposes which wire is behind it.
      */
     private fun openTransport(app: Context) {
+        val generation = publicationGate.capture()
         StrideSettings.attach(app)
         // Before reading the setting, because on a console the rider has never configured the
         // setting *is* the detection. Runs once per process and is a no-op afterwards.
@@ -1104,13 +1145,16 @@ object MachineLink {
         when (StrideSettings.transport) {
             StrideSettings.Transport.GLASSOS -> {
                 val c = GlassOsClient(app)
-                client = c
-                // GlassOS cannot be asked for the machine's limits, so the fixed ceiling stands.
-                MachineCoordinator.applyMachineLimits(null)
-                MachineCoordinator.rebind(GlassOsCommands(c))
+                val accepted = publicationGate.publish(generation) {
+                    client = c
+                    // GlassOS cannot be asked for the machine's limits, so the fixed ceiling stands.
+                    MachineCoordinator.applyMachineLimits(null)
+                    MachineCoordinator.rebind(GlassOsCommands(c))
+                }
+                if (!accepted) c.close()
             }
-            StrideSettings.Transport.DIRECT -> openDirect(app)
-            StrideSettings.Transport.FTMS -> openFtms(app)
+            StrideSettings.Transport.DIRECT -> openDirect(app, generation)
+            StrideSettings.Transport.FTMS -> openFtms(app, generation)
         }
     }
 
@@ -1125,7 +1169,7 @@ object MachineLink {
      * an unbound coordinator refuses commands — the correct answer when we could not establish that
      * the machine is listening.
      */
-    private fun openFtms(app: Context) {
+    private fun openFtms(app: Context, generation: Long) {
         val transport = try {
             FtmsTransport.open(app)
         } catch (t: Throwable) {
@@ -1133,20 +1177,26 @@ object MachineLink {
             null
         }
         if (transport == null) {
-            openFailure = FTMS_NO_MACHINE
-            MachineCoordinator.rebind(null)
+            publicationGate.publish(generation) {
+                openFailure = FTMS_NO_MACHINE
+                MachineCoordinator.rebind(null)
+            }
             return
         }
 
-        openFailure = null
-        ftmsTransport = transport
-        ftms = FtmsClient(transport)
+        val client = FtmsClient(transport)
         val commands = FtmsMachineCommands(transport)
-        // The machine's own ceiling, so the clamp becomes the intersection of ours and theirs.
-        // Null when it did not publish both ranges, which leaves Stride's fixed ceiling standing
-        // alone rather than inventing a limit the machine never agreed to.
-        MachineCoordinator.applyMachineLimits(commands.limits())
-        MachineCoordinator.rebind(commands)
+        val accepted = publicationGate.publish(generation) {
+            openFailure = null
+            ftmsTransport = transport
+            ftms = client
+            // The machine's own ceiling, so the clamp becomes the intersection of ours and theirs.
+            // Null when it did not publish both ranges, which leaves Stride's fixed ceiling standing
+            // alone rather than inventing a limit the machine never agreed to.
+            MachineCoordinator.applyMachineLimits(commands.limits())
+            MachineCoordinator.rebind(commands)
+        }
+        if (!accepted) transport.close()
     }
 
     /**
@@ -1157,7 +1207,7 @@ object MachineLink {
      * unbound coordinator refuses commands, which is the correct answer when we could not establish
      * that the console understands us.
      */
-    private fun openDirect(app: Context) {
+    private fun openDirect(app: Context, generation: Long) {
         val transport = try {
             FitProTransport.open(app)
         } catch (t: Throwable) {
@@ -1165,7 +1215,7 @@ object MachineLink {
             null
         }
         if (transport == null) {
-            openFailure = directNoTransportDetail(app)
+            val detail = directNoTransportDetail(app)
             // A console whose USB device is present but ungranted looks exactly like one that is
             // absent, and the grant can only come from a dialog somebody has to raise. Nothing
             // raised it, so direct-over-USB could never open on a fresh install however many times
@@ -1177,12 +1227,14 @@ object MachineLink {
                 runCatching { UsbSerialTransport.requestPermission(app) }
                     .onFailure { Log.w(TAG, "requesting USB permission failed", it) }
             }
-            MachineCoordinator.rebind(null)
+            publicationGate.publish(generation) {
+                openFailure = detail
+                MachineCoordinator.rebind(null)
+            }
             return
         }
 
         val session = DirectMachineSession(transport)
-        directSession = session
         val result = try {
             // No reference reading is available at startup: nobody has told us what the console
             // shows. The probe can still confirm the link answers and read the machine's limits; it
@@ -1194,18 +1246,24 @@ object MachineLink {
         }
 
         if (result == null) {
-            openFailure = DIRECT_NO_ANSWER
             session.close()
-            directSession = null
-            MachineCoordinator.rebind(null)
+            publicationGate.publish(generation) {
+                openFailure = DIRECT_NO_ANSWER
+                MachineCoordinator.rebind(null)
+            }
             return
         }
 
-        openFailure = null
-        direct = DirectMachineClient(session)
-        // The machine's own ceiling, so the clamp becomes the intersection of ours and theirs.
-        MachineCoordinator.applyMachineLimits(session.probe.limits)
-        MachineCoordinator.rebind(DirectMachineCommands(session))
+        val client = DirectMachineClient(session)
+        val accepted = publicationGate.publish(generation) {
+            openFailure = null
+            directSession = session
+            direct = client
+            // The machine's own ceiling, so the clamp becomes the intersection of ours and theirs.
+            MachineCoordinator.applyMachineLimits(session.probe.limits)
+            MachineCoordinator.rebind(DirectMachineCommands(session))
+        }
+        if (!accepted) session.close()
     }
 
     /**
@@ -1313,48 +1371,40 @@ object MachineLink {
     ): Boolean = incline != null || speed != null || inclineFetched || speedFetched
 
     private fun closeTransport() {
-        // Invalidates a read already in flight before any transport-owned value is cleared. The poll
-        // checks this generation before publishing, so detach cannot resurrect an old snapshot.
-        transportGeneration.incrementAndGet()
-        MachineCoordinator.rebind(null)
+        var oldDirectSession: DirectMachineSession? = null
+        var oldFtmsTransport: FtmsTransport? = null
+        var oldClient: GlassOsClient? = null
+        publicationGate.invalidate {
+            // Remove every readable client in the same critical section that advances the
+            // generation. A poll that captures the new generation can therefore only read null,
+            // while a poll already holding an old client cannot publish against the old generation.
+            direct = null
+            oldDirectSession = directSession
+            directSession = null
+            ftms = null
+            oldFtmsTransport = ftmsTransport
+            ftmsTransport = null
+            oldClient = client
+            client = null
+            clearTelemetryPublication()
+            glassOsReconnect.clear()
+            MachineCoordinator.rebind(null)
+        }
         // A reading taken through the old transport says nothing about the new one, and the belt
         // edge is built from exactly two readings. Carried across a switch, GlassOS reporting
         // WORKOUT and a freshly opened direct link reporting anything else is a manufactured
         // "the rider pressed Stop" — from two different wires, seconds apart.
         WorkoutMachineCoupling.forgetConsole()
-        direct = null
-        directSession?.let { runCatching { it.close() } }
-        directSession = null
-        ftms = null
+        oldDirectSession?.let { runCatching { it.close() } }
         // Closed rather than merely dropped, for the same reason the GlassOS client is: clearing the
         // field stops future work from finding it, but only the close stops a GATT link from staying
         // subscribed and delivering notifications into a transport nobody reads.
-        ftmsTransport?.let { runCatching { it.close() } }
-        ftmsTransport = null
+        oldFtmsTransport?.let { runCatching { it.close() } }
         openFailure = null
         // Closed, not merely dropped. Clearing the field stops *future* work from finding it; the
         // close is what stops work that is already in flight on another thread from finishing a
         // call it started before the rider switched away. See GlassOsClient.close.
-        client?.let { runCatching { it.close() } }
-        client = null
-        snapshot = null
-        snapshotAt = 0L
-        vertGainPublication = null
-        // Cleared with the snapshot, for the same reason: a reading belongs to the machine that
-        // produced it. [readingSeq] is deliberately *not* reset — it is a monotonic ordering used
-        // to tell a reading taken before a stop from one taken after it, and restarting the count
-        // would make a fresh reading on the new transport compare as older than a stop issued on
-        // the previous one.
-        latestObservation = null
-        // A different machine has to earn the benefit of the doubt again. Carrying this across a
-        // transport swap would let an honest console vouch for the register of the one that
-        // replaced it.
-        everReportedMotion = false
-        // A different transport is a different machine, so what the old one said about having a fan
-        // is not evidence about the new one. Deliberately not tied to the presets generation below:
-        // clearing this changes a cell's visibility inside an existing window, not the set of
-        // windows, so it must not drag the whole chrome through a rebuild.
-        fanSeen = false
+        oldClient?.let { runCatching { it.close() } }
         // Only announce a preset change when there was something to lose.
         //
         // The overlay rebuilds its entire chrome whenever this generation moves, which is correct
@@ -1398,79 +1448,80 @@ object MachineLink {
         }
     }
 
+    /**
+     * Atomically invalidate every value one successful poll publishes.
+     *
+     * [readingSeq] deliberately survives: it is a monotonic ordering sampled by stop confirmation,
+     * and restarting it would make a fresh reading compare as older than one from the prior link.
+     */
+    private fun clearTelemetryPublication() {
+        snapshot = null
+        snapshotAt = 0L
+        vertGainPublication = null
+        latestObservation = null
+        everReportedMotion = false
+        fanSeen = false
+    }
+
     private val poll = object : Runnable {
         override fun run() {
-            val generation = transportGeneration.get()
+            val pollHandler = handler ?: return
+            val generation = publicationGate.capture()
             val read = try {
                 client?.read() ?: direct?.read() ?: ftms?.read()
             } catch (t: Throwable) {
                 // A failed read means "we do not know". Never a crash, and never a stale number.
                 null
             }
-            // detach() can close the transport from another thread while a blocking read is in
-            // flight. Nothing returned by that obsolete generation may be published or rescheduled.
-            if (generation != transportGeneration.get()) return
-            if (read != null) {
-                val at = System.currentTimeMillis()
-                val gain = foldVertGain(vertGainPublication?.state, read)
-                vertGainPublication = VertGainPublication(gain, at)
-                snapshot = read
-                snapshotAt = at
-                // Published as one object, after the snapshot, so a stop confirmation gets a speed
-                // and a distance that came off the same poll. See Observation.
-                readingSeq += 1
-                latestObservation = Observation(readingSeq, at, read.speedMph, read.distanceMiles)
-                // Latched, never cleared by a later zero. The question this answers is not "is the
-                // belt moving now" — that is what the snapshot is for — but "does this console's
-                // speed register ever say anything but zero". See everReportedMotion and issue #34.
-                if ((read.speedMph ?: 0.0) > BELT_MOVING_MPH) everReportedMotion = true
-                // Positive evidence only, and latched: see [fanSeen]. Either answer proves a fan
-                // exists, and neither can be un-proved by a poll that failed to reach the console.
-                if (read.fanWritable == true || read.fanState != null) fanSeen = true
-                // A real reading over GlassOS settles the question the probe could not. Without
-                // this, a console whose daemon started *after* an inconclusive probe kept the
-                // unresolved state forever - harmless for the transport, which is already right,
-                // but the settings screen went on claiming there was no GlassOS service while
-                // GlassOS was plainly working.
-                StrideSettings.resolveTransportFromReading()
-                // The console is not only a thing Stride commands; it has its own Stop button under
-                // the rider's hand. This is where pressing it reaches the overlay.
-                WorkoutMachineCoupling.observeConsole(read.consoleState)
-                // Presets are static for the machine, so fetch them once on the same background
-                // thread as the poll rather than inventing a second worker. A read having just
-                // succeeded means the link is up, so this is the cheapest moment to try.
-                fetchPresetsOnce()
-            } else {
-                // Nothing came back, so nothing is known about the belt. Dropping the remembered
-                // reading stops a link that recovers minutes later from delivering a stale edge
-                // built out of two readings with a gap between them.
-                WorkoutMachineCoupling.forgetConsole()
-                reopenIfDropped()
+            val continued = publicationGate.publish(generation) {
+                if (read != null) {
+                    val at = System.currentTimeMillis()
+                    // A successful read is the strongest possible proof that GlassOS recovered,
+                    // regardless of which handshake path got it there. Consume the outage here so
+                    // this first sample becomes a baseline rather than charging its whole gap at the
+                    // recovery incline.
+                    val previousGain = if (glassOsReconnect.takeLost()) {
+                        null
+                    } else {
+                        vertGainPublication?.state
+                    }
+                    val gain = foldVertGain(previousGain, read)
+                    vertGainPublication = VertGainPublication(gain, at)
+                    snapshot = read
+                    snapshotAt = at
+                    // Published as one object, after the snapshot, so a stop confirmation gets a
+                    // speed and a distance from the same poll. See Observation.
+                    readingSeq += 1
+                    latestObservation = Observation(readingSeq, at, read.speedMph, read.distanceMiles)
+                    if ((read.speedMph ?: 0.0) > BELT_MOVING_MPH) everReportedMotion = true
+                    if (read.fanWritable == true || read.fanState != null) fanSeen = true
+                    // Keep the continuation under the same generation lease as publication. detach()
+                    // cannot clear the link between accepting this sample and applying its lifecycle
+                    // edge or preset answers, then have an obsolete poll mutate the replacement link.
+                    StrideSettings.resolveTransportFromReading()
+                    WorkoutMachineCoupling.observeConsole(read.consoleState)
+                    fetchPresetsOnce()
+                } else {
+                    if (StrideSettings.transport == StrideSettings.Transport.GLASSOS) {
+                        glassOsReconnect.noteLost()
+                    }
+                    // Nothing came back, so nothing is known about the belt. Dropping the remembered
+                    // reading stops a recovered link from delivering a stale console edge.
+                    WorkoutMachineCoupling.forgetConsole()
+                    reopenIfDropped()
+                }
+                // A strap is independent, but keeping its retry in this continuation prevents an
+                // obsolete poll from acting after detach and touching a replacement handler.
+                reopenHeartRateIfDropped()
+                if (read?.consoleState == GlassOsClient.ConsoleState.DISCONNECTED_NAME || read == null) {
+                    reconnect()
+                }
+                val moving = read?.let { GlassOsClient.ConsoleState.beltMayBeMoving(it.consoleState) }
+                val fast = moving == true || MachineCoordinator.stopConfirmationPending
+                pollHandler.postDelayed(this, if (fast) 500L else 2_000L)
             }
-            // Outside the read check on purpose: a strap is not part of the machine link, so its
-            // reconnect must not be gated on the machine having failed to answer. A rider whose
-            // treadmill is reporting perfectly and whose strap slipped off still wants it back.
-            reopenHeartRateIfDropped()
-            if (read?.consoleState == GlassOsClient.ConsoleState.DISCONNECTED_NAME || read == null) {
-                // Also on a read that failed outright, not only on one that came back saying
-                // "disconnected". During boot GlassOS is not listening yet, so the read does not
-                // return an answer — it returns nothing at all, and treating that as "no news"
-                // meant waiting for the daemon to come up *and* for a poll to complete before the
-                // handshake was even attempted. A refused socket fails in about a millisecond, so
-                // retrying on it is nearly free and it is the case that catches GlassOS starting.
-                reconnect()
-            }
-            // Poll faster while the machine says it may be moving. There is no reason to hammer a
-            // console sitting idle, and no excuse for a laggy readout while someone is running.
-            //
-            // Also while a stop is waiting to be confirmed, which is the one moment a slow poll
-            // would be actively harmful: a console walking to WORKOUT_RESULTS reports a belt that
-            // "may not be moving" and would drop this to two seconds, so the two agreeing readings
-            // a confirmation needs would take four — long enough to time out and escalate a stop
-            // that worked perfectly. See MachineCoordinator.stopConfirmationPending.
-            val moving = read?.let { GlassOsClient.ConsoleState.beltMayBeMoving(it.consoleState) }
-            val fast = moving == true || MachineCoordinator.stopConfirmationPending
-            handler?.postDelayed(this, if (fast) 500L else 2_000L)
+            // detach() may have invalidated this generation while read() was blocked.
+            if (!continued) return
         }
     }
 
