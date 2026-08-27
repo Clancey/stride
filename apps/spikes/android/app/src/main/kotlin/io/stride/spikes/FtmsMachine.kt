@@ -137,14 +137,9 @@ class FtmsMachineCommands(private val transport: FtmsLink) : MachineCommands {
 
     override fun speedPresetsMph(): List<Double>? {
         val range = transport.speedRange ?: return null
-        return MachinePresets.ladder(
+        return MachinePresets.speedLadder(
             min = FtmsValues.kphToMph(range.minKph),
             max = FtmsValues.kphToMph(range.maxKph),
-            // Whole mph buttons regardless of the machine's own resolution. A machine advertising a
-            // 0.1 km/h step would otherwise produce a ladder of 200 near-identical buttons, capped
-            // to 40 arbitrary ones — quick picks are for reaching a speed quickly, and the fine
-            // resolution is still available through the ordinary controls.
-            step = 1.0,
         )
     }
 

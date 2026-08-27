@@ -2038,19 +2038,34 @@ class OverlayService : Service() {
      */
     private fun addInclineRail() {
         val limits = MachineCoordinator.machineLimits
+        val spacing = StrideSettings.inclineSpacing
+        val floor = maxOf(
+            MachineCoordinator.MIN_INCLINE,
+            limits?.minInclinePercent ?: MachineCoordinator.MIN_INCLINE,
+        )
+        val ceiling = minOf(
+            MachineCoordinator.MAX_INCLINE,
+            limits?.maxInclinePercent ?: MachineCoordinator.MAX_INCLINE,
+        )
         val presets = railEntries(
             published = MachineLink.inclinePresets,
             // The rider's spacing reaches the fallback too. Skipping it would leave the column at 1%
             // for as long as the machine has published nothing — which on GlassOS is every idle
             // console, and on the direct path is every moment before the probe lands — and then
             // re-space itself under their hand.
-            ladder = if (StrideSettings.inclineSpacing == InclineSpacing.COARSE) {
+            ladder = if (limits != null) {
+                MachinePresets.inclineLadder(
+                    limits.minInclinePercent,
+                    limits.maxInclinePercent,
+                    spacing,
+                )
+            } else if (spacing == InclineSpacing.COARSE) {
                 INCLINE_LADDER_COARSE
             } else {
                 INCLINE_LADDER
             },
-            floor = limits?.minInclinePercent,
-            ceiling = limits?.maxInclinePercent,
+            floor = floor,
+            ceiling = ceiling,
         )
         val binding = addRail(
             accent = amber,
@@ -2092,10 +2107,9 @@ class OverlayService : Service() {
      * a well-formed, successful, empty answer. Treating it as the machine's final word left both
      * rails permanently blank on a console that was working perfectly.
      *
-     * Finally, an intersection that empties the ladder is discarded rather than shown. Limits come
-     * off a wire and a nonsensical pair — a zeroed struct, an unfinished probe — must not be able to
-     * filter every button away. A ladder slightly outside the machine's range gets clamped by
-     * [MachineCoordinator]; a column with nothing in it cannot be clamped back into usefulness.
+     * Both published controls and fallback ladders are intersected with the effective machine and
+     * installation range. A published list with no usable values falls back to the honest ladder;
+     * an invalid empty intersection offers no button that the coordinator would silently change.
      */
     private fun railEntries(
         published: List<Double>?,
@@ -2158,11 +2172,21 @@ class OverlayService : Service() {
 
     private fun addSpeedRail() {
         val limits = MachineCoordinator.machineLimits
+        val floor = maxOf(
+            MachineCoordinator.MIN_SPEED_MPH,
+            limits?.minSpeedMph ?: MachineCoordinator.MIN_SPEED_MPH,
+        )
+        val ceiling = minOf(
+            MachineCoordinator.MAX_SPEED_MPH,
+            limits?.maxSpeedMph ?: MachineCoordinator.MAX_SPEED_MPH,
+        )
         val presets = railEntries(
             published = MachineLink.speedPresets,
-            ladder = SPEED_LADDER,
-            floor = limits?.minSpeedMph,
-            ceiling = limits?.maxSpeedMph,
+            ladder = limits?.let {
+                MachinePresets.speedLadder(it.minSpeedMph, it.maxSpeedMph)
+            } ?: SPEED_LADDER,
+            floor = floor,
+            ceiling = ceiling,
         )
         val binding = addRail(
             accent = cyan,
@@ -3409,11 +3433,9 @@ internal fun formatRailPreset(value: Double): String =
  * `ControlList`. Treating that as the machine's final word left both rails permanently blank on a
  * console that was working perfectly.
  *
- * Finally, an intersection that empties the ladder is discarded rather than shown. Limits come off a
- * wire, and a nonsensical pair — a zeroed struct, an unfinished probe — must not be able to filter
- * every button away. A ladder reaching slightly outside the machine's range is clamped by
- * [MachineCoordinator] on the way to the belt; a column with nothing in it cannot be clamped back
- * into usefulness.
+ * Published controls and the fallback are both intersected with the effective range. If a published
+ * list has no usable controls, the fallback still gives the rider an honest column. An invalid empty
+ * intersection gives no buttons rather than labels that the coordinator would silently change.
  */
 internal fun railPresetEntries(
     published: List<Double>?,
@@ -3421,11 +3443,15 @@ internal fun railPresetEntries(
     floor: Double?,
     ceiling: Double?,
 ): List<String> {
-    published?.takeIf { it.isNotEmpty() }?.let { return it.map(::formatRailPreset) }
-    val within = ladder.filter {
-        (floor == null || it >= floor) && (ceiling == null || it <= ceiling)
+    fun List<Double>.withinLimits(): List<Double> = filter {
+        it.isFinite() && (floor == null || it >= floor) && (ceiling == null || it <= ceiling)
     }
-    return (within.takeIf { it.isNotEmpty() } ?: ladder).map(::formatRailPreset)
+    val values = published
+        ?.takeIf { it.isNotEmpty() }
+        ?.withinLimits()
+        ?.takeIf { it.isNotEmpty() }
+        ?: ladder.withinLimits()
+    return values.map(::formatRailPreset).distinct()
 }
 
 /**
