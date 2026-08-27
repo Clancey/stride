@@ -430,8 +430,8 @@ An end now sends, in this order and each as its own queued job behind the stop:
 |---|---|---|
 | 1 | `KPH = 0`, `WORKOUT_MODE = IDLE` | always — the stop itself, preempting the queue |
 | 2 | `KPH = 0` | always |
-| 3 | `GRADE = 0` | only when telemetry shows the belt at rest **and** this console has proved its speed register reports motion |
-| 4 | `FAN_STATE = OFF` | always |
+| 3 | `FAN_STATE = OFF` | always |
+| 4 | `GRADE = 0` | only after two newer, same-workout observations show no motion or distance increase |
 
 The second zero looks redundant and is the point. If the stop frame landed, the console is idle, it
 will most likely refuse 2, and the cost is a log line. If the stop frame was **lost** — a dropped
@@ -464,14 +464,18 @@ unproven**. The direct poll reads `KPH` back from the console alongside `ACTUAL_
 `ACTUAL_KPH` reports motion, the metric strip and its pace use that read-back setpoint. Once
 `ACTUAL_KPH` has reported motion on a link, its later zero is kept rather than hidden by the
 fallback. The raw `ACTUAL_KPH` remains a separate snapshot field throughout: `Observation`,
-`everReportedMotion`, deck movement, and stop confirmation never receive the commanded value.
-Outside a moving workout state — including pause and results — the fallback is disabled so a stale
-target cannot appear as live speed.
+deck movement, and stop confirmation never receive the commanded value. Outside a moving workout
+state — including pause and results — the fallback is disabled so a stale target cannot appear as
+live speed.
 
-The gate therefore also requires that this console has, at some point on this link, reported a
-speed above the moving threshold at all. Until it has, its zero is indistinguishable from a
-register stuck at zero and is treated as worth nothing. On an X22i exhibiting #34 the deck is never
-flattened, which is exactly where it sat before any of this existed.
+The gate therefore also requires that this console has reported a speed above the moving threshold
+in the workout being ended. Evidence from an earlier workout cannot vouch for a register that has
+since gone dead. It then requires two newer, same-workout observations that both claim rest and
+compares their distance. Starting that window only after the belt claims rest avoids treating normal
+deceleration as continued motion. An increase vetoes flattening even when speed claims zero. Missing
+or unchanged distance grants nothing — a quantized distance register can remain unchanged while the
+belt moves — so the independent speed conditions remain mandatory. On an X22i exhibiting #34 the
+deck is never flattened, which is exactly where it sat before any of this existed.
 
 This does not turn a target into a measurement. The X22i reports `Rpm` (field 5) unsupported, so the
 remaining route to a real instantaneous displayed value is deriving it from `CURRENT_DISTANCE`.

@@ -74,6 +74,79 @@ internal class ReconnectResetLatch {
  * watchdog in plan section 3.1; here it only governs what is displayed, since nothing can be
  * commanded yet.
  */
+internal data class WorkoutMotionEvidence(
+    val epoch: Long?,
+    val reportedMotion: Boolean,
+)
+
+/**
+ * Binds the speed register's credibility to one workout rather than to the life of a link.
+ *
+ * GlassOS and the direct transport provide distinct workout ids. FTMS only provides a presence
+ * marker, so its epoch turns over after a positively observed idle state. PAUSED and RESULTS keep
+ * the current epoch: those are still the workout whose end-of-workout tidy-up may be running.
+ */
+internal class WorkoutMotionTracker {
+    private var nextEpoch = 0L
+    private var generation = 0L
+    private var epoch: Long? = null
+    private var sourceId: String? = null
+    private var reportedMotion = false
+
+    @Synchronized
+    fun observe(workoutId: String?, consoleState: String?, speedMph: Double?): WorkoutMotionEvidence {
+        return observeCurrent(workoutId, consoleState, speedMph)
+    }
+
+    @Synchronized
+    fun capture(): Long = generation
+
+    @Synchronized
+    fun observe(
+        expectedGeneration: Long,
+        workoutId: String?,
+        consoleState: String?,
+        speedMph: Double?,
+    ): WorkoutMotionEvidence {
+        if (expectedGeneration != generation) return WorkoutMotionEvidence(epoch, reportedMotion)
+        return observeCurrent(workoutId, consoleState, speedMph)
+    }
+
+    private fun observeCurrent(
+        workoutId: String?,
+        consoleState: String?,
+        speedMph: Double?,
+    ): WorkoutMotionEvidence {
+        if (!workoutId.isNullOrEmpty()) {
+            if (epoch == null || (sourceId != null && sourceId != workoutId)) {
+                nextEpoch += 1
+                epoch = nextEpoch
+                reportedMotion = false
+            }
+            sourceId = workoutId
+        } else if (consoleState in NO_WORKOUT_STATES) {
+            epoch = null
+            sourceId = null
+            reportedMotion = false
+        }
+        if (epoch != null && (speedMph ?: 0.0) > BELT_MOVING_MPH) reportedMotion = true
+        return WorkoutMotionEvidence(epoch, reportedMotion)
+    }
+
+    @Synchronized
+    fun reset() {
+        generation += 1
+        epoch = null
+        sourceId = null
+        reportedMotion = false
+    }
+
+    private companion object {
+        val NO_WORKOUT_STATES =
+            setOf("DISCONNECTED", "IDLE", "SAFETY_KEY_REMOVED", "LOCKED", "SLEEP", "DEMO", "ERROR")
+    }
+}
+
 object MachineLink {
 
     /** What to draw when a reading is unknown. Never substitute a zero, and never a bare dash. */
@@ -468,9 +541,14 @@ object MachineLink {
         val atMs: Long,
         val speedMph: Double?,
         val distanceMiles: Double?,
+        /** The workout this poll belongs to, distinct from every completed workout on this link. */
+        val workoutEpoch: Long?,
+        /** Whether this workout, not merely this link, has produced a credible motion reading. */
+        val reportedMotionInWorkout: Boolean,
     )
 
     @Volatile private var latestObservation: Observation? = null
+    private val workoutMotion = WorkoutMotionTracker()
 
     /**
      * How many polls have succeeded on this link.
@@ -494,6 +572,17 @@ object MachineLink {
      */
     fun observation(): Observation? =
         latestObservation?.takeIf { System.currentTimeMillis() - it.atMs <= FRESHNESS_MS }
+
+    /**
+     * Starts a new workout's credibility window.
+     *
+     * Usually the transport's workout id turns the epoch over. FTMS has only a constant presence
+     * marker, though, so a dropped IDLE poll could otherwise carry motion evidence into the next
+     * workout. The app's own start boundary is positive lifecycle evidence and closes that gap.
+     */
+    fun beginWorkoutEvidence() {
+        workoutMotion.reset()
+    }
 
     /**
      * Whether this machine has ever, on this link, reported a speed that means the belt is moving.
@@ -1512,6 +1601,7 @@ object MachineLink {
         timedSnapshot = null
         vertGainPublication = null
         latestObservation = null
+        workoutMotion.reset()
         everReportedMotion = false
         fanSeen = false
     }
@@ -1520,6 +1610,7 @@ object MachineLink {
         override fun run() {
             val pollHandler = handler ?: return
             val generation = publicationGate.capture()
+            val motionGeneration = workoutMotion.capture()
             val read = try {
                 client?.read() ?: direct?.read() ?: ftms?.read()
             } catch (t: Throwable) {
@@ -1541,10 +1632,23 @@ object MachineLink {
                     val gain = foldVertGain(previousGain, read)
                     vertGainPublication = VertGainPublication(gain, at)
                     timedSnapshot = TimedSnapshot(read, at)
+                    val motion = workoutMotion.observe(
+                        motionGeneration,
+                        read.workoutId,
+                        read.consoleState,
+                        read.speedMph,
+                    )
                     // Published as one object, after the snapshot, so a stop confirmation gets a
                     // speed and a distance from the same poll. See Observation.
                     readingSeq += 1
-                    latestObservation = Observation(readingSeq, at, read.speedMph, read.distanceMiles)
+                    latestObservation = Observation(
+                        readingSeq,
+                        at,
+                        read.speedMph,
+                        read.distanceMiles,
+                        motion.epoch,
+                        motion.reportedMotion,
+                    )
                     if ((read.speedMph ?: 0.0) > BELT_MOVING_MPH) everReportedMotion = true
                     if (read.fanWritable == true || read.fanState != null) fanSeen = true
                     // Keep the continuation under the same generation lease as publication. detach()

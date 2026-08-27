@@ -257,10 +257,10 @@ class FanReadoutTest {
     /**
      * A fan change the rider never made still reaches the readout.
      *
-     * `MachineCoordinator.stopFan` shuts the fan off at the end of a workout (#29), so the state can
-     * now diverge from what is on screen with no user action at all — which is exactly when a stale
-     * readout is least likely to be questioned. The stamp on the request carries it immediately, and
-     * the next reading confirms it.
+     * `MachineCoordinator.stopAndSettle` shuts the fan off at the end of a workout (#29), so the
+     * state can now diverge from what is on screen with no user action at all — which is exactly when
+     * a stale readout is least likely to be questioned. The stamp on the request carries it
+     * immediately, and the next reading confirms it.
      */
     @Test
     fun `an automatic fan off is picked up without waiting for a poll`() {
@@ -287,9 +287,9 @@ class FanReadoutTest {
     /**
      * A refused automatic fan off does not become "Off" on screen.
      *
-     * `stopFan` records its state only on an `Ok`, so a refusal leaves the request where it was —
-     * and the reading, which is the thing that actually knows, keeps the strip honest about a fan
-     * that is still running.
+     * The end sequence records fan state only on an `Ok`, so a refusal leaves the request where it
+     * was — and the reading, which is the thing that actually knows, keeps the strip honest about a
+     * fan that is still running.
      */
     @Test
     fun `a fan that kept running is still reported as running`() {

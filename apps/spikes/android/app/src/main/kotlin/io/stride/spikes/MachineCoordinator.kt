@@ -124,6 +124,9 @@ object MachineCoordinator {
      */
     private const val STOP_CONFIRM_SAMPLE_MS = 200L
 
+    /** One fast-poll interval plus scheduling slack between two claimed-at-rest deck samples. */
+    private const val DECK_RECHECK_MS = 700L
+
     /** Pause after a clearing stop, so the console's state read reflects it. */
     private const val CLEAR_SETTLE_MS = 300L
 
@@ -219,6 +222,9 @@ object MachineCoordinator {
     private val queue = LinkedBlockingDeque<Job>()
     private val generation = AtomicInteger(0)
 
+    @Volatile
+    internal var beforeCommandExecutionForTest: (() -> Unit)? = null
+
     /**
      * Retires the writes that tidy up after a finished workout.
      *
@@ -226,10 +232,10 @@ object MachineCoordinator {
      * "everything queued is stale", and a stop must keep meaning exactly that. This one means "the
      * workout those writes belonged to is over and something newer wants the machine".
      *
-     * It exists because the tidy-up costs round trips — a re-assert is two, the fan is a third —
-     * and each one can block for the console's full command timeout. A rider who ends a workout and
-     * immediately starts another would otherwise have their start queued behind the best part of a
-     * minute of writes for a session that no longer exists, which is long enough for
+     * It exists because the tidy-up costs multiple round trips, and each one can block for the
+     * console's full command timeout. A rider who ends a workout and immediately starts another
+     * would otherwise have their start queued behind writes for a session that no longer exists,
+     * which is long enough for
      * [WorkoutMachineCoupling]'s start watchdog to give up on a start that was never sent.
      */
     private val endGeneration = AtomicInteger(0)
@@ -401,6 +407,7 @@ object MachineCoordinator {
         val token = synchronized(this) {
             FanRestoreToken(generation.get(), endGeneration.incrementAndGet(), commands)
         }
+        MachineLink.beginWorkoutEvidence()
         submit(
             label = "Start workout",
             onDone = { outcome -> onDone?.invoke(outcome, token) },
@@ -592,7 +599,26 @@ object MachineCoordinator {
      */
     @Synchronized
     fun stop(onSettled: ((StopVerdict) -> Unit)? = null) {
+        enqueueStop(onSettled)?.start()
+    }
+
+    /**
+     * Stop a definitively ended workout and enqueue every follow-up under the same monitor.
+     *
+     * Keeping this as one coordinator operation prevents a start or rebind from landing after the
+     * stop but before the follow-ups sample their generation and transport.
+     */
+    @Synchronized
+    fun stopAndSettle(onSettled: ((StopVerdict) -> Unit)? = null) {
+        val watcher = enqueueStop(onSettled)
+        enqueueSettlement()
+        watcher?.start()
+    }
+
+    /** Caller holds this object's monitor. */
+    private fun enqueueStop(onSettled: ((StopVerdict) -> Unit)?): StopConfirmation? {
         val gen = generation.incrementAndGet()
+        val stopCommands = commands
         queue.clear()
         pendingFanRequest = null
         // Sampled on the caller's thread, before the job can possibly run, so "readings newer than
@@ -607,11 +633,12 @@ object MachineCoordinator {
                 STOP_LABEL,
                 onDone = { outcome -> watcher?.onAck(outcome is Outcome.Ok) },
             ) {
-                val c = commands ?: return@Job Outcome.Failed("No link to the console")
+                if (commands !== stopCommands) return@Job Outcome.Superseded
+                val c = stopCommands ?: return@Job Outcome.Failed("No link to the console")
                 c.stop().toOutcome()
             },
         )
-        watcher?.start()
+        return watcher
     }
 
     /**
@@ -961,15 +988,27 @@ object MachineCoordinator {
      * re-assert as a successful stop.
      *
      * Queued, never preempting. [stop] has already bumped the generation and taken the front of the
-     * queue by the time this is called, so this can only ever sit behind it. That ordering is not
-     * an accident of timing: the caller issues the stop first, and `submit` only ever appends.
+     * queue by the time this is called, so this sequence can only ever sit behind it.
+     *
+     * The three follow-ups are enqueued here, by one caller, in their wire order. The flatten job
+     * cannot be submitted from inside the zero job: the worker could do that before the ending
+     * thread submits fan-off, putting a 700 ms wait and a deck movement in front of the fan.
+     *
+     * Caller holds this object's monitor, immediately after [enqueueStop].
      */
-    fun reassertZero() {
+    private fun enqueueSettlement() {
         // Sampled here, on the caller's thread, so the checks inside the job compare against the
         // state this end belonged to rather than against whatever is current when it runs.
         val gen = generation.get()
         val end = endGeneration.get()
-        submit(REASSERT_LABEL, endGen = end, reportsOutcome = false) { commands ->
+        val fanRequest = beginFanRequest(GlassOsCommands.FAN_OFF, fanAdmission())
+        var firstAtRest: MachineLink.Observation? = null
+        submit(
+            REASSERT_LABEL,
+            endGen = end,
+            reportsOutcome = false,
+            jobGeneration = gen,
+        ) { commands ->
             // Through the same clamp as every other speed request, not as a raw zero. The floor
             // being 0 rather than the machine's reported minimum is a safety rule, and it is stated
             // in exactly one place (clampSpeed) so a second copy here cannot drift away from it.
@@ -979,15 +1018,48 @@ object MachineCoordinator {
             // deck movement belongs to a session that is over — moving it anyway would be this
             // job's writes outliving the generation that authorised them.
             if (generation.get() != gen || endGeneration.get() != end) return@submit Outcome.Superseded
-            val observed = MachineLink.observedSpeedMph
-            if (!mayFlattenDeck(observed, MachineLink.everReportedMotion)) {
+            val atRest = MachineLink.observation()
+            if (!mayBeginFlattenCheck(atRest)) {
                 Log.i(
                     TAG,
-                    "belt not observably at rest (speed=$observed, " +
-                        "everReportedMotion=${MachineLink.everReportedMotion}); " +
+                    "belt not observably at rest after the zero re-assert (observed=$atRest); " +
                         "leaving the deck where it is",
                 )
                 return@submit speed.toOutcome()
+            }
+            firstAtRest = atRest
+            speed.toOutcome()
+        }
+        submit(
+            label = FAN_OFF_LABEL,
+            onDone = { finishFanRequest(fanRequest) },
+            endGen = end,
+            reportsOutcome = false,
+            jobGeneration = gen,
+        ) { commands ->
+            if (commands !== fanRequest.admission.transport) return@submit Outcome.Superseded
+            val ack = acceptFanWrite(fanRequest, commands.setFanState(GlassOsCommands.FAN_OFF))
+            if (ack is MachineAck.Refused) Outcome.Ok else ack.toOutcome()
+        }
+        submit(
+            "Flatten deck after rest recheck",
+            endGen = end,
+            reportsOutcome = false,
+            jobGeneration = gen,
+        ) { commands ->
+            val before = firstAtRest ?: return@submit Outcome.Ok
+            if (!settle(DECK_RECHECK_MS)) return@submit Outcome.Superseded
+            if (generation.get() != gen || endGeneration.get() != end) {
+                return@submit Outcome.Superseded
+            }
+            val observed = MachineLink.observation()
+            if (!mayFlattenDeck(before, observed)) {
+                Log.i(
+                    TAG,
+                    "belt did not remain observably at rest (before=$before, observed=$observed); " +
+                        "leaving the deck where it is",
+                )
+                return@submit Outcome.Ok
             }
             // Flat is the state a rider steps off onto, and it is the same state a workout is
             // started in — a run should not end leaving the deck wherever the last hill put it.
@@ -998,44 +1070,9 @@ object MachineCoordinator {
         }
     }
 
-    /**
-     * Shut the fan off, because the workout is over.
-     *
-     * The missing half of [restoreFan]. Stride has turned the fan on at the start of every workout
-     * since that landed and has never turned it off, so a console left alone after a run sat there
-     * blowing until somebody noticed — issue #29.
-     *
-     * **Sent unconditionally, not gated on [lastFanState].** Skipping when Stride does not think it
-     * has a fan running looks like an easy saving and is a race: a restore can already be on the wire
-     * when the workout ends and can turn the fan on behind the stop. The accepted state cannot make
-     * that in-flight write safe, and the console has controls of its own.
-     *
-     * A refusal is not an error. It means this machine has no fan register that will take a write,
-     * which is a fact about the treadmill and not a failure of the end — swallowed for the same
-     * reason [restoreFan] swallows a speculative Auto.
-     *
-     * [StrideSettings.fanState] is deliberately untouched. That is the rider's remembered
-     * preference and the value the next [restoreFan] replays; recording an automatic shutdown into
-     * it would quietly teach the app that they want the fan off from now on.
-     */
-    fun stopFan() {
-        val end = endGeneration.get()
-        val request = beginFanRequest(GlassOsCommands.FAN_OFF, fanAdmission())
-        submit(
-            label = FAN_OFF_LABEL,
-            onDone = { finishFanRequest(request) },
-            endGen = end,
-            reportsOutcome = false,
-            jobGeneration = request.admission.generation,
-        ) { commands ->
-            if (commands !== request.admission.transport) return@submit Outcome.Superseded
-            val ack = acceptFanWrite(request, commands.setFanState(GlassOsCommands.FAN_OFF))
-            if (ack is MachineAck.Refused) Outcome.Ok else ack.toOutcome()
-        }
-    }
-
     // -------------------------------------------------------------- plumbing
 
+    @Synchronized
     private fun submit(
         label: String,
         delayMs: Long = 0L,
@@ -1043,13 +1080,14 @@ object MachineCoordinator {
         speedGen: Int? = null,
         endGen: Int? = null,
         reportsOutcome: Boolean = true,
-        jobGeneration: Int = generation.get(),
+        jobGeneration: Int? = null,
         // MachineCommands, not GlassOsCommands: the coordinator owns the clamps and the ramp and
         // must not know which wire is underneath it. That split is what lets the direct register
         // path substitute for GlassOS without a second copy of any of the safety rules.
         run: (MachineCommands) -> Outcome,
     ) {
-        val gen = jobGeneration
+        val gen = jobGeneration ?: generation.get()
+        val boundCommands = commands
         queue.addLast(
             Job(gen, label, onDone, speedGen, endGen, reportsOutcome) {
                 if (delayMs > 0) {
@@ -1068,13 +1106,17 @@ object MachineCoordinator {
                 // A workout's tidy-up is worth nothing to the workout that replaced it, and it
                 // holds the worker for a round trip it could be spending on a start.
                 if (endGen != null && endGeneration.get() != endGen) return@Job Outcome.Superseded
+                beforeCommandExecutionForTest?.invoke()
+                // Validation and transport capture are separate in time on the worker, so invoke
+                // the captured transport rather than rereading this volatile field after a rebind.
+                if (commands !== boundCommands) return@Job Outcome.Superseded
                 // Deliberately not short-circuited on [MachineLink.consoleDetached]. Refusing here
                 // without touching the wire would be faster, but it also makes the app's own
                 // reading of the console the thing that decides whether a rider may use their
                 // treadmill — and a single stale or wrong poll would then lock them out with no
                 // way to overrule it. The console gets asked every time; a detached one answers by
                 // timing out, and that failure is now shown with a retry rather than swallowed.
-                val c = commands ?: return@Job Outcome.Failed("No link to the console")
+                val c = boundCommands ?: return@Job Outcome.Failed("No link to the console")
                 run(c)
             },
         )
@@ -1446,21 +1488,22 @@ internal fun shouldEscalate(
  *   value is zero" from "I do not have this value", so the two are identical on the wire by
  *   construction.
  *
- * So the reading alone is not the question. [everReportedMotion] asks whether this console's speed
- * register has *ever* said anything but zero on this link; until it has, a zero from it is
- * indistinguishable from a register stuck at zero and is worth nothing. See
- * [MachineLink.everReportedMotion].
+ * So the reading alone is not the question. [MachineLink.Observation.reportedMotionInWorkout] asks
+ * whether this console's speed register said anything but zero in the workout being ended; until it
+ * has, a zero from it is indistinguishable from a register stuck at zero and is worth nothing.
+ * Binding that evidence to the workout matters: motion reported during yesterday's workout cannot
+ * vouch for a register that has gone dead during this one.
  *
  * `Rpm` is field 5 and read-only on FitPro1, but the X22i reports it unsupported. A future real
  * motion signal on this console therefore has to come from another measured register rather than
  * from the commanded speed.
  *
- * Corroborating against `CURRENT_DISTANCE` failing to advance would work too, and issue #39's
- * [stopVerdict] now does exactly that for the stronger question of whether a *stop* is confirmed —
- * but only in the one direction that is safe under an unmeasured quantum: distance advancing may
- * refuse a confirmation, distance standing still may never grant one. The same veto would tighten
- * this gate and has deliberately been left off it, so that #39 could not change #36's behaviour on
- * the way past. Either would let this be strengthened. It must not be weakened.
+ * `CURRENT_DISTANCE` supplies a second, deliberately asymmetric check across two readings that both
+ * claim the belt is at rest. Starting the window before deceleration would veto every successful
+ * stop merely because stopping covers ground. An increase in the at-rest window is monotone positive
+ * evidence of travel, so it vetoes the movement even when speed claims zero. No increase grants
+ * nothing: a quantized register can remain unchanged for seconds while a belt moves. The speed
+ * evidence above remains independently mandatory.
  *
  * **Null is not permission.** [MachineLink.observedSpeedMph] is null when the snapshot is stale or the
  * machine could not be asked, and "we cannot see the belt" has to mean "do not move anything",
@@ -1468,5 +1511,24 @@ internal fun shouldEscalate(
  * moving a treadmill. The cost of being wrong in this direction is a deck left on a hill, which is
  * exactly where it sat before any of this existed.
  */
-internal fun mayFlattenDeck(observedSpeedMph: Double?, everReportedMotion: Boolean): Boolean =
-    everReportedMotion && observedSpeedMph != null && observedSpeedMph <= BELT_MOVING_MPH
+internal fun mayFlattenDeck(
+    firstAtRest: MachineLink.Observation?,
+    observed: MachineLink.Observation?,
+): Boolean {
+    if (!mayBeginFlattenCheck(firstAtRest) || !mayBeginFlattenCheck(observed)) return false
+    checkNotNull(firstAtRest)
+    checkNotNull(observed)
+    if (observed.seq <= firstAtRest.seq) return false
+    if (observed.workoutEpoch != firstAtRest.workoutEpoch) return false
+    val from = firstAtRest.distanceMiles ?: return false
+    val to = observed.distanceMiles ?: return false
+    if (to - from > DISTANCE_STILL_MILES) return false
+    return true
+}
+
+/** Conditions each observation must satisfy independently; distance is deliberately absent. */
+private fun mayBeginFlattenCheck(observed: MachineLink.Observation?): Boolean =
+    observed?.workoutEpoch != null &&
+        observed.reportedMotionInWorkout &&
+        observed.speedMph != null &&
+        observed.speedMph <= BELT_MOVING_MPH

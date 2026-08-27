@@ -217,25 +217,6 @@ object WorkoutMachineCoupling {
     }
 
     /**
-     * Leave the machine in a known-safe state, at the moment a workout is definitively over.
-     *
-     * The counterpart to [restoreFan], and it exists because there was not one: Stride turned the
-     * fan on at the start of every workout and never turned it off, so a console left alone after a
-     * run kept blowing indefinitely (issue #29).
-     *
-     * Called **after** [MachineCoordinator.stop], never instead of it and never before it. The stop
-     * empties the queue and takes the front of it; these only ever append, so they cannot delay,
-     * reorder ahead of, or queue in front of the one command that stops a belt.
-     *
-     * Zero first, fan second. If the stop frame was lost, the re-assert is what actually stops the
-     * treadmill, and the fan is a comfort control that can wait behind it.
-     */
-    private fun settleAfterEnd() {
-        MachineCoordinator.reassertZero()
-        MachineCoordinator.stopFan()
-    }
-
-    /**
      * What to do once the machine has answered a start.
      *
      * Stride's clock used to start regardless of the answer. On a console that had lost its link to
@@ -377,13 +358,7 @@ object WorkoutMachineCoupling {
                 // a belt that might be moving is always told to stop.
                 EndFollowUp.STOP -> stopOnMachine(abandonCause())
 
-                EndFollowUp.STOP_AND_SETTLE -> {
-                    // In this order, always. The stop preempts the queue; the settling writes only
-                    // append to it. Calling them the other way round would put a fan write in front
-                    // of the command that stops a treadmill.
-                    stopOnMachine(StopCause.ENDED)
-                    settleAfterEnd()
-                }
+                EndFollowUp.STOP_AND_SETTLE -> stopOnMachine(StopCause.ENDED, settle = true)
             }
         } catch (t: Throwable) {
             // A failure to command must never take down the timer or the overlay. The rider still
@@ -404,7 +379,7 @@ object WorkoutMachineCoupling {
      * was sent, and this class is the only thing that knows. The verdict itself is the
      * coordinator's; the policy is [shouldEscalate], which is pure and lives beside it.
      */
-    private fun stopOnMachine(cause: StopCause) {
+    private fun stopOnMachine(cause: StopCause, settle: Boolean = false) {
         // Retire the attempt before anything else. Any answer still in flight belongs to a start
         // the rider has left behind, and the token is what tells the two apart — without this bump
         // a slow reply could land after a retry had begun and be mistaken for that newer attempt's
@@ -421,7 +396,14 @@ object WorkoutMachineCoupling {
         val seenMoving = MachineLink.everReportedMotion &&
             (MachineLink.observation()?.speedMph ?: 0.0) > BELT_MOVING_MPH
         val token = synchronized(this) { ++stopToken }
-        MachineCoordinator.stop { verdict -> onStopSettled(token, verdict, cause, seenMoving) }
+        val onSettled = { verdict: StopVerdict ->
+            onStopSettled(token, verdict, cause, seenMoving)
+        }
+        if (settle) {
+            MachineCoordinator.stopAndSettle(onSettled)
+        } else {
+            MachineCoordinator.stop(onSettled)
+        }
     }
 
     /**
