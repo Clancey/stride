@@ -62,11 +62,12 @@ class GlassOsCommandEncodingTest {
 
     @Test
     fun `coordinator clamps stay inside the machine's reported range`() {
-        // The console reports 1.0-12.0 mph and -3 to 12% for this model. Plan section 5 requires
-        // clamping below the machine's own limits, never at or above them.
+        // Speed is still model 17125's own figure (1.0-12.0 mph). Incline was deliberately widened
+        // to -6/40% to cover incline trainers past model 17125's 12% -- confirmed against an X22i's
+        // own reported range, not a guess -- so it is checked against that range instead.
         assertTrue(MachineCoordinator.MAX_SPEED_MPH <= 12.0)
-        assertTrue(MachineCoordinator.MAX_INCLINE <= 12.0)
-        assertTrue(MachineCoordinator.MIN_INCLINE >= -3.0)
+        assertTrue(MachineCoordinator.MAX_INCLINE <= 40.0)
+        assertTrue(MachineCoordinator.MIN_INCLINE >= -6.0)
         // Zero must remain reachable even though the machine's minimum running speed is 1.0 mph,
         // because zero is how the belt is told to stop.
         assertEquals(0.0, MachineCoordinator.MIN_SPEED_MPH, 0.0)

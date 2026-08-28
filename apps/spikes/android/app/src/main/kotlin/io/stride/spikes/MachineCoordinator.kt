@@ -38,18 +38,25 @@ object MachineCoordinator {
     /**
      * The device-level ceiling, in mph and percent.
      *
-     * These are the values `ConsoleService` reports for this machine (model 17125: 1.0-12.0 mph,
-     * -3 to 12% incline), transcribed rather than read at runtime. A clamp the machine supplies can
-     * be widened by the machine; this one cannot, and plan section 3.6 requires a ceiling a profile
-     * may only ever lower.
+     * Speed's values are `ConsoleService`'s figures for model 17125 (1.0-12.0 mph), transcribed
+     * rather than read at runtime. A clamp the machine supplies can be widened by the machine; this
+     * one cannot, and plan section 3.6 requires a ceiling a profile may only ever lower.
+     *
+     * Incline's ceiling was widened from model 17125's -3/12% to -6/40% to cover incline trainers
+     * that genuinely exceed 12%, confirmed against an X22i's own reported range (§1 of
+     * `~/x22i-debug/INVESTIGATION_NOTES.md`: `minInclinePercent=-6.0, maxInclinePercent=40.0`, live
+     * on `dumpsys usb`/the FitPro handshake, not a guess). Still a fixed, human-set ceiling in the
+     * same sense speed's is: [MachineLimits.maxInclinePercent] only ever narrows [clampIncline]'s
+     * effective ceiling from here, never raises it past it, so a console misreporting its own range
+     * still cannot make Stride command a steeper incline than this.
      *
      * Speed's floor is 0 rather than the machine's 1.0 mph on purpose: 0 is how the belt is told to
      * stop, and clamping a stop up to 1 mph would be catastrophic.
      */
     const val MIN_SPEED_MPH = 0.0
     const val MAX_SPEED_MPH = 12.0
-    const val MIN_INCLINE = -3.0
-    const val MAX_INCLINE = 12.0
+    const val MIN_INCLINE = -6.0
+    const val MAX_INCLINE = 40.0
 
     /**
      * What the machine says its own limits are, when a transport can tell us. Null on a link that

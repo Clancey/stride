@@ -64,7 +64,7 @@ class RailPresetsTest {
     @Test
     fun `published presets outside installation clamps use an honest fallback`() {
         val entries = railPresetEntries(
-            published = listOf(40.0, 20.0, 15.0),
+            published = listOf(90.0, 60.0, 50.0),
             ladder = inclineLadder,
             floor = MachineCoordinator.MIN_INCLINE,
             ceiling = MachineCoordinator.MAX_INCLINE,
@@ -75,12 +75,12 @@ class RailPresetsTest {
     @Test
     fun `published presets cannot collapse into duplicate clamp commands`() {
         val entries = railPresetEntries(
-            published = listOf(40.0, 20.0, 12.0, 12.0, 10.0, -6.0, -3.0),
+            published = listOf(90.0, 40.0, 20.0, 12.0, 12.0, 10.0, -6.0, -3.0),
             ladder = inclineLadder,
             floor = MachineCoordinator.MIN_INCLINE,
             ceiling = MachineCoordinator.MAX_INCLINE,
         )
-        assertEquals(listOf("12", "10", "-3"), entries)
+        assertEquals(listOf("40", "20", "12", "10", "-6", "-3"), entries)
     }
 
     @Test
