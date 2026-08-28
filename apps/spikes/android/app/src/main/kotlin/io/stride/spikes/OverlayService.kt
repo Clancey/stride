@@ -2050,13 +2050,11 @@ class OverlayService : Service() {
     private fun addInclineRail() {
         val limits = MachineCoordinator.machineLimits
         val spacing = StrideSettings.inclineSpacing
-        val floor = maxOf(
-            MachineCoordinator.MIN_INCLINE,
-            limits?.minInclinePercent ?: MachineCoordinator.MIN_INCLINE,
-        )
-        val ceiling = minOf(
-            MachineCoordinator.MAX_INCLINE,
-            limits?.maxInclinePercent ?: MachineCoordinator.MAX_INCLINE,
+        val (floor, ceiling) = MachinePresets.railRange(
+            reportedMin = limits?.minInclinePercent,
+            reportedMax = limits?.maxInclinePercent,
+            installMin = MachineCoordinator.MIN_INCLINE,
+            installMax = MachineCoordinator.MAX_INCLINE,
         )
         val presets = railEntries(
             published = MachineLink.inclinePresets,
@@ -2187,13 +2185,11 @@ class OverlayService : Service() {
 
     private fun addSpeedRail() {
         val limits = MachineCoordinator.machineLimits
-        val floor = maxOf(
-            MachineCoordinator.MIN_SPEED_MPH,
-            limits?.minSpeedMph ?: MachineCoordinator.MIN_SPEED_MPH,
-        )
-        val ceiling = minOf(
-            MachineCoordinator.MAX_SPEED_MPH,
-            limits?.maxSpeedMph ?: MachineCoordinator.MAX_SPEED_MPH,
+        val (floor, ceiling) = MachinePresets.railRange(
+            reportedMin = limits?.minSpeedMph,
+            reportedMax = limits?.maxSpeedMph,
+            installMin = MachineCoordinator.MIN_SPEED_MPH,
+            installMax = MachineCoordinator.MAX_SPEED_MPH,
         )
         val presets = railEntries(
             published = MachineLink.speedPresets,

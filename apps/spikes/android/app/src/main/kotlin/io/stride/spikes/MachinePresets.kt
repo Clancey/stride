@@ -298,4 +298,27 @@ internal object MachinePresets {
 
     /** One decimal place, never rounding meaningfully above [v] — used for a range's upper bound. */
     fun floor1(v: Double): Double = kotlin.math.floor((v + QUANTIZATION_EPSILON) * 10.0) / 10.0
+
+    /**
+     * The floor/ceiling a rail's [railPresetEntries] filter should use for one axis: the reported
+     * machine limit intersected with the installation clamp, rounded through [ceil1]/[floor1] the
+     * same way [ladder] rounds its own endpoints.
+     *
+     * That last part is the reason this exists rather than each rail comparing against the raw
+     * reported limit directly. Confirmed live on an X22i: its 19.31 kph reported maximum decodes to
+     * 11.9987 mph, which [floor1] correctly rounds to the 12.0 the ladder puts a rung on -- but a
+     * filter built from the raw 11.9987 instead would compare `12.0 <= 11.9987`, fail, and silently
+     * drop that rung, undoing the endpoint rounding [ladder] just did. Both sides of one comparison
+     * have to agree on what "the machine's limit" means, or the more precise one always loses.
+     */
+    fun railRange(
+        reportedMin: Double?,
+        reportedMax: Double?,
+        installMin: Double,
+        installMax: Double,
+    ): Pair<Double, Double> {
+        val floor = maxOf(installMin, reportedMin?.let(::ceil1) ?: installMin)
+        val ceiling = minOf(installMax, reportedMax?.let(::floor1) ?: installMax)
+        return floor to ceiling
+    }
 }
