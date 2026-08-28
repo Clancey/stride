@@ -880,28 +880,37 @@ class _AdvancedSection extends StatelessWidget {
 
 /// How far apart the incline column's buttons sit.
 ///
-/// Two pills, and the coarse one is labelled with both of its steps rather than
-/// as "coarse". The two sides of flat are not spaced the same — 5% climbing,
-/// 3% declining — because a treadmill that declines at all rarely passes -6%,
-/// so a single 5% step would give a rider one decline button and call it a
-/// range. A label that hid that would make the column look wrong on arrival.
+/// Three pills. The coarse one is labelled with both of its steps rather than
+/// as "coarse" — the two sides of flat are not spaced the same, 5% climbing
+/// and 3% declining, because a treadmill that declines at all rarely passes
+/// -6%, so a single 5% step would give a rider one decline button and call it
+/// a range. A label that hid that would make the column look wrong on
+/// arrival. The third mirrors one specific console's own physical incline
+/// buttons (-6, -3, 0, 3, 6, 10, 15, 20, 25, 30, 35, 40 — confirmed against an
+/// X22i's keypad) rather than any general shape, so it may offer a shorter or
+/// even empty column on a machine whose range or button layout differs.
 class _InclineSpacingChoice extends StatelessWidget {
   const _InclineSpacingChoice({required this.spacing, required this.onChanged});
 
-  /// `'fine'` or `'coarse'`. Anything else is treated as the default rather
-  /// than as no selection: a pill row with nothing lit looks broken, and the
-  /// platform has already resolved an unreadable value to fine.
+  /// `'fine'`, `'coarse'`, or `'physical'`. Anything else is treated as the
+  /// default rather than as no selection: a pill row with nothing lit looks
+  /// broken, and the platform has already resolved an unreadable value to
+  /// fine.
   final String spacing;
   final ValueChanged<String> onChanged;
 
   @override
   Widget build(BuildContext context) {
     final coarse = spacing == 'coarse';
+    final physical = spacing == 'physical';
+    final fine = !coarse && !physical;
     return Row(
       children: [
-        _pill(context, 'Every 1%', !coarse, () => onChanged('fine')),
+        _pill(context, 'Every 1%', fine, () => onChanged('fine')),
         const SizedBox(width: StrideSpace.sm),
         _pill(context, '5% up, 3% down', coarse, () => onChanged('coarse')),
+        const SizedBox(width: StrideSpace.sm),
+        _pill(context, 'Console buttons', physical, () => onChanged('physical')),
       ],
     );
   }

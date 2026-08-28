@@ -21,6 +21,21 @@ enum class InclineSpacing {
 
     /** 5% climbing, 3% declining. See [MachinePresets.inclineLadder] for why the two differ. */
     COARSE,
+
+    /**
+     * The rungs of one specific console's own physical incline buttons: -6, -3, 0, 3, 6, 10, 15,
+     * 20, 25, 30, 35, 40. Confirmed against an X22i's own keypad, not derived from any register --
+     * see [MachinePresets.PHYSICAL_INCLINE_RUNGS].
+     *
+     * Opt-in, like [COARSE], and for the same reason spelled out there: nobody who has not chosen
+     * this gets a different column. Unlike [COARSE] this is not a general shape ("5 up, 3 down")
+     * that fits any reported range -- it is one console's fixed list, intersected with whatever range
+     * the machine and installation actually allow the same way every other spacing is. A rider on a
+     * different console who selects it gets whichever of these twelve values their own machine's
+     * range happens to permit, which may be a short or empty column; there is no way to know this
+     * matches another model's buttons without measuring that model too.
+     */
+    PHYSICAL,
     ;
 
     companion object {
@@ -64,6 +79,10 @@ internal object MachinePresets {
 
     /** [InclineSpacing.COARSE] descending, below flat. */
     const val DECLINE_STEP_COARSE = 3.0
+
+    /** [InclineSpacing.PHYSICAL]'s fixed list, highest first to match every other ladder's order. */
+    val PHYSICAL_INCLINE_RUNGS: List<Double> =
+        listOf(40.0, 35.0, 30.0, 25.0, 20.0, 15.0, 10.0, 6.0, 3.0, 0.0, -3.0, -6.0)
 
     /**
      * Speed quick picks over the range both the machine and this installation permit.
@@ -125,6 +144,15 @@ internal object MachinePresets {
         // Verbatim, not "step = 1.0 happens to be the same". This is the guarantee that a rider who
         // never opens the setting sees exactly the column they saw before it existed.
         if (spacing == InclineSpacing.FINE) return ladder(min, max, INCLINE_STEP_FINE)
+
+        if (spacing == InclineSpacing.PHYSICAL) {
+            if (!min.isFinite() || !max.isFinite() || max < min) return emptyList()
+            // No synthetic endpoint the way [ladder] adds one: every rung here is a claim that a
+            // real button exists at that value, and a machine whose range does not reach one of the
+            // twelve is a machine that gets fewer of them, or none, rather than an invented one that
+            // does not correspond to anything printed on a keypad.
+            return PHYSICAL_INCLINE_RUNGS.filter { it in min..max }
+        }
 
         // Repeated from [ladder] rather than left to it. Splitting first would ask each half about a
         // sub-range of a nonsensical one, and a half that happens to be valid — the decline side of

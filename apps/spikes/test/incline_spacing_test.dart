@@ -180,6 +180,37 @@ void main() {
     expect(lit(tester, '5% up, 3% down'), isFalse);
   });
 
+  /// The third pill, mirroring one console's own physical incline buttons.
+  testWidgets('choosing the console-buttons column sends physical', (
+    tester,
+  ) async {
+    await openAdvanced(tester);
+    await tapPill(tester, 'Console buttons');
+
+    expect(spacingWrites, <Map<String, Object?>>[
+      <String, Object?>{'spacing': 'physical'},
+    ]);
+    expect(lit(tester, 'Console buttons'), isTrue);
+    expect(lit(tester, 'Every 1%'), isFalse);
+    expect(lit(tester, '5% up, 3% down'), isFalse);
+  });
+
+  testWidgets('the platform reporting physical lights only that pill', (
+    tester,
+  ) async {
+    settings = <String, Object?>{
+      'transport': 'glassos',
+      'inclineSpacing': 'physical',
+    };
+    await openAdvanced(tester);
+    await tester.ensureVisible(find.text('Console buttons'));
+    await tester.pumpAndSettle();
+
+    expect(lit(tester, 'Console buttons'), isTrue);
+    expect(lit(tester, 'Every 1%'), isFalse);
+    expect(lit(tester, '5% up, 3% down'), isFalse);
+  });
+
   /// The copy has to say where the setting does and does not apply. On iFit the
   /// console publishes its own quick picks and this choice cannot re-space
   /// them, and a rider who is not told that will report the setting as broken.

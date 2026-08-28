@@ -271,4 +271,47 @@ class InclineLadderTest {
             MachinePresets.ladder(0.0, 12.0, 1.0),
         )
     }
+
+    // ---- InclineSpacing.PHYSICAL: one console's own buttons, not a general shape ---------------
+
+    private val physical = InclineSpacing.PHYSICAL
+
+    @Test
+    fun `physical parses like any other named spacing`() {
+        assertEquals(physical, InclineSpacing.parse("physical"))
+        assertEquals(physical, InclineSpacing.parse("PHYSICAL"))
+    }
+
+    /** The fixed list itself, highest first — what every other test here filters a subset of. */
+    @Test
+    fun `the physical rungs are the console's own twelve values`() {
+        assertEquals(
+            listOf(40.0, 35.0, 30.0, 25.0, 20.0, 15.0, 10.0, 6.0, 3.0, 0.0, -3.0, -6.0),
+            MachinePresets.PHYSICAL_INCLINE_RUNGS,
+        )
+    }
+
+    /**
+     * A narrower range gets only the rungs that fall inside it — no synthetic endpoint the way
+     * [MachinePresets.ladder] adds one, because every value here is a claim that a physical button
+     * exists at it.
+     */
+    @Test
+    fun `a narrower range gets only the rungs it actually contains`() {
+        assertEquals(listOf(6.0, 3.0, 0.0, -3.0), MachinePresets.inclineLadder(-4.0, 8.0, physical))
+    }
+
+    /** A range with no fixed rung in it is an honestly empty column, not an invented one. */
+    @Test
+    fun `a range between two rungs offers nothing rather than a nearby value`() {
+        assertTrue(MachinePresets.inclineLadder(1.0, 2.0, physical).isEmpty())
+    }
+
+    /** Still bounded by the installation clamp, the same as every other spacing. */
+    @Test
+    fun `physical is still intersected with the installation clamp`() {
+        // MIN_INCLINE..MAX_INCLINE is -3.0..12.0; -6.0 and every rung above 12.0 must not appear.
+        val out = MachinePresets.inclineLadder(-60.0, 100.0, physical)
+        assertEquals(listOf(10.0, 6.0, 3.0, 0.0, -3.0), out)
+    }
 }

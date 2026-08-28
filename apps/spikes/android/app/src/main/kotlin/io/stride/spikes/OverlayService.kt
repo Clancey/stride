@@ -227,6 +227,13 @@ class OverlayService : Service() {
             InclineSpacing.COARSE,
         )
 
+        /** As [INCLINE_LADDER_COARSE], for a rider who asked for [InclineSpacing.PHYSICAL]. */
+        private val INCLINE_LADDER_PHYSICAL = MachinePresets.inclineLadder(
+            INCLINE_LADDER.last(),
+            INCLINE_LADDER.first(),
+            InclineSpacing.PHYSICAL,
+        )
+
         private val SPEED_LADDER = listOf(12.0, 10.0, 9.0, 8.0, 7.0, 6.0, 5.0, 4.0, 3.0, 2.0, 1.0)
 
         /**
@@ -2065,6 +2072,8 @@ class OverlayService : Service() {
                 )
             } else if (spacing == InclineSpacing.COARSE) {
                 INCLINE_LADDER_COARSE
+            } else if (spacing == InclineSpacing.PHYSICAL) {
+                INCLINE_LADDER_PHYSICAL
             } else {
                 INCLINE_LADDER
             },
