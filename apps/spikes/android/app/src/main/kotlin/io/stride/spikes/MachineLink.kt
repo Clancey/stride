@@ -479,6 +479,22 @@ object MachineLink {
     @Volatile private var vertGainPublication: VertGainPublication? = null
 
     /**
+     * The rider-facing distance figure, guarded against a register glitch [foldDisplayDistance]
+     * exists to absorb.
+     */
+    data class DisplayDistanceState(
+        val workoutId: String?,
+        val distanceMiles: Double?,
+    )
+
+    private data class DisplayDistancePublication(
+        val state: DisplayDistanceState,
+        val atMs: Long,
+    )
+
+    @Volatile private var displayDistancePublication: DisplayDistancePublication? = null
+
+    /**
      * Fold one complete telemetry poll into vertical gain.
      *
      * The rectangle uses the incline reported on the poll that closes each distance interval. That
@@ -524,6 +540,42 @@ object MachineLink {
         val total = (previous.feet ?: 0.0) + gained
         if (!total.isFinite()) return previous
         return previous.copy(distanceMiles = distance, feet = total)
+    }
+
+    /**
+     * Fold one telemetry poll into the rider-facing distance figure.
+     *
+     * Guards against exactly what was seen live on an X22i: `CURRENT_DISTANCE` read a hard `0.0`
+     * for several consecutive polls across a pause, with the belt's true distance unchanged (a
+     * separate register, `DISTANCE`, kept reporting the correct value the whole time). Displaying
+     * that zero verbatim would read to the rider as lost progress rather than the register glitch
+     * it is. A backwards reading is therefore held at the last good value instead of drawn, the same
+     * way [foldVertGain] treats one -- kept as its own fold, rather than reusing that one's baseline,
+     * so a momentarily missing incline reading can never blank the distance figure too.
+     *
+     * Safety code must keep reading distance from the raw [GlassOsClient.Snapshot]/[Observation]
+     * instead of this fold: a workout that genuinely restarts needs its true zero to reach a stop
+     * confirmation, not a display-smoothed one.
+     */
+    fun foldDisplayDistance(
+        previous: DisplayDistanceState?,
+        read: GlassOsClient.Snapshot,
+    ): DisplayDistanceState {
+        val distance = read.distanceMiles?.takeIf { it.isFinite() && it >= 0.0 }
+
+        // Same hard boundary foldVertGain draws: a new workout identity, including into or out of
+        // null, starts a fresh baseline rather than inheriting one that belongs to a different run.
+        if (previous == null || previous.workoutId != read.workoutId) {
+            return DisplayDistanceState(read.workoutId, distance)
+        }
+
+        val baseline = previous.distanceMiles
+        val next = when {
+            distance == null -> baseline
+            baseline == null || distance >= baseline -> distance
+            else -> baseline
+        }
+        return previous.copy(distanceMiles = next)
     }
 
     /**
@@ -825,8 +877,18 @@ object MachineLink {
     /** Current incline percent. Null means unknown. */
     val inclinePercent: Double? get() = fresh()?.inclinePercent
 
-    /** Distance covered this session, as measured by the machine. Null means unknown. */
-    val distanceMiles: Double? get() = fresh()?.distanceMiles
+    /**
+     * Distance covered this session, as measured by the machine. Null means unknown.
+     *
+     * Goes through [foldDisplayDistance] rather than the raw poll, so a console whose distance
+     * register glitches backward mid-workout does not flash a wrong number at the rider. Safety
+     * code must use [Observation.distanceMiles] instead -- see that fold's own note.
+     */
+    val distanceMiles: Double?
+        get() = displayDistancePublication
+            ?.takeIf { System.currentTimeMillis() - it.atMs <= FRESHNESS_MS }
+            ?.state
+            ?.distanceMiles
 
     /**
      * Positive vertical gain accumulated from distance and incline telemetry, in feet.
@@ -1627,6 +1689,7 @@ object MachineLink {
     private fun clearTelemetryPublication() {
         timedSnapshot = null
         vertGainPublication = null
+        displayDistancePublication = null
         latestObservation = null
         workoutMotion.reset()
         everReportedMotion = false
@@ -1652,13 +1715,13 @@ object MachineLink {
                     // regardless of which handshake path got it there. Consume the outage here so
                     // this first sample becomes a baseline rather than charging its whole gap at the
                     // recovery incline.
-                    val previousGain = if (glassOsReconnect.takeLost()) {
-                        null
-                    } else {
-                        vertGainPublication?.state
-                    }
+                    val reconnected = glassOsReconnect.takeLost()
+                    val previousGain = if (reconnected) null else vertGainPublication?.state
                     val gain = foldVertGain(previousGain, read)
                     vertGainPublication = VertGainPublication(gain, at)
+                    val previousDisplayDistance = if (reconnected) null else displayDistancePublication?.state
+                    val displayDistance = foldDisplayDistance(previousDisplayDistance, read)
+                    displayDistancePublication = DisplayDistancePublication(displayDistance, at)
                     timedSnapshot = TimedSnapshot(read, at)
                     val motion = workoutMotion.observe(
                         motionGeneration,
