@@ -93,8 +93,11 @@ class SpeedDisplayFallbackTest {
         val snapshot = client(FakeWire(setpointKph = FitProValues.KPH_PER_MPH * 2.0, actualKph = 0.0))
             .read()!!
 
+        // displaySpeedMph itself carries the register's own small quantization residual (see
+        // FitProValues.paceMinPerMile) -- paceMinPerMile rounds past it, so the two are compared
+        // against the rider's clean 2.0 mph ask rather than against each other.
         assertEquals(2.0, snapshot.displaySpeedMph!!, 0.01)
-        assertEquals(60.0 / snapshot.displaySpeedMph!!, snapshot.paceMinPerMile!!, 0.001)
+        assertEquals(30.0, snapshot.paceMinPerMile!!, 0.001)
     }
 
     @Test
@@ -142,5 +145,38 @@ class SpeedDisplayFallbackTest {
 
         val unproven = client(FakeWire(setpointKph = 8.0, actualKph = 0.0))
         assertEquals(FitProValues.kphToMph(8.0), unproven.read()!!.displaySpeedMph!!, 0.001)
+    }
+
+    // --------------------------------------- pace rounds to the speed's own displayed precision
+
+    /**
+     * A rider commanding a clean mph value always gets a clean pace back, however the register's
+     * 0.01 kph resolution happened to round that request.
+     *
+     * Measured live on an X22i: a commanded 4 mph paced 15:01 instead of 15:00, because `KPH` could
+     * only hold 6.43 or 6.44 kph, never exactly 6.437376. [FitProValues.paceMinPerMile] rounds its
+     * input to the tenth already shown on screen before dividing, which is comfortably wider than
+     * the register's worst-case ~0.006 mph residual.
+     */
+    @Test
+    fun `pace matches the speed shown, not the register's exact quantization`() {
+        for (mph in listOf(1.0, 2.0, 4.0, 6.0, 11.9)) {
+            val kph = FitProValues.mphToKph(mph)
+            val snapshot = client(FakeWire(setpointKph = kph, actualKph = 0.0)).read()!!
+            assertEquals("$mph mph", 60.0 / mph, snapshot.paceMinPerMile!!, 1e-9)
+        }
+    }
+
+    @Test
+    fun `paceMinPerMile rounds to one decimal, not two`() {
+        // 3.9956 rounds to 4.0 at one decimal (the fix), but to 4.00 at two -- which would still
+        // leave the residual visible. One decimal is what the speed readout itself shows.
+        assertEquals(15.0, FitProValues.paceMinPerMile(3.9956)!!, 1e-9)
+        assertEquals(15.0, FitProValues.paceMinPerMile(4.0044)!!, 1e-9)
+    }
+
+    @Test
+    fun `paceMinPerMile is still null for a belt rounding down to a stop`() {
+        assertNull(FitProValues.paceMinPerMile(0.04))
     }
 }

@@ -112,24 +112,6 @@ class DirectMachineSession(
         private set
 
     /**
-     * The speed, in mph, most recently *accepted* over this link — before [FitProCodec.encodeSpeed]
-     * rounds it to the register's 0.01 kph resolution.
-     *
-     * Exists for [DirectMachineClient]'s issue #34 display fallback: a rider who asks for 1 mph gets
-     * 1.609344 kph rounded to the nearest representable 1.61 kph, which reads back as 1.0004 mph and
-     * paces a clean mile at 59:59 rather than 60:00 — not a bug, just the register's own quantization
-     * made visible. [DirectMachineClient.read] uses this in place of that round-tripped value, but
-     * only when the two agree to within one quantization step, which is what proves this accepted
-     * write is what the register is actually holding rather than a stale memory of a different one.
-     *
-     * Set only from an accepted write ([authorisedWrite]), never a refused one — a refusal must not
-     * overwrite what the console is still actually holding with the target it just declined.
-     */
-    @Volatile
-    var lastRequestedSpeedMph: Double? = null
-        private set
-
-    /**
      * How far [initializeStartGate] got on this console, and therefore whether control is trustworthy.
      *
      * Read by [authorisedWrite] the same way [FitProProbe.refusalReason] is: a console whose start
@@ -402,15 +384,6 @@ class DirectMachineSession(
     }
 
     /**
-     * Records [lastRequestedSpeedMph]. Called by a KPH writer with its own pre-encoding mph value,
-     * only once the write is confirmed accepted — never with the register's post-rounding echo,
-     * which would just reintroduce the quantization this field exists to see past.
-     */
-    internal fun noteAcceptedSpeedMph(mph: Double) {
-        lastRequestedSpeedMph = mph
-    }
-
-    /**
      * Perform the startup handshake, in the order GlassOS performs it.
      *
      * `xh/n0.F()` is the model: start the link, ask `DEVICE_INFO`, keep the resulting device record
@@ -430,7 +403,6 @@ class DirectMachineSession(
         replyAddress = null
         supportedCommands = emptySet()
         fanRegister = null
-        lastRequestedSpeedMph = null
         startGate = StartGate.NotApplicable
         probe.reset()
         forgetSecurity()
@@ -1061,8 +1033,23 @@ object FitProValues {
      */
     fun metresToMiles(metres: Int): Double = metres / METRES_PER_MILE
 
-    /** Minutes per mile at [mph], or null when stopped — dividing by zero would render as "∞". */
-    fun paceMinPerMile(mph: Double): Double? = if (mph > 0.1) 60.0 / mph else null
+    /**
+     * Minutes per mile at [mph], or null when stopped — dividing by zero would render as "∞".
+     *
+     * Rounds [mph] to the tenth already shown on screen (the overlay's speed readout formats to one
+     * decimal place) before dividing, rather than dividing the raw register value. `KPH` only holds
+     * hundredths of a km/h, so a requested 4 mph reads back as something like 3.9956 or 4.0044 — at most
+     * ~0.006 mph off, confirmed live to pace a 15:01 mile instead of 15:00. That residual is an
+     * order of magnitude smaller than half a tenth of a mile per hour (0.05), so rounding to the
+     * displayed precision absorbs it completely and makes the pace shown agree with the speed shown,
+     * for any speed a rider would actually select — without having to track which write produced
+     * the reading. Two decimals would not be safe here: the residual is close enough to a
+     * hundredth's own half-width (0.005) that it would not always round away.
+     */
+    fun paceMinPerMile(mph: Double): Double? {
+        val rounded = Math.round(mph * 10.0) / 10.0
+        return if (rounded > 0.1) 60.0 / rounded else null
+    }
 
     /**
      * Translates FitPro's [FitProCodec.WorkoutMode] to the console-state *names* that
@@ -1196,24 +1183,8 @@ class DirectMachineClient(private val session: DirectMachineSession) {
         val actualSpeedMph = response.value(FitProCodec.Register.ACTUAL_KPH)
             ?.let { FitProValues.kphToMph(FitProCodec.decodeSpeed(it)) }
         if ((actualSpeedMph ?: 0.0) > BELT_MOVING_MPH) actualSpeedReportedMotion = true
-        val confirmedSetpointMph = response.value(FitProCodec.Register.KPH)
+        val setpointSpeedMph = response.value(FitProCodec.Register.KPH)
             ?.let { FitProValues.kphToMph(FitProCodec.decodeSpeed(it)) }
-        // Prefer the clean value Stride actually asked for over the register's own round-tripped
-        // echo, but only when they agree to within one quantization step: that is what proves the
-        // accepted write really is what the register is holding, rather than a stale target from
-        // before a console-side change. This is what turns a requested 1 mph into a 60:00 pace
-        // instead of the register's nearest representable 1.61 kph (59:59) — see
-        // DirectMachineSession.lastRequestedSpeedMph. It never contradicts the confirmed register;
-        // it only replaces that register's own quantization noise with the value that produced it.
-        val requested = session.lastRequestedSpeedMph
-        val setpointSpeedMph = if (
-            requested != null && confirmedSetpointMph != null &&
-            Math.abs(requested - confirmedSetpointMph) <= SPEED_QUANTUM_MPH
-        ) {
-            requested
-        } else {
-            confirmedSetpointMph
-        }
         // iFit makes this same source choice for belt machines. It is display-only: speedMph below
         // remains ACTUAL_KPH, so MachineLink's observation and everReportedMotion latch never see a
         // commanded target. Outside a moving workout state, do not resurrect a stale setpoint from
@@ -1338,16 +1309,6 @@ class DirectMachineClient(private val session: DirectMachineSession) {
 
     private companion object {
         /**
-         * One quantization step of the `KPH` register (0.01 kph), in mph.
-         *
-         * The largest possible gap between a requested speed and the nearest value the register can
-         * actually hold, after [FitProCodec.encodeSpeed]'s rounding. Used as the tolerance for
-         * trusting [DirectMachineSession.lastRequestedSpeedMph] in place of the register's own
-         * round-tripped echo — see where it is read, above.
-         */
-        const val SPEED_QUANTUM_MPH = 0.01 / FitProValues.KPH_PER_MPH
-
-        /**
          * One poll's worth of registers, all read-only.
          *
          * `WORKOUT_MODE` is writable but perfectly readable — the read block is a plain bitmask with
@@ -1418,7 +1379,7 @@ class DirectMachineCommands(private val session: DirectMachineSession) : Machine
     override fun setSpeedKph(kph: Double): MachineAck =
         write("speed", FitProCodec.Register.KPH) {
             listOf(FitProCodec.writeOf(FitProCodec.Register.KPH, FitProCodec.encodeSpeed(kph)))
-        }.also { if (it is MachineAck.Ok) session.noteAcceptedSpeedMph(FitProValues.kphToMph(kph)) }
+        }
 
     override fun setInclinePercent(percent: Double): MachineAck =
         write("incline", FitProCodec.Register.GRADE) {
@@ -1518,7 +1479,7 @@ class DirectMachineCommands(private val session: DirectMachineSession) : Machine
                     )
                 }
             }
-        }.also { if (it is MachineAck.Ok) session.noteAcceptedSpeedMph(FitProValues.kphToMph(kph)) }
+        }
 
     /** Flat, unless the machine cannot be flat, in which case as close to it as it goes. */
     private fun openingInclinePercent(): Double {
@@ -1586,7 +1547,6 @@ class DirectMachineCommands(private val session: DirectMachineSession) : Machine
         val speedAck = write("stop speed", FitProCodec.Register.KPH, startGateExempt = true) {
             listOf(FitProCodec.writeOf(FitProCodec.Register.KPH, FitProCodec.encodeSpeed(0.0)))
         }
-        if (speedAck is MachineAck.Ok) session.noteAcceptedSpeedMph(0.0)
         if (speedAck !is MachineAck.Ok) {
             Log.w(TAG, "stop: speed-to-zero was not accepted: $speedAck")
         }
