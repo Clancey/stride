@@ -341,6 +341,18 @@ class GlassOsClient(private val context: Context) {
          * grip sensors, which is the normal case for anyone actually running.
          */
         val heartRateBpm: Int? = null,
+        /**
+         * Motor power draw in watts, as the *machine* reports it, or null when it does not report
+         * one.
+         *
+         * Direct-path only — GlassOS and FTMS leave it null. Not a speed proxy: power depends on
+         * rider weight and incline as well as belt speed, so this must never be calibrated into a
+         * displayed mph figure. Its one job is [MachineLink.everReportedLoad]: a second, independent
+         * signal that the belt is genuinely under load, for a console like the X22i (issue #34)
+         * whose speed register never proves itself. It does **not** decay while merely paused, only
+         * when the console actually leaves `RUNNING` — see [MachineLink.everReportedLoad].
+         */
+        val wattsW: Int? = null,
     ) {
         /**
          * Fan speed, 0..[MachineLink.FAN_MAX], or null when we do not know.

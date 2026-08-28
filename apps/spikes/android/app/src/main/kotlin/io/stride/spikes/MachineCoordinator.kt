@@ -736,7 +736,13 @@ object MachineCoordinator {
                     ?.let { observations.add(it) }
                 val ack = acked
                 if (ack != null) {
-                    val verdict = stopVerdict(ack, MachineLink.everReportedMotion, beforeStop, observations)
+                    val verdict = stopVerdict(
+                        ack,
+                        MachineLink.everReportedMotion,
+                        MachineLink.everReportedLoad,
+                        beforeStop,
+                        observations,
+                    )
                     if (verdict is StopVerdict.Confirmed) {
                         finish(verdict)
                         return
@@ -749,7 +755,15 @@ object MachineCoordinator {
                     }
                 }
                 if (System.nanoTime() >= deadlineAt) {
-                    finish(stopVerdict(acked ?: false, MachineLink.everReportedMotion, beforeStop, observations))
+                    finish(
+                        stopVerdict(
+                            acked ?: false,
+                            MachineLink.everReportedMotion,
+                            MachineLink.everReportedLoad,
+                            beforeStop,
+                            observations,
+                        ),
+                    )
                 }
             } catch (t: Throwable) {
                 // A watcher that throws must not leave the ending path waiting forever, and must
@@ -1224,8 +1238,9 @@ enum class StopUnconfirmed {
     NOT_ACKED,
 
     /**
-     * This console's speed register has never reported motion on this link, so its zero is worth
-     * nothing. Issue #34 — see [MachineLink.everReportedMotion].
+     * Neither this console's speed register nor its watts register has ever reported real motion
+     * or load on this link, so a zero from either is worth nothing. Issue #34 — see
+     * [MachineLink.everReportedMotion] and [MachineLink.everReportedLoad].
      */
     NEVER_REPORTED_MOTION,
 
@@ -1269,10 +1284,12 @@ private const val DISTANCE_STILL_MILES = 1e-6
  * 1. **The console acked.** Necessary and nowhere near sufficient: an ack says a console took a
  *    register write, which is the exact thing this issue exists because somebody once mistook for a
  *    stopped belt.
- * 2. **The speed register has proved it reports motion**, via [MachineLink.everReportedMotion]. On
- *    the X22i `ACTUAL_KPH` reads a confident, well-formed `0x0000` on every poll while a rider walks
- *    at 4 mph (issue #34), and there is no per-field validity marker in the protocol that could tell
- *    that apart from a real zero. A console that has only ever said zero is not saying anything.
+ * 2. **The speed register has proved it reports motion**, via [MachineLink.everReportedMotion], or
+ *    failing that, **the watts register has**, via [MachineLink.everReportedLoad]. On the X22i
+ *    `ACTUAL_KPH` reads a confident, well-formed `0x0000` on every poll while a rider walks at 4 mph
+ *    (issue #34), and there is no per-field validity marker in the protocol that could tell that
+ *    apart from a real zero — a console that has only ever said zero is not saying anything, on
+ *    either register.
  * 3. **Two agreeing readings say the belt is at rest, at least one of them from after the stop.**
  *    Two, not one, because a single sample cannot distinguish a belt at rest from a belt passing
  *    through a reading. At least one from after, by poll count, because otherwise a reading taken
@@ -1329,6 +1346,30 @@ private const val DISTANCE_STILL_MILES = 1e-6
  * still running. On the X22i that is not hypothetical — it is what #34 observed, with
  * `CURRENT_DISTANCE` accumulating the real pace beside a speed stuck at zero.
  *
+ * ## The [MachineLink.everReportedLoad] fallback — for a console where speed never proves itself
+ *
+ * Confirmed live on an X22i (issue #34): [MachineLink.everReportedMotion] can simply never become
+ * true on some consoles, because the speed register is stuck at a confident, well-formed zero
+ * forever. Without a fallback, every single stop on such a console escalates to the safety key —
+ * correct the first time, and then every time after, for a console this file otherwise handles
+ * perfectly well. That is not hypothetical either: it is what happened on this same console, twice,
+ * once the connection issues masking it were fixed.
+ *
+ * `WATTS` — motor power draw, a direct-path-only measurement — does the same job from the motor's
+ * side, and was confirmed live to fall to a genuine `0` within ~1.2s of an actual stop, on the same
+ * console and the same link where speed never once left zero.
+ *
+ * The fallback only ever activates in place of a signal that has never proven itself, never instead
+ * of one that has: `trustSpeed` below is exactly [MachineLink.everReportedMotion], unchanged, so a
+ * console whose speed register already works sees no behaviour change at all. `trustLoad` only
+ * turns on when `trustSpeed` is false. Nothing here weakens the speed-based path; it only gives a
+ * console that never had one a second way to earn a real confirmation instead of an unconditional
+ * escalation.
+ *
+ * Not yet handled: a console where *both* signals work. Today speed wins outright and watts is
+ * ignored in that case, rather than the two being required to agree. That is a strengthening left
+ * for later, in the spirit of the rest of this file — it must not be dropped in the other direction.
+ *
  * ## Why this is stricter than [mayFlattenDeck], which looks like the same question
  *
  * It is not the same question. [mayFlattenDeck] asks whether a deck may be driven flat, and gets
@@ -1341,14 +1382,26 @@ private const val DISTANCE_STILL_MILES = 1e-6
 internal fun stopVerdict(
     acked: Boolean,
     everReportedMotion: Boolean,
+    everReportedLoad: Boolean,
     beforeStop: MachineLink.Observation?,
     postStop: List<MachineLink.Observation>,
 ): StopVerdict {
     if (!acked) return StopVerdict.Unconfirmed(StopUnconfirmed.NOT_ACKED)
-    if (!everReportedMotion) return StopVerdict.Unconfirmed(StopUnconfirmed.NEVER_REPORTED_MOTION)
+    // trustLoad only ever activates in place of a signal that has never proven itself, never
+    // instead of one that has: a console whose speed register already works sees no behaviour
+    // change at all, because trustSpeed is exactly everReportedMotion, unchanged.
+    val trustSpeed = everReportedMotion
+    val trustLoad = !trustSpeed && everReportedLoad
+    if (!trustSpeed && !trustLoad) {
+        return StopVerdict.Unconfirmed(StopUnconfirmed.NEVER_REPORTED_MOTION)
+    }
     val last = postStop.lastOrNull() ?: return StopVerdict.Unconfirmed(StopUnconfirmed.NOT_OBSERVED)
-    val lastSpeed = last.speedMph
+    val lastSpeed = last.speedMph.takeIf { trustSpeed }
     if (lastSpeed != null && lastSpeed > BELT_MOVING_MPH) {
+        return StopVerdict.Unconfirmed(StopUnconfirmed.STILL_MOVING)
+    }
+    val lastWatts = last.wattsW.takeIf { trustLoad }
+    if (lastWatts != null && lastWatts > 0) {
         return StopVerdict.Unconfirmed(StopUnconfirmed.STILL_MOVING)
     }
     // The *trailing* run, so a belt that read at rest and then moved again cannot be confirmed by
@@ -1358,7 +1411,11 @@ internal fun stopVerdict(
     // The reading taken as the stop went out is allowed to complete the run, but never to be the
     // whole of it: the check below requires the run to contain something from after the stop.
     val window = listOfNotNull(beforeStop) + postStop
-    val rest = window.takeLastWhile { it.speedMph != null && it.speedMph <= BELT_MOVING_MPH }
+    val rest = window.takeLastWhile { observation ->
+        val speed = observation.speedMph.takeIf { trustSpeed }
+        val watts = observation.wattsW.takeIf { trustLoad }
+        (speed != null && speed <= BELT_MOVING_MPH) || (watts != null && watts <= 0)
+    }
     if (rest.size < 2) return StopVerdict.Unconfirmed(StopUnconfirmed.NOT_OBSERVED)
     if (rest.none { it.seq >= (postStop.firstOrNull()?.seq ?: Long.MAX_VALUE) }) {
         return StopVerdict.Unconfirmed(StopUnconfirmed.NOT_OBSERVED)

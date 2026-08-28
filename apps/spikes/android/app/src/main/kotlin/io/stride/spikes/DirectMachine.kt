@@ -1209,6 +1209,7 @@ class DirectMachineClient(private val session: DirectMachineSession) {
                 ?.let(FitProCodec::decodeCalories),
             speedWritable = duringWorkout && session.supports(FitProCodec.Register.KPH) != false,
             inclineWritable = duringWorkout && session.supports(FitProCodec.Register.GRADE) != false,
+            wattsW = response.value(FitProCodec.Register.WATTS)?.let(FitProCodec::decodeInt),
             fanWritable = writable && session.fanRegister != null,
             // Whichever register this console said it implements, decoded to the shared FAN_*
             // numbering. Auto survives here where it used to be flattened away, because the
@@ -1308,6 +1309,10 @@ class DirectMachineClient(private val session: DirectMachineSession) {
             FitProCodec.Register.ACTUAL_KPH,
             FitProCodec.Register.ACTUAL_INCLINE,
             FitProCodec.Register.CURRENT_CALORIES,
+            // Motor power draw. Not shown anywhere on its own — it exists for
+            // MachineLink.everReportedLoad, issue #34's fallback for a console whose ACTUAL_KPH
+            // never proves itself.
+            FitProCodec.Register.WATTS,
         )
 
         /**

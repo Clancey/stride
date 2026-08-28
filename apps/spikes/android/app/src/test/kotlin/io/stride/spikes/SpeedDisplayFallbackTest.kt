@@ -23,12 +23,12 @@ class SpeedDisplayFallbackTest {
         override val variant = FitProCodec.Variant.FITPRO1
 
         override fun exchange(frame: ByteArray, command: FitProCodec.Command): ByteArray {
-            // KPH(2), CURRENT_DISTANCE(4), RUNNING_TIME(4), WORKOUT_MODE(1), ACTUAL_KPH(2),
-            // ACTUAL_INCLINE(2), CURRENT_CALORIES(4), in ascending field order.
-            val values = ByteArray(19)
+            // KPH(2), WATTS(2), CURRENT_DISTANCE(4), RUNNING_TIME(4), WORKOUT_MODE(1),
+            // ACTUAL_KPH(2), ACTUAL_INCLINE(2), CURRENT_CALORIES(4), in ascending field order.
+            val values = ByteArray(21)
             FitProCodec.encodeSpeed(setpointKph).copyInto(values, 0)
-            values[10] = mode.value.toByte()
-            FitProCodec.encodeSpeed(actualKph).copyInto(values, 11)
+            values[12] = mode.value.toByte()
+            FitProCodec.encodeSpeed(actualKph).copyInto(values, 13)
 
             val total = FitProCodec.FRAME_OVERHEAD + 1 + values.size
             return ByteArray(total).also { reply ->

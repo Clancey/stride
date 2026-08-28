@@ -545,6 +545,8 @@ object MachineLink {
         val workoutEpoch: Long?,
         /** Whether this workout, not merely this link, has produced a credible motion reading. */
         val reportedMotionInWorkout: Boolean,
+        /** Motor power draw in watts, or null. Direct-path only — see [GlassOsClient.Snapshot.wattsW]. */
+        val wattsW: Int? = null,
     )
 
     @Volatile private var latestObservation: Observation? = null
@@ -609,6 +611,26 @@ object MachineLink {
      */
     @Volatile
     var everReportedMotion: Boolean = false
+        private set
+
+    /**
+     * Whether this machine has ever, on this link, reported real motor power draw.
+     *
+     * The same idea as [everReportedMotion], for a console where that never becomes true. `WATTS`
+     * is the direct path's motor-power register — a measurement, not a setpoint — and on an X22i
+     * exhibiting issue #34 it works where `ACTUAL_KPH` does not: confirmed live to rise with an
+     * actual speed change and fall to a genuine `0` within ~1.2s of an actual stop, on a link where
+     * `ACTUAL_KPH` read a confident zero throughout.
+     *
+     * Not a substitute for [everReportedMotion] in every role — it does **not** decay while the
+     * console is merely paused, only when it actually leaves `RUNNING` — so [stopVerdict] uses it
+     * as a fallback corroboration, never in place of a speed reading that has already proved itself.
+     *
+     * Reset with the snapshot when a transport is torn down, same as [everReportedMotion]: a
+     * different machine has to prove itself again.
+     */
+    @Volatile
+    var everReportedLoad: Boolean = false
         private set
 
     /**
@@ -1603,6 +1625,7 @@ object MachineLink {
         latestObservation = null
         workoutMotion.reset()
         everReportedMotion = false
+        everReportedLoad = false
         fanSeen = false
     }
 
@@ -1648,8 +1671,12 @@ object MachineLink {
                         read.distanceMiles,
                         motion.epoch,
                         motion.reportedMotion,
+                        read.wattsW,
                     )
                     if ((read.speedMph ?: 0.0) > BELT_MOVING_MPH) everReportedMotion = true
+                    // Same idea, for a console where the above never becomes true. See
+                    // everReportedLoad.
+                    if ((read.wattsW ?: 0) > 0) everReportedLoad = true
                     if (read.fanWritable == true || read.fanState != null) fanSeen = true
                     // Keep the continuation under the same generation lease as publication. detach()
                     // cannot clear the link between accepting this sample and applying its lifecycle
