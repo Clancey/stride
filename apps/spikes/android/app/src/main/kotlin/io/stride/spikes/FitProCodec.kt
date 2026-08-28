@@ -471,13 +471,22 @@ object FitProCodec {
     // ---- value serializers ----------------------------------------------------------------------
 
     /**
-     * Encodes a speed as `(short)(kph * 100)`, **little-endian**, 2 bytes. VERIFIED (`g7/z.g`).
+     * Encodes a speed as hundredths of a km/h, **little-endian**, 2 bytes. Framing VERIFIED
+     * (`g7/z.g`): the source builds `{(byte)(v >> 8), (byte)v}` and then passes it through
+     * `tt.p.E2`, which reverses the array (`tt/p.java:103`) — so the low byte is transmitted
+     * first. Reading `g()` without following `E2` is what produced the "speed is big-endian"
+     * claim in our docs.
      *
-     * The source builds `{(byte)(v >> 8), (byte)v}` and then passes it through `tt.p.E2`, which
-     * reverses the array (`tt/p.java:103`) — so the low byte is transmitted first. Reading `g()`
-     * without following `E2` is what produced the "speed is big-endian" claim in our docs.
+     * **Deliberately not** `(short)(kph * 100)`, which is what `g7/z.g` itself does. That is a
+     * truncating cast, and it is iFit's own bug, not a protocol requirement: the register is a
+     * plain centi-kph integer with no rule about how that integer was derived, so a console
+     * cannot tell 1.61 kph rounded from 1.60 kph truncated apart from the belt actually running
+     * a hair slower. That is what a rider saw live on the X22i — a commanded 1 mph and 4 mph both
+     * paced a few seconds slower per mile than they should have, in the direction truncation always
+     * biases (never faster, only slower). Rounding keeps the same 2-byte centi-kph framing and is
+     * accepted exactly the same way; only the numeric value sent differs.
      */
-    fun encodeSpeed(kph: Double): ByteArray = intToLe((kph * 100).toInt(), 2)
+    fun encodeSpeed(kph: Double): ByteArray = intToLe(Math.round(kph * 100).toInt(), 2)
 
     /**
      * Decodes a 2-byte little-endian speed in hundredths of a km/h. VERIFIED (`g7/z.h`).
@@ -492,12 +501,16 @@ object FitProCodec {
     fun decodeSpeed(bytes: ByteArray): Double = leToInt(bytes, 2) / 100.0
 
     /**
-     * Encodes an incline as `(int)(grade * 100)` truncated to 2 **little-endian** bytes.
-     * VERIFIED (`g7/s.g`, `e() = 2`).
+     * Encodes an incline as hundredths of a percent, 2 **little-endian** bytes. Framing VERIFIED
+     * (`g7/s.g`, `e() = 2`).
      *
      * Declines are negative, so this is a signed 16-bit value in two's complement.
+     *
+     * Rounded rather than the source's truncating `(int)(grade * 100)`, for the same reason as
+     * [encodeSpeed]: the register does not know or care how its integer was derived, so truncation
+     * here is iFit's own bug, not a protocol requirement.
      */
-    fun encodeIncline(gradePercent: Double): ByteArray = intToLe((gradePercent * 100).toInt(), 2)
+    fun encodeIncline(gradePercent: Double): ByteArray = intToLe(Math.round(gradePercent * 100).toInt(), 2)
 
     /** Decodes a 2-byte little-endian **signed** incline in hundredths of a percent. VERIFIED (`g7/s.h`). */
     fun decodeIncline(bytes: ByteArray): Double = leToInt(bytes, 2).toShort() / 100.0
