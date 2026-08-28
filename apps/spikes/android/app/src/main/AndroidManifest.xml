@@ -135,6 +135,21 @@
                 <category android:name="android.intent.category.HOME"/>
                 <category android:name="android.intent.category.DEFAULT"/>
             </intent-filter>
+
+            <!-- Declaring interest in the ICON Generic HID controller (res/xml/usb_device_filter.xml)
+                 is what lets Android grant Stride permission for it automatically on attach, instead
+                 of depending entirely on ERU's privileged broker re-granting it every time the device
+                 re-enumerates, observed on this console's own attach cycling to grant itself
+                 (com.ifit.eru) every time while skipping Stride's uid. ifit-standalone.apk uses this
+                 identical mechanism for the same device. This does not replace the settings-screen
+                 request path (FitProTransport.requestPermission): a console this filter's OS version
+                 does not auto-grant on still falls back to it. -->
+            <intent-filter>
+                <action android:name="android.hardware.usb.action.USB_DEVICE_ATTACHED"/>
+            </intent-filter>
+            <meta-data
+                android:name="android.hardware.usb.action.USB_DEVICE_ATTACHED"
+                android:resource="@xml/usb_device_filter"/>
         </activity>
 
         <!-- S3 / S9: overlay host. foregroundServiceType is required at API 34+ (see permission
