@@ -140,12 +140,17 @@ internal class WorkoutMotionTracker {
         sourceId = null
         reportedMotion = false
     }
-
-    private companion object {
-        val NO_WORKOUT_STATES =
-            setOf("DISCONNECTED", "IDLE", "SAFETY_KEY_REMOVED", "LOCKED", "SLEEP", "DEMO", "ERROR")
-    }
 }
+
+/**
+ * Console states that mean no workout instance exists, shared by [WorkoutMotionTracker] and
+ * [StopEscalation]'s reboot verification: a console reporting one of these cannot be mid-workout,
+ * and this protocol never accepts a speed write outside a workout ([DirectMachine]'s `duringWorkout`
+ * gate) -- so one of these is real, positive evidence the belt is not being commanded to move, not
+ * merely the absence of evidence that it is.
+ */
+internal val NO_WORKOUT_STATES =
+    setOf("DISCONNECTED", "IDLE", "SAFETY_KEY_REMOVED", "LOCKED", "SLEEP", "DEMO", "ERROR")
 
 object MachineLink {
 
@@ -1683,6 +1688,7 @@ object MachineLink {
                     // edge or preset answers, then have an obsolete poll mutate the replacement link.
                     StrideSettings.resolveTransportFromReading()
                     WorkoutMachineCoupling.observeConsole(read.consoleState)
+                    StopEscalation.observeBootTelemetry(read.consoleState)
                     fetchPresetsOnce()
                 } else {
                     if (StrideSettings.transport == StrideSettings.Transport.GLASSOS) {

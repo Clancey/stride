@@ -696,7 +696,7 @@ class OverlayService : Service() {
         // the way past rather than sitting in memory with nothing drawing it. This is the case that
         // matters most: the service being killed while a stop was unconfirmed is exactly when a
         // rider needs to be told again, and it is exactly when nothing would otherwise tell them.
-        StopEscalation.restore()
+        StopEscalation.restore(this)
         // Start reading the machine here rather than in the Activity: the overlay outlives the
         // launcher UI, and the metrics on it are exactly what someone mid-run is looking at.
         MachineLink.attach(this)

@@ -36,6 +36,16 @@ object StrideSettings {
      */
     private const val KEY_STOP_ESCALATION = "safety.stopEscalation"
 
+    /**
+     * `Settings.Global.BOOT_COUNT` at the moment [KEY_STOP_ESCALATION] was raised.
+     *
+     * What lets [StopEscalation.restore] tell a mere process kill (the case the persistence above
+     * exists for -- the console never rebooted, so nothing new can be learned by waiting) apart from
+     * an actual reboot (where the motor controller is a separate board on USB and may or may not
+     * have reset with it, so it is worth actually asking the console rather than either assuming).
+     */
+    private const val KEY_STOP_ESCALATION_BOOT_COUNT = "safety.stopEscalationBootCount"
+
     /** How Stride is permitted to reach the machine. */
     enum class Transport {
         /** Through iFit's GlassOS gRPC server. The default, and the only one that is implemented. */
@@ -120,6 +130,15 @@ object StrideSettings {
                 // from the path that has just failed to confirm a treadmill stopped, and the very
                 // next thing that may happen is the process being killed — which is precisely the
                 // case the persistence exists for. An asynchronous apply() can lose that write.
+            }.commit()
+        }
+
+    /** See [KEY_STOP_ESCALATION_BOOT_COUNT]. -1 (never a real boot count) rather than null-by-absence. */
+    var stopEscalationBootCount: Int
+        get() = requirePrefs().getInt(KEY_STOP_ESCALATION_BOOT_COUNT, -1)
+        set(value) {
+            requirePrefs().edit().apply {
+                if (value < 0) remove(KEY_STOP_ESCALATION_BOOT_COUNT) else putInt(KEY_STOP_ESCALATION_BOOT_COUNT, value)
             }.commit()
         }
 
