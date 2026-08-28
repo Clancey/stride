@@ -104,11 +104,12 @@ internal object MachinePresets {
      *
      * Widen anything. Every value comes out of a [ladder] call over a sub-range of `[min, max]`, so
      * no button can ask for more than the machine said it would take. The final [coerceIn] is not
-     * redundant with that: [ceil1] and [floor1] carry a 1e-9 nudge to keep binary fractions from
-     * rounding the wrong way, and that nudge can put a rounded end a hair outside the range it came
-     * from. A hair is enough — `MachineCoordinator` clamps again on the way to the belt, but a
-     * preset column that quietly disagrees with the machine's own limits is how a clamp ends up
-     * being asked to be the only thing standing between a rider and a value the machine refused.
+     * redundant with that: [ceil1] and [floor1] carry a quantization margin (see
+     * [QUANTIZATION_EPSILON]) to see past the register's own wire precision, and that margin can put
+     * a rounded end a hair outside the range it came from. A hair is enough — `MachineCoordinator`
+     * clamps again on the way to the belt, but a preset column that quietly disagrees with the
+     * machine's own limits is how a clamp ends up being asked to be the only thing standing between a
+     * rider and a value the machine refused.
      */
     fun inclineLadder(min: Double, max: Double, spacing: InclineSpacing): List<Double> {
         val range = effectiveRange(
@@ -229,8 +230,9 @@ internal object MachinePresets {
     /**
      * Collapse negative zero onto zero.
      *
-     * Not cosmetic, and not hypothetical. [ceil1] subtracts 1e-9 before rounding up, so `ceil1(0.0)`
-     * is **-0.0**, while the step walk reaches plain `0.0`. `-0.0 == 0.0` is true, but a sorted set
+     * Not cosmetic, and not hypothetical. [ceil1] subtracts a margin before rounding up, so
+     * `ceil1(0.0)` is **-0.0**, while the step walk reaches plain `0.0`. `-0.0 == 0.0` is true, but a
+     * sorted set
      * of boxed Doubles orders by `Double.compareTo`, which reports `-0.0 < 0.0` — so both survive,
      * and both render as "0".
      *
@@ -244,9 +246,28 @@ internal object MachinePresets {
 
     fun round1(v: Double): Double = kotlin.math.round(v * 10.0) / 10.0
 
-    /** One decimal place, never rounding below [v] — used for a range's lower bound. */
-    fun ceil1(v: Double): Double = kotlin.math.ceil(v * 10.0 - 1e-9) / 10.0
+    /**
+     * How far a limit may sit short of the next round tenth and still count as being *at* it, for
+     * [ceil1]/[floor1].
+     *
+     * Bigger than mere floating-point noise on purpose. FitPro's `KPH`/`MAX_KPH`/`MIN_KPH` registers
+     * hold hundredths of a km/h, so a limit that *means* some whole or one-decimal mph value can
+     * decode up to half a quantization step short of it: measured live, an X22i reporting a 19.31 kph
+     * maximum decodes to 11.9987 mph, not 12.0 — 0.0013 mph short, comfortably inside the ~0.0031 mph
+     * (half of 0.01 kph) that rounding a nice mph value to the register's own resolution can cost.
+     * [FitProCodec.encodeSpeed] quantizes a write the identical way, so a button landing on the
+     * rounded tenth sends the *exact same wire value* the register already reports as its limit — it
+     * asks for nothing the machine did not already say it would take.
+     *
+     * Set to one full quantization step (0.01 kph, ≈0.0062 mph) rather than the theoretical half-step
+     * minimum, for margin — and still an order of magnitude below the 0.05 a genuinely different
+     * tenth would need to be misread as this one.
+     */
+    private const val QUANTIZATION_EPSILON = 0.0065
 
-    /** One decimal place, never rounding above [v] — used for a range's upper bound. */
-    fun floor1(v: Double): Double = kotlin.math.floor(v * 10.0 + 1e-9) / 10.0
+    /** One decimal place, never rounding meaningfully below [v] — used for a range's lower bound. */
+    fun ceil1(v: Double): Double = kotlin.math.ceil((v - QUANTIZATION_EPSILON) * 10.0) / 10.0
+
+    /** One decimal place, never rounding meaningfully above [v] — used for a range's upper bound. */
+    fun floor1(v: Double): Double = kotlin.math.floor((v + QUANTIZATION_EPSILON) * 10.0) / 10.0
 }
