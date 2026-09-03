@@ -140,12 +140,17 @@ internal class WorkoutMotionTracker {
         sourceId = null
         reportedMotion = false
     }
-
-    private companion object {
-        val NO_WORKOUT_STATES =
-            setOf("DISCONNECTED", "IDLE", "SAFETY_KEY_REMOVED", "LOCKED", "SLEEP", "DEMO", "ERROR")
-    }
 }
+
+/**
+ * Console states that mean no workout instance exists, shared by [WorkoutMotionTracker] and
+ * [StopEscalation]'s reboot verification: a console reporting one of these cannot be mid-workout,
+ * and this protocol never accepts a speed write outside a workout ([DirectMachine]'s `duringWorkout`
+ * gate) -- so one of these is real, positive evidence the belt is not being commanded to move, not
+ * merely the absence of evidence that it is.
+ */
+internal val NO_WORKOUT_STATES =
+    setOf("DISCONNECTED", "IDLE", "SAFETY_KEY_REMOVED", "LOCKED", "SLEEP", "DEMO", "ERROR")
 
 object MachineLink {
 
@@ -474,6 +479,22 @@ object MachineLink {
     @Volatile private var vertGainPublication: VertGainPublication? = null
 
     /**
+     * The rider-facing distance figure, guarded against a register glitch [foldDisplayDistance]
+     * exists to absorb.
+     */
+    data class DisplayDistanceState(
+        val workoutId: String?,
+        val distanceMiles: Double?,
+    )
+
+    private data class DisplayDistancePublication(
+        val state: DisplayDistanceState,
+        val atMs: Long,
+    )
+
+    @Volatile private var displayDistancePublication: DisplayDistancePublication? = null
+
+    /**
      * Fold one complete telemetry poll into vertical gain.
      *
      * The rectangle uses the incline reported on the poll that closes each distance interval. That
@@ -522,6 +543,42 @@ object MachineLink {
     }
 
     /**
+     * Fold one telemetry poll into the rider-facing distance figure.
+     *
+     * Guards against exactly what was seen live on an X22i: `CURRENT_DISTANCE` read a hard `0.0`
+     * for several consecutive polls across a pause, with the belt's true distance unchanged (a
+     * separate register, `DISTANCE`, kept reporting the correct value the whole time). Displaying
+     * that zero verbatim would read to the rider as lost progress rather than the register glitch
+     * it is. A backwards reading is therefore held at the last good value instead of drawn, the same
+     * way [foldVertGain] treats one -- kept as its own fold, rather than reusing that one's baseline,
+     * so a momentarily missing incline reading can never blank the distance figure too.
+     *
+     * Safety code must keep reading distance from the raw [GlassOsClient.Snapshot]/[Observation]
+     * instead of this fold: a workout that genuinely restarts needs its true zero to reach a stop
+     * confirmation, not a display-smoothed one.
+     */
+    fun foldDisplayDistance(
+        previous: DisplayDistanceState?,
+        read: GlassOsClient.Snapshot,
+    ): DisplayDistanceState {
+        val distance = read.distanceMiles?.takeIf { it.isFinite() && it >= 0.0 }
+
+        // Same hard boundary foldVertGain draws: a new workout identity, including into or out of
+        // null, starts a fresh baseline rather than inheriting one that belongs to a different run.
+        if (previous == null || previous.workoutId != read.workoutId) {
+            return DisplayDistanceState(read.workoutId, distance)
+        }
+
+        val baseline = previous.distanceMiles
+        val next = when {
+            distance == null -> baseline
+            baseline == null || distance >= baseline -> distance
+            else -> baseline
+        }
+        return previous.copy(distanceMiles = next)
+    }
+
+    /**
      * One poll's worth of the readings a stop confirmation needs, taken together.
      *
      * Read as a single object rather than through [speedMph] and [distanceMiles] on purpose. Those
@@ -545,6 +602,8 @@ object MachineLink {
         val workoutEpoch: Long?,
         /** Whether this workout, not merely this link, has produced a credible motion reading. */
         val reportedMotionInWorkout: Boolean,
+        /** Motor power draw in watts, or null. Direct-path only — see [GlassOsClient.Snapshot.wattsW]. */
+        val wattsW: Int? = null,
     )
 
     @Volatile private var latestObservation: Observation? = null
@@ -609,6 +668,26 @@ object MachineLink {
      */
     @Volatile
     var everReportedMotion: Boolean = false
+        private set
+
+    /**
+     * Whether this machine has ever, on this link, reported real motor power draw.
+     *
+     * The same idea as [everReportedMotion], for a console where that never becomes true. `WATTS`
+     * is the direct path's motor-power register — a measurement, not a setpoint — and on an X22i
+     * exhibiting issue #34 it works where `ACTUAL_KPH` does not: confirmed live to rise with an
+     * actual speed change and fall to a genuine `0` within ~1.2s of an actual stop, on a link where
+     * `ACTUAL_KPH` read a confident zero throughout.
+     *
+     * Not a substitute for [everReportedMotion] in every role — it does **not** decay while the
+     * console is merely paused, only when it actually leaves `RUNNING` — so [stopVerdict] uses it
+     * as a fallback corroboration, never in place of a speed reading that has already proved itself.
+     *
+     * Reset with the snapshot when a transport is torn down, same as [everReportedMotion]: a
+     * different machine has to prove itself again.
+     */
+    @Volatile
+    var everReportedLoad: Boolean = false
         private set
 
     /**
@@ -798,8 +877,18 @@ object MachineLink {
     /** Current incline percent. Null means unknown. */
     val inclinePercent: Double? get() = fresh()?.inclinePercent
 
-    /** Distance covered this session, as measured by the machine. Null means unknown. */
-    val distanceMiles: Double? get() = fresh()?.distanceMiles
+    /**
+     * Distance covered this session, as measured by the machine. Null means unknown.
+     *
+     * Goes through [foldDisplayDistance] rather than the raw poll, so a console whose distance
+     * register glitches backward mid-workout does not flash a wrong number at the rider. Safety
+     * code must use [Observation.distanceMiles] instead -- see that fold's own note.
+     */
+    val distanceMiles: Double?
+        get() = displayDistancePublication
+            ?.takeIf { System.currentTimeMillis() - it.atMs <= FRESHNESS_MS }
+            ?.state
+            ?.distanceMiles
 
     /**
      * Positive vertical gain accumulated from distance and incline telemetry, in feet.
@@ -1600,9 +1689,11 @@ object MachineLink {
     private fun clearTelemetryPublication() {
         timedSnapshot = null
         vertGainPublication = null
+        displayDistancePublication = null
         latestObservation = null
         workoutMotion.reset()
         everReportedMotion = false
+        everReportedLoad = false
         fanSeen = false
     }
 
@@ -1624,13 +1715,13 @@ object MachineLink {
                     // regardless of which handshake path got it there. Consume the outage here so
                     // this first sample becomes a baseline rather than charging its whole gap at the
                     // recovery incline.
-                    val previousGain = if (glassOsReconnect.takeLost()) {
-                        null
-                    } else {
-                        vertGainPublication?.state
-                    }
+                    val reconnected = glassOsReconnect.takeLost()
+                    val previousGain = if (reconnected) null else vertGainPublication?.state
                     val gain = foldVertGain(previousGain, read)
                     vertGainPublication = VertGainPublication(gain, at)
+                    val previousDisplayDistance = if (reconnected) null else displayDistancePublication?.state
+                    val displayDistance = foldDisplayDistance(previousDisplayDistance, read)
+                    displayDistancePublication = DisplayDistancePublication(displayDistance, at)
                     timedSnapshot = TimedSnapshot(read, at)
                     val motion = workoutMotion.observe(
                         motionGeneration,
@@ -1648,14 +1739,19 @@ object MachineLink {
                         read.distanceMiles,
                         motion.epoch,
                         motion.reportedMotion,
+                        read.wattsW,
                     )
                     if ((read.speedMph ?: 0.0) > BELT_MOVING_MPH) everReportedMotion = true
+                    // Same idea, for a console where the above never becomes true. See
+                    // everReportedLoad.
+                    if ((read.wattsW ?: 0) > 0) everReportedLoad = true
                     if (read.fanWritable == true || read.fanState != null) fanSeen = true
                     // Keep the continuation under the same generation lease as publication. detach()
                     // cannot clear the link between accepting this sample and applying its lifecycle
                     // edge or preset answers, then have an obsolete poll mutate the replacement link.
                     StrideSettings.resolveTransportFromReading()
                     WorkoutMachineCoupling.observeConsole(read.consoleState)
+                    StopEscalation.observeBootTelemetry(read.consoleState)
                     fetchPresetsOnce()
                 } else {
                     if (StrideSettings.transport == StrideSettings.Transport.GLASSOS) {

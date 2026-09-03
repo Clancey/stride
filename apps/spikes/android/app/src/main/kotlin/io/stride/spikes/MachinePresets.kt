@@ -21,6 +21,21 @@ enum class InclineSpacing {
 
     /** 5% climbing, 3% declining. See [MachinePresets.inclineLadder] for why the two differ. */
     COARSE,
+
+    /**
+     * The rungs of one specific console's own physical incline buttons: -6, -3, 0, 3, 6, 10, 15,
+     * 20, 25, 30, 35, 40. Confirmed against an X22i's own keypad, not derived from any register --
+     * see [MachinePresets.PHYSICAL_INCLINE_RUNGS].
+     *
+     * Opt-in, like [COARSE], and for the same reason spelled out there: nobody who has not chosen
+     * this gets a different column. Unlike [COARSE] this is not a general shape ("5 up, 3 down")
+     * that fits any reported range -- it is one console's fixed list, intersected with whatever range
+     * the machine and installation actually allow the same way every other spacing is. A rider on a
+     * different console who selects it gets whichever of these twelve values their own machine's
+     * range happens to permit, which may be a short or empty column; there is no way to know this
+     * matches another model's buttons without measuring that model too.
+     */
+    PHYSICAL,
     ;
 
     companion object {
@@ -65,6 +80,10 @@ internal object MachinePresets {
     /** [InclineSpacing.COARSE] descending, below flat. */
     const val DECLINE_STEP_COARSE = 3.0
 
+    /** [InclineSpacing.PHYSICAL]'s fixed list, highest first to match every other ladder's order. */
+    val PHYSICAL_INCLINE_RUNGS: List<Double> =
+        listOf(40.0, 35.0, 30.0, 25.0, 20.0, 15.0, 10.0, 6.0, 3.0, 0.0, -3.0, -6.0)
+
     /**
      * Speed quick picks over the range both the machine and this installation permit.
      *
@@ -104,11 +123,12 @@ internal object MachinePresets {
      *
      * Widen anything. Every value comes out of a [ladder] call over a sub-range of `[min, max]`, so
      * no button can ask for more than the machine said it would take. The final [coerceIn] is not
-     * redundant with that: [ceil1] and [floor1] carry a 1e-9 nudge to keep binary fractions from
-     * rounding the wrong way, and that nudge can put a rounded end a hair outside the range it came
-     * from. A hair is enough — `MachineCoordinator` clamps again on the way to the belt, but a
-     * preset column that quietly disagrees with the machine's own limits is how a clamp ends up
-     * being asked to be the only thing standing between a rider and a value the machine refused.
+     * redundant with that: [ceil1] and [floor1] carry a quantization margin (see
+     * [QUANTIZATION_EPSILON]) to see past the register's own wire precision, and that margin can put
+     * a rounded end a hair outside the range it came from. A hair is enough — `MachineCoordinator`
+     * clamps again on the way to the belt, but a preset column that quietly disagrees with the
+     * machine's own limits is how a clamp ends up being asked to be the only thing standing between a
+     * rider and a value the machine refused.
      */
     fun inclineLadder(min: Double, max: Double, spacing: InclineSpacing): List<Double> {
         val range = effectiveRange(
@@ -124,6 +144,15 @@ internal object MachinePresets {
         // Verbatim, not "step = 1.0 happens to be the same". This is the guarantee that a rider who
         // never opens the setting sees exactly the column they saw before it existed.
         if (spacing == InclineSpacing.FINE) return ladder(min, max, INCLINE_STEP_FINE)
+
+        if (spacing == InclineSpacing.PHYSICAL) {
+            if (!min.isFinite() || !max.isFinite() || max < min) return emptyList()
+            // No synthetic endpoint the way [ladder] adds one: every rung here is a claim that a
+            // real button exists at that value, and a machine whose range does not reach one of the
+            // twelve is a machine that gets fewer of them, or none, rather than an invented one that
+            // does not correspond to anything printed on a keypad.
+            return PHYSICAL_INCLINE_RUNGS.filter { it in min..max }
+        }
 
         // Repeated from [ladder] rather than left to it. Splitting first would ask each half about a
         // sub-range of a nonsensical one, and a half that happens to be valid — the decline side of
@@ -229,8 +258,9 @@ internal object MachinePresets {
     /**
      * Collapse negative zero onto zero.
      *
-     * Not cosmetic, and not hypothetical. [ceil1] subtracts 1e-9 before rounding up, so `ceil1(0.0)`
-     * is **-0.0**, while the step walk reaches plain `0.0`. `-0.0 == 0.0` is true, but a sorted set
+     * Not cosmetic, and not hypothetical. [ceil1] subtracts a margin before rounding up, so
+     * `ceil1(0.0)` is **-0.0**, while the step walk reaches plain `0.0`. `-0.0 == 0.0` is true, but a
+     * sorted set
      * of boxed Doubles orders by `Double.compareTo`, which reports `-0.0 < 0.0` — so both survive,
      * and both render as "0".
      *
@@ -244,9 +274,51 @@ internal object MachinePresets {
 
     fun round1(v: Double): Double = kotlin.math.round(v * 10.0) / 10.0
 
-    /** One decimal place, never rounding below [v] — used for a range's lower bound. */
-    fun ceil1(v: Double): Double = kotlin.math.ceil(v * 10.0 - 1e-9) / 10.0
+    /**
+     * How far a limit may sit short of the next round tenth and still count as being *at* it, for
+     * [ceil1]/[floor1].
+     *
+     * Bigger than mere floating-point noise on purpose. FitPro's `KPH`/`MAX_KPH`/`MIN_KPH` registers
+     * hold hundredths of a km/h, so a limit that *means* some whole or one-decimal mph value can
+     * decode up to half a quantization step short of it: measured live, an X22i reporting a 19.31 kph
+     * maximum decodes to 11.9987 mph, not 12.0 — 0.0013 mph short, comfortably inside the ~0.0031 mph
+     * (half of 0.01 kph) that rounding a nice mph value to the register's own resolution can cost.
+     * [FitProCodec.encodeSpeed] quantizes a write the identical way, so a button landing on the
+     * rounded tenth sends the *exact same wire value* the register already reports as its limit — it
+     * asks for nothing the machine did not already say it would take.
+     *
+     * Set to one full quantization step (0.01 kph, ≈0.0062 mph) rather than the theoretical half-step
+     * minimum, for margin — and still an order of magnitude below the 0.05 a genuinely different
+     * tenth would need to be misread as this one.
+     */
+    private const val QUANTIZATION_EPSILON = 0.0065
 
-    /** One decimal place, never rounding above [v] — used for a range's upper bound. */
-    fun floor1(v: Double): Double = kotlin.math.floor(v * 10.0 + 1e-9) / 10.0
+    /** One decimal place, never rounding meaningfully below [v] — used for a range's lower bound. */
+    fun ceil1(v: Double): Double = kotlin.math.ceil((v - QUANTIZATION_EPSILON) * 10.0) / 10.0
+
+    /** One decimal place, never rounding meaningfully above [v] — used for a range's upper bound. */
+    fun floor1(v: Double): Double = kotlin.math.floor((v + QUANTIZATION_EPSILON) * 10.0) / 10.0
+
+    /**
+     * The floor/ceiling a rail's [railPresetEntries] filter should use for one axis: the reported
+     * machine limit intersected with the installation clamp, rounded through [ceil1]/[floor1] the
+     * same way [ladder] rounds its own endpoints.
+     *
+     * That last part is the reason this exists rather than each rail comparing against the raw
+     * reported limit directly. Confirmed live on an X22i: its 19.31 kph reported maximum decodes to
+     * 11.9987 mph, which [floor1] correctly rounds to the 12.0 the ladder puts a rung on -- but a
+     * filter built from the raw 11.9987 instead would compare `12.0 <= 11.9987`, fail, and silently
+     * drop that rung, undoing the endpoint rounding [ladder] just did. Both sides of one comparison
+     * have to agree on what "the machine's limit" means, or the more precise one always loses.
+     */
+    fun railRange(
+        reportedMin: Double?,
+        reportedMax: Double?,
+        installMin: Double,
+        installMax: Double,
+    ): Pair<Double, Double> {
+        val floor = maxOf(installMin, reportedMin?.let(::ceil1) ?: installMin)
+        val ceiling = minOf(installMax, reportedMax?.let(::floor1) ?: installMax)
+        return floor to ceiling
+    }
 }

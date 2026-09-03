@@ -36,11 +36,11 @@ class WorkoutInstanceIdTest {
         override fun exchange(frame: ByteArray, command: FitProCodec.Command): ByteArray? {
             replies++
             if (silent) return null
-            // Values are packed in ascending field id: KPH(2), CURRENT_DISTANCE(4),
+            // Values are packed in ascending field id: KPH(2), WATTS(2), CURRENT_DISTANCE(4),
             // RUNNING_TIME(4), WORKOUT_MODE(1), ACTUAL_KPH(2), ACTUAL_INCLINE(2),
-            // CURRENT_CALORIES(4) = 19 bytes.
-            val values = ByteArray(19)
-            values[10] = mode.value.toByte()
+            // CURRENT_CALORIES(4) = 21 bytes.
+            val values = ByteArray(21)
+            values[12] = mode.value.toByte()
             // Header is address, length, command, status; then values; then the checksum — one
             // byte more than a request's FRAME_OVERHEAD, which has no status.
             val total = FitProCodec.FRAME_OVERHEAD + 1 + values.size

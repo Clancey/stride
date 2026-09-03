@@ -38,18 +38,25 @@ object MachineCoordinator {
     /**
      * The device-level ceiling, in mph and percent.
      *
-     * These are the values `ConsoleService` reports for this machine (model 17125: 1.0-12.0 mph,
-     * -3 to 12% incline), transcribed rather than read at runtime. A clamp the machine supplies can
-     * be widened by the machine; this one cannot, and plan section 3.6 requires a ceiling a profile
-     * may only ever lower.
+     * Speed's values are `ConsoleService`'s figures for model 17125 (1.0-12.0 mph), transcribed
+     * rather than read at runtime. A clamp the machine supplies can be widened by the machine; this
+     * one cannot, and plan section 3.6 requires a ceiling a profile may only ever lower.
+     *
+     * Incline's ceiling was widened from model 17125's -3/12% to -6/40% to cover incline trainers
+     * that genuinely exceed 12%, confirmed against an X22i's own reported range (§1 of
+     * `~/x22i-debug/INVESTIGATION_NOTES.md`: `minInclinePercent=-6.0, maxInclinePercent=40.0`, live
+     * on `dumpsys usb`/the FitPro handshake, not a guess). Still a fixed, human-set ceiling in the
+     * same sense speed's is: [MachineLimits.maxInclinePercent] only ever narrows [clampIncline]'s
+     * effective ceiling from here, never raises it past it, so a console misreporting its own range
+     * still cannot make Stride command a steeper incline than this.
      *
      * Speed's floor is 0 rather than the machine's 1.0 mph on purpose: 0 is how the belt is told to
      * stop, and clamping a stop up to 1 mph would be catastrophic.
      */
     const val MIN_SPEED_MPH = 0.0
     const val MAX_SPEED_MPH = 12.0
-    const val MIN_INCLINE = -3.0
-    const val MAX_INCLINE = 12.0
+    const val MIN_INCLINE = -6.0
+    const val MAX_INCLINE = 40.0
 
     /**
      * What the machine says its own limits are, when a transport can tell us. Null on a link that
@@ -736,7 +743,13 @@ object MachineCoordinator {
                     ?.let { observations.add(it) }
                 val ack = acked
                 if (ack != null) {
-                    val verdict = stopVerdict(ack, MachineLink.everReportedMotion, beforeStop, observations)
+                    val verdict = stopVerdict(
+                        ack,
+                        MachineLink.everReportedMotion,
+                        MachineLink.everReportedLoad,
+                        beforeStop,
+                        observations,
+                    )
                     if (verdict is StopVerdict.Confirmed) {
                         finish(verdict)
                         return
@@ -749,7 +762,15 @@ object MachineCoordinator {
                     }
                 }
                 if (System.nanoTime() >= deadlineAt) {
-                    finish(stopVerdict(acked ?: false, MachineLink.everReportedMotion, beforeStop, observations))
+                    finish(
+                        stopVerdict(
+                            acked ?: false,
+                            MachineLink.everReportedMotion,
+                            MachineLink.everReportedLoad,
+                            beforeStop,
+                            observations,
+                        ),
+                    )
                 }
             } catch (t: Throwable) {
                 // A watcher that throws must not leave the ending path waiting forever, and must
@@ -782,6 +803,16 @@ object MachineCoordinator {
      *
      * The ramp only ever applies upward. Asking for a lower speed is a single immediate command,
      * because slowing down is never the dangerous direction.
+     *
+     * The baseline for "how large" is [MachineLink.speedMph], not [MachineLink.observedSpeedMph].
+     * That reads as raw telemetry everywhere it matters for safety -- arrival, deck movement, stop
+     * confirmation -- but here it decided the *size of the step*, and on a console whose actual-speed
+     * register reports a confident zero without ever moving (the X22i's `ACTUAL_KPH`, see
+     * `MachineLink.speedMph`'s own doc), that made every request from a real cruising speed look like
+     * a request from a dead stop: the ramp's first step landed below where the belt already was,
+     * commanding a real, visible slowdown before climbing back to the target. `speedMph` only
+     * substitutes a value here in that same narrow case -- a console that has ever proven real motion,
+     * or isn't a FitPro belt console at all, sees the identical raw number either way.
      */
     fun setSpeedMph(mph: Double, onDone: ((Outcome) -> Unit)? = null) {
         val target = clampSpeed(mph)
@@ -790,7 +821,7 @@ object MachineCoordinator {
         // belt keeps accelerating after the rider has asked it not to. The generation is bumped
         // before anything is queued so the new jobs carry the new value.
         val gen = speedGeneration.incrementAndGet()
-        val current = MachineLink.observedSpeedMph
+        val current = MachineLink.speedMph
         if (current == null || target <= current || target - current <= MAX_STEP_UP_MPH) {
             submit(label = "Speed ${format(target)} mph", speedGen = gen, onDone = onDone) {
                 it.setSpeedKph(target * MPH_TO_KPH).toOutcome()
@@ -1224,8 +1255,9 @@ enum class StopUnconfirmed {
     NOT_ACKED,
 
     /**
-     * This console's speed register has never reported motion on this link, so its zero is worth
-     * nothing. Issue #34 — see [MachineLink.everReportedMotion].
+     * Neither this console's speed register nor its watts register has ever reported real motion
+     * or load on this link, so a zero from either is worth nothing. Issue #34 — see
+     * [MachineLink.everReportedMotion] and [MachineLink.everReportedLoad].
      */
     NEVER_REPORTED_MOTION,
 
@@ -1269,10 +1301,12 @@ private const val DISTANCE_STILL_MILES = 1e-6
  * 1. **The console acked.** Necessary and nowhere near sufficient: an ack says a console took a
  *    register write, which is the exact thing this issue exists because somebody once mistook for a
  *    stopped belt.
- * 2. **The speed register has proved it reports motion**, via [MachineLink.everReportedMotion]. On
- *    the X22i `ACTUAL_KPH` reads a confident, well-formed `0x0000` on every poll while a rider walks
- *    at 4 mph (issue #34), and there is no per-field validity marker in the protocol that could tell
- *    that apart from a real zero. A console that has only ever said zero is not saying anything.
+ * 2. **The speed register has proved it reports motion**, via [MachineLink.everReportedMotion], or
+ *    failing that, **the watts register has**, via [MachineLink.everReportedLoad]. On the X22i
+ *    `ACTUAL_KPH` reads a confident, well-formed `0x0000` on every poll while a rider walks at 4 mph
+ *    (issue #34), and there is no per-field validity marker in the protocol that could tell that
+ *    apart from a real zero — a console that has only ever said zero is not saying anything, on
+ *    either register.
  * 3. **Two agreeing readings say the belt is at rest, at least one of them from after the stop.**
  *    Two, not one, because a single sample cannot distinguish a belt at rest from a belt passing
  *    through a reading. At least one from after, by poll count, because otherwise a reading taken
@@ -1329,6 +1363,30 @@ private const val DISTANCE_STILL_MILES = 1e-6
  * still running. On the X22i that is not hypothetical — it is what #34 observed, with
  * `CURRENT_DISTANCE` accumulating the real pace beside a speed stuck at zero.
  *
+ * ## The [MachineLink.everReportedLoad] fallback — for a console where speed never proves itself
+ *
+ * Confirmed live on an X22i (issue #34): [MachineLink.everReportedMotion] can simply never become
+ * true on some consoles, because the speed register is stuck at a confident, well-formed zero
+ * forever. Without a fallback, every single stop on such a console escalates to the safety key —
+ * correct the first time, and then every time after, for a console this file otherwise handles
+ * perfectly well. That is not hypothetical either: it is what happened on this same console, twice,
+ * once the connection issues masking it were fixed.
+ *
+ * `WATTS` — motor power draw, a direct-path-only measurement — does the same job from the motor's
+ * side, and was confirmed live to fall to a genuine `0` within ~1.2s of an actual stop, on the same
+ * console and the same link where speed never once left zero.
+ *
+ * The fallback only ever activates in place of a signal that has never proven itself, never instead
+ * of one that has: `trustSpeed` below is exactly [MachineLink.everReportedMotion], unchanged, so a
+ * console whose speed register already works sees no behaviour change at all. `trustLoad` only
+ * turns on when `trustSpeed` is false. Nothing here weakens the speed-based path; it only gives a
+ * console that never had one a second way to earn a real confirmation instead of an unconditional
+ * escalation.
+ *
+ * Not yet handled: a console where *both* signals work. Today speed wins outright and watts is
+ * ignored in that case, rather than the two being required to agree. That is a strengthening left
+ * for later, in the spirit of the rest of this file — it must not be dropped in the other direction.
+ *
  * ## Why this is stricter than [mayFlattenDeck], which looks like the same question
  *
  * It is not the same question. [mayFlattenDeck] asks whether a deck may be driven flat, and gets
@@ -1341,14 +1399,26 @@ private const val DISTANCE_STILL_MILES = 1e-6
 internal fun stopVerdict(
     acked: Boolean,
     everReportedMotion: Boolean,
+    everReportedLoad: Boolean,
     beforeStop: MachineLink.Observation?,
     postStop: List<MachineLink.Observation>,
 ): StopVerdict {
     if (!acked) return StopVerdict.Unconfirmed(StopUnconfirmed.NOT_ACKED)
-    if (!everReportedMotion) return StopVerdict.Unconfirmed(StopUnconfirmed.NEVER_REPORTED_MOTION)
+    // trustLoad only ever activates in place of a signal that has never proven itself, never
+    // instead of one that has: a console whose speed register already works sees no behaviour
+    // change at all, because trustSpeed is exactly everReportedMotion, unchanged.
+    val trustSpeed = everReportedMotion
+    val trustLoad = !trustSpeed && everReportedLoad
+    if (!trustSpeed && !trustLoad) {
+        return StopVerdict.Unconfirmed(StopUnconfirmed.NEVER_REPORTED_MOTION)
+    }
     val last = postStop.lastOrNull() ?: return StopVerdict.Unconfirmed(StopUnconfirmed.NOT_OBSERVED)
-    val lastSpeed = last.speedMph
+    val lastSpeed = last.speedMph.takeIf { trustSpeed }
     if (lastSpeed != null && lastSpeed > BELT_MOVING_MPH) {
+        return StopVerdict.Unconfirmed(StopUnconfirmed.STILL_MOVING)
+    }
+    val lastWatts = last.wattsW.takeIf { trustLoad }
+    if (lastWatts != null && lastWatts > 0) {
         return StopVerdict.Unconfirmed(StopUnconfirmed.STILL_MOVING)
     }
     // The *trailing* run, so a belt that read at rest and then moved again cannot be confirmed by
@@ -1358,7 +1428,11 @@ internal fun stopVerdict(
     // The reading taken as the stop went out is allowed to complete the run, but never to be the
     // whole of it: the check below requires the run to contain something from after the stop.
     val window = listOfNotNull(beforeStop) + postStop
-    val rest = window.takeLastWhile { it.speedMph != null && it.speedMph <= BELT_MOVING_MPH }
+    val rest = window.takeLastWhile { observation ->
+        val speed = observation.speedMph.takeIf { trustSpeed }
+        val watts = observation.wattsW.takeIf { trustLoad }
+        (speed != null && speed <= BELT_MOVING_MPH) || (watts != null && watts <= 0)
+    }
     if (rest.size < 2) return StopVerdict.Unconfirmed(StopUnconfirmed.NOT_OBSERVED)
     if (rest.none { it.seq >= (postStop.firstOrNull()?.seq ?: Long.MAX_VALUE) }) {
         return StopVerdict.Unconfirmed(StopUnconfirmed.NOT_OBSERVED)

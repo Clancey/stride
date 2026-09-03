@@ -22,7 +22,7 @@ import org.junit.Test
 class StopConfirmationTest {
 
     /** A poll, as [MachineLink] publishes them. */
-    private fun reading(seq: Long, speed: Double?, distance: Double? = 1.0) =
+    private fun reading(seq: Long, speed: Double?, distance: Double? = 1.0, watts: Int? = null) =
         MachineLink.Observation(
             seq = seq,
             atMs = seq * 500L,
@@ -30,6 +30,7 @@ class StopConfirmationTest {
             distanceMiles = distance,
             workoutEpoch = 1L,
             reportedMotionInWorkout = true,
+            wattsW = watts,
         )
 
     /** Two agreeing readings of a belt at rest that covered no ground between them. */
@@ -41,9 +42,10 @@ class StopConfirmationTest {
     private fun verdict(
         acked: Boolean = true,
         everReportedMotion: Boolean = true,
+        everReportedLoad: Boolean = false,
         beforeStop: MachineLink.Observation? = null,
         postStop: List<MachineLink.Observation> = stoppedBelt(),
-    ) = stopVerdict(acked, everReportedMotion, beforeStop, postStop)
+    ) = stopVerdict(acked, everReportedMotion, everReportedLoad, beforeStop, postStop)
 
     // --------------------------------------------------------------- the three Dart failure modes
 
@@ -347,6 +349,7 @@ class StopConfirmationTest {
         data class Case(
             val acked: Boolean,
             val everReportedMotion: Boolean,
+            val everReportedLoad: Boolean,
             val postStop: List<MachineLink.Observation>,
             val expected: StopVerdict,
         )
@@ -354,28 +357,96 @@ class StopConfirmationTest {
         val moving = listOf(reading(11, 4.0, 1.20), reading(12, 4.0, 1.26))
         val travelling = listOf(reading(11, 0.0, 1.20), reading(12, 0.0, 1.21))
         val cases = listOf(
-            Case(true, true, stoppedBelt(), StopVerdict.Confirmed),
-            Case(false, true, stoppedBelt(), StopVerdict.Unconfirmed(StopUnconfirmed.NOT_ACKED)),
+            Case(true, true, false, stoppedBelt(), StopVerdict.Confirmed),
+            Case(false, true, false, stoppedBelt(), StopVerdict.Unconfirmed(StopUnconfirmed.NOT_ACKED)),
             Case(
                 true,
+                false,
                 false,
                 stoppedBelt(),
                 StopVerdict.Unconfirmed(StopUnconfirmed.NEVER_REPORTED_MOTION),
             ),
-            Case(true, true, moving, StopVerdict.Unconfirmed(StopUnconfirmed.STILL_MOVING)),
-            Case(true, true, travelling, StopVerdict.Unconfirmed(StopUnconfirmed.DISTANCE_ADVANCED)),
-            Case(true, true, emptyList(), StopVerdict.Unconfirmed(StopUnconfirmed.NOT_OBSERVED)),
+            Case(true, true, false, moving, StopVerdict.Unconfirmed(StopUnconfirmed.STILL_MOVING)),
+            Case(true, true, false, travelling, StopVerdict.Unconfirmed(StopUnconfirmed.DISTANCE_ADVANCED)),
+            Case(true, true, false, emptyList(), StopVerdict.Unconfirmed(StopUnconfirmed.NOT_OBSERVED)),
             // Not acked wins over everything, because it is checked first and because a command we
             // have no evidence reached the machine cannot be confirmed by anything the machine says.
-            Case(false, false, moving, StopVerdict.Unconfirmed(StopUnconfirmed.NOT_ACKED)),
+            Case(false, false, false, moving, StopVerdict.Unconfirmed(StopUnconfirmed.NOT_ACKED)),
         )
         for (case in cases) {
             assertEquals(
                 "acked=${case.acked} everReportedMotion=${case.everReportedMotion} " +
-                    "postStop=${case.postStop}",
+                    "everReportedLoad=${case.everReportedLoad} postStop=${case.postStop}",
                 case.expected,
-                stopVerdict(case.acked, case.everReportedMotion, null, case.postStop),
+                stopVerdict(case.acked, case.everReportedMotion, case.everReportedLoad, null, case.postStop),
             )
         }
+    }
+
+    // ------------------------------------------------------- the watts fallback, issue #34
+
+    /**
+     * A poll with no speed at all — the X22i shape, where [MachineLink.everReportedMotion] never
+     * becomes true and only watts can ever corroborate anything.
+     */
+    private fun wattsReading(seq: Long, watts: Int?, distance: Double? = 1.0) =
+        reading(seq, speed = null, distance = distance, watts = watts)
+
+    @Test
+    fun `watts alone confirms a stop on a console whose speed register never worked`() {
+        val atRest = listOf(wattsReading(11, 0, distance = 1.25), wattsReading(12, 0, distance = 1.25))
+        assertEquals(
+            StopVerdict.Confirmed,
+            verdict(everReportedMotion = false, everReportedLoad = true, postStop = atRest),
+        )
+    }
+
+    @Test
+    fun `watts still showing load reads as still moving, same as a speed register would`() {
+        val stillLoaded = listOf(wattsReading(11, 164, 1.20), wattsReading(12, 164, 1.26))
+        assertEquals(
+            StopVerdict.Unconfirmed(StopUnconfirmed.STILL_MOVING),
+            verdict(everReportedMotion = false, everReportedLoad = true, postStop = stillLoaded),
+        )
+    }
+
+    @Test
+    fun `watts advancing distance still vetoes a confirmation`() {
+        val travellingByWattsAlone = listOf(
+            wattsReading(11, 0, distance = 1.20),
+            wattsReading(12, 0, distance = 1.21),
+        )
+        assertEquals(
+            StopVerdict.Unconfirmed(StopUnconfirmed.DISTANCE_ADVANCED),
+            verdict(everReportedMotion = false, everReportedLoad = true, postStop = travellingByWattsAlone),
+        )
+    }
+
+    @Test
+    fun `neither speed nor watts ever proving themselves is still an unconditional escalation`() {
+        val atRest = listOf(wattsReading(11, 0, distance = 1.25), wattsReading(12, 0, distance = 1.25))
+        assertEquals(
+            StopVerdict.Unconfirmed(StopUnconfirmed.NEVER_REPORTED_MOTION),
+            verdict(everReportedMotion = false, everReportedLoad = false, postStop = atRest),
+        )
+    }
+
+    /**
+     * A console whose speed register already works is unaffected by [MachineLink.everReportedLoad].
+     *
+     * `trustSpeed` wins outright once [MachineLink.everReportedMotion] is true — watts is not even
+     * consulted, so a stray non-zero watts reading here must not block a confirmation the speed
+     * reading already earns.
+     */
+    @Test
+    fun `a console whose speed register already works is unaffected by everReportedLoad`() {
+        val atRestBySpeedOnly = listOf(
+            reading(11, 0.0, distance = 1.25, watts = 50),
+            reading(12, 0.0, distance = 1.25, watts = 50),
+        )
+        assertEquals(
+            StopVerdict.Confirmed,
+            verdict(everReportedMotion = true, everReportedLoad = true, postStop = atRestBySpeedOnly),
+        )
     }
 }

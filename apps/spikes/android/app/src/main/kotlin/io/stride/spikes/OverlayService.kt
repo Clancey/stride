@@ -227,6 +227,13 @@ class OverlayService : Service() {
             InclineSpacing.COARSE,
         )
 
+        /** As [INCLINE_LADDER_COARSE], for a rider who asked for [InclineSpacing.PHYSICAL]. */
+        private val INCLINE_LADDER_PHYSICAL = MachinePresets.inclineLadder(
+            INCLINE_LADDER.last(),
+            INCLINE_LADDER.first(),
+            InclineSpacing.PHYSICAL,
+        )
+
         private val SPEED_LADDER = listOf(12.0, 10.0, 9.0, 8.0, 7.0, 6.0, 5.0, 4.0, 3.0, 2.0, 1.0)
 
         /**
@@ -696,7 +703,7 @@ class OverlayService : Service() {
         // the way past rather than sitting in memory with nothing drawing it. This is the case that
         // matters most: the service being killed while a stop was unconfirmed is exactly when a
         // rider needs to be told again, and it is exactly when nothing would otherwise tell them.
-        StopEscalation.restore()
+        StopEscalation.restore(this)
         // Start reading the machine here rather than in the Activity: the overlay outlives the
         // launcher UI, and the metrics on it are exactly what someone mid-run is looking at.
         MachineLink.attach(this)
@@ -2043,13 +2050,11 @@ class OverlayService : Service() {
     private fun addInclineRail() {
         val limits = MachineCoordinator.machineLimits
         val spacing = StrideSettings.inclineSpacing
-        val floor = maxOf(
-            MachineCoordinator.MIN_INCLINE,
-            limits?.minInclinePercent ?: MachineCoordinator.MIN_INCLINE,
-        )
-        val ceiling = minOf(
-            MachineCoordinator.MAX_INCLINE,
-            limits?.maxInclinePercent ?: MachineCoordinator.MAX_INCLINE,
+        val (floor, ceiling) = MachinePresets.railRange(
+            reportedMin = limits?.minInclinePercent,
+            reportedMax = limits?.maxInclinePercent,
+            installMin = MachineCoordinator.MIN_INCLINE,
+            installMax = MachineCoordinator.MAX_INCLINE,
         )
         val presets = railEntries(
             published = MachineLink.inclinePresets,
@@ -2065,6 +2070,8 @@ class OverlayService : Service() {
                 )
             } else if (spacing == InclineSpacing.COARSE) {
                 INCLINE_LADDER_COARSE
+            } else if (spacing == InclineSpacing.PHYSICAL) {
+                INCLINE_LADDER_PHYSICAL
             } else {
                 INCLINE_LADDER
             },
@@ -2178,13 +2185,11 @@ class OverlayService : Service() {
 
     private fun addSpeedRail() {
         val limits = MachineCoordinator.machineLimits
-        val floor = maxOf(
-            MachineCoordinator.MIN_SPEED_MPH,
-            limits?.minSpeedMph ?: MachineCoordinator.MIN_SPEED_MPH,
-        )
-        val ceiling = minOf(
-            MachineCoordinator.MAX_SPEED_MPH,
-            limits?.maxSpeedMph ?: MachineCoordinator.MAX_SPEED_MPH,
+        val (floor, ceiling) = MachinePresets.railRange(
+            reportedMin = limits?.minSpeedMph,
+            reportedMax = limits?.maxSpeedMph,
+            installMin = MachineCoordinator.MIN_SPEED_MPH,
+            installMax = MachineCoordinator.MAX_SPEED_MPH,
         )
         val presets = railEntries(
             published = MachineLink.speedPresets,
@@ -2198,14 +2203,21 @@ class OverlayService : Service() {
             accent = cyan,
             entries = presets,
             entrySuffix = "",
-            // A fallback setpoint may be useful in the metric strip, but a solid rail pill means
-            // measured belt motion. Keep both the initial and live marks on raw ACTUAL_KPH.
-            currentEntry = MachineLink.observedSpeedMph?.roundToInt()?.toString(),
+            // The lit pill follows the same rider-facing figure the numeric readout already shows
+            // (MachineLink.speedMph, display-fallback-aware) — see `displayed` below. Arrival
+            // evidence for a requested pill stays on raw ACTUAL_KPH via `measured`, unchanged.
+            currentEntry = MachineLink.speedMph?.roundToInt()?.toString(),
             gravity = Gravity.END or Gravity.TOP,
             minimumAllowed = floor,
             maximumAllowed = ceiling,
             usable = { MachineLink.canCommand() },
+            // Never starts drawing conclusions about arrival from a commanded value: this stays
+            // the raw, un-fallback'd register so `pending`'s "did it get there" check can't be
+            // fooled by a display fallback masquerading as belt telemetry.
             measured = { MachineLink.observedSpeedMph },
+            // Cosmetic only: which pill lights up as "current". Safe to use the display fallback
+            // here because nothing safety-relevant reads `displayed` — see applyRailHighlight.
+            displayed = { MachineLink.speedMph },
             pending = PendingSetpoint(tolerance = SPEED_ARRIVED_TOLERANCE, graceMs = PENDING_GRACE_MS),
             onPick = { mph ->
                 requestSetpoint(mayStart = true) { done ->
@@ -2284,6 +2296,10 @@ class OverlayService : Service() {
         maximumAllowed: Double,
         usable: () -> Boolean,
         measured: () -> Double?,
+        // What decides the highlighted pill. Defaults to [measured]; a rail whose numeric readout
+        // trusts a display fallback (see speed's own [MachineLink.speedMph] doc) can pass a
+        // different source here without changing what [pending] treats as arrival evidence.
+        displayed: () -> Double? = measured,
         pending: PendingSetpoint,
         onPick: (Double) -> Unit,
     ): RailBinding? {
@@ -2303,6 +2319,7 @@ class OverlayService : Service() {
             scroll = ScrollView(this),
             usable = usable,
             measured = measured,
+            displayed = displayed,
             pending = pending,
         )
 
@@ -2439,6 +2456,7 @@ class OverlayService : Service() {
         /** Whether the machine will take a write for this control at this instant. */
         val usable: () -> Boolean,
         val measured: () -> Double?,
+        val displayed: () -> Double?,
         val pending: PendingSetpoint,
     ) {
         var applied: String? = null
@@ -2470,10 +2488,16 @@ class OverlayService : Service() {
      * belt at 3 *and* the 5 the rider chose, in two visibly different styles. Collapsing them into
      * one mark would force a choice between ignoring the tap and claiming a speed the belt has not
      * reached.
+     *
+     * The pill lit ("target", below) comes from [RailBinding.displayed], not [RailBinding.measured].
+     * [pending]'s arrival check stays on [measured] regardless — a rail whose numeric readout trusts
+     * a display fallback (speed, on a console whose actual-speed register never proves itself) can
+     * still show a rung lit without that fallback ever counting as proof a requested value arrived.
      */
     private fun applyRailHighlight(rail: RailBinding?, nowMs: Long) {
         val binding = rail ?: return
         val current = binding.measured()
+        val shown = binding.displayed()
 
         val enabled = binding.usable()
         val enabledChanged = enabled != binding.appliedEnabled
@@ -2486,7 +2510,7 @@ class OverlayService : Service() {
         binding.pending.observe(current, nowMs)
         val requested = binding.pending.label?.takeIf { binding.enabled && binding.buttons.containsKey(it) }
 
-        val target = current?.let { value ->
+        val target = shown?.let { value ->
             val rungs = binding.buttons.keys.mapNotNull { key -> key.toDoubleOrNull()?.let { key to it } }
             val lowest = rungs.minOfOrNull { it.second }
             val highest = rungs.maxOfOrNull { it.second }

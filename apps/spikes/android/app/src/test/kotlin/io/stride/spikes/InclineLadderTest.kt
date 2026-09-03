@@ -66,11 +66,11 @@ class InclineLadderTest {
 
     // ---- the shape the issue asked for --------------------------------------------------------
 
-    /** An X22i reports -6% to 40%, but this installation permits only -3% to 12%. */
+    /** An X22i reports -6% to 40%, and this installation's clamp was widened to match it exactly. */
     @Test
     fun `a wide incline trainer range is intersected with installation clamps`() {
         assertEquals(
-            listOf(12.0, 10.0, 5.0, 0.0, -3.0),
+            listOf(40.0, 35.0, 30.0, 25.0, 20.0, 15.0, 10.0, 5.0, 0.0, -3.0, -6.0),
             coarse(-6.0, 40.0),
         )
     }
@@ -79,8 +79,8 @@ class InclineLadderTest {
     @Test
     fun `the fine column on that machine contains only effective values`() {
         val out = MachinePresets.inclineLadder(-6.0, 40.0, fine)
-        assertEquals(12.0, out.first(), 1e-9)
-        assertEquals(-3.0, out.last(), 1e-9)
+        assertEquals(40.0, out.first(), 1e-9)
+        assertEquals(-6.0, out.last(), 1e-9)
         assertEquals("duplicate buttons", out.size, out.distinct().size)
         assertTrue(out.all { it in MachineCoordinator.MIN_INCLINE..MachineCoordinator.MAX_INCLINE })
     }
@@ -90,7 +90,7 @@ class InclineLadderTest {
     /** A machine with no decline must not be handed decline buttons. */
     @Test
     fun `a range that is entirely at or above flat has no negative rungs`() {
-        assertEquals(listOf(12.0, 10.0, 5.0, 0.0), coarse(0.0, 15.0))
+        assertEquals(listOf(15.0, 10.0, 5.0, 0.0), coarse(0.0, 15.0))
         assertEquals(listOf(12.0, 10.0, 5.0, 2.0), coarse(2.0, 12.0))
         coarse(0.0, 15.0).forEach { assertTrue("$it is below the machine's floor", it >= 0.0) }
     }
@@ -103,7 +103,7 @@ class InclineLadderTest {
      */
     @Test
     fun `a range that is entirely below flat has no non-negative rungs`() {
-        assertEquals(listOf(-2.0, -3.0), coarse(-10.0, -2.0))
+        assertEquals(listOf(-2.0, -3.0, -6.0), coarse(-10.0, -2.0))
         coarse(-10.0, -2.0).forEach { assertTrue("$it is above the machine's ceiling", it <= -2.0) }
     }
 
@@ -113,7 +113,7 @@ class InclineLadderTest {
         assertEquals(listOf(5.0), coarse(5.0, 5.0))
         assertEquals(listOf(0.0), coarse(0.0, 0.0))
         assertEquals(listOf(-3.0), coarse(-3.0, -3.0))
-        assertTrue(coarse(-4.0, -4.0).isEmpty())
+        assertTrue(coarse(-7.0, -7.0).isEmpty())
     }
 
     /**
@@ -270,5 +270,52 @@ class InclineLadderTest {
             listOf(12.0, 11.0, 10.0, 9.0, 8.0, 7.0, 6.0, 5.0, 4.0, 3.0, 2.0, 1.0, 0.0),
             MachinePresets.ladder(0.0, 12.0, 1.0),
         )
+    }
+
+    // ---- InclineSpacing.PHYSICAL: one console's own buttons, not a general shape ---------------
+
+    private val physical = InclineSpacing.PHYSICAL
+
+    @Test
+    fun `physical parses like any other named spacing`() {
+        assertEquals(physical, InclineSpacing.parse("physical"))
+        assertEquals(physical, InclineSpacing.parse("PHYSICAL"))
+    }
+
+    /** The fixed list itself, highest first — what every other test here filters a subset of. */
+    @Test
+    fun `the physical rungs are the console's own twelve values`() {
+        assertEquals(
+            listOf(40.0, 35.0, 30.0, 25.0, 20.0, 15.0, 10.0, 6.0, 3.0, 0.0, -3.0, -6.0),
+            MachinePresets.PHYSICAL_INCLINE_RUNGS,
+        )
+    }
+
+    /**
+     * A narrower range gets only the rungs that fall inside it — no synthetic endpoint the way
+     * [MachinePresets.ladder] adds one, because every value here is a claim that a physical button
+     * exists at it.
+     */
+    @Test
+    fun `a narrower range gets only the rungs it actually contains`() {
+        assertEquals(listOf(6.0, 3.0, 0.0, -3.0), MachinePresets.inclineLadder(-4.0, 8.0, physical))
+    }
+
+    /** A range with no fixed rung in it is an honestly empty column, not an invented one. */
+    @Test
+    fun `a range between two rungs offers nothing rather than a nearby value`() {
+        assertTrue(MachinePresets.inclineLadder(1.0, 2.0, physical).isEmpty())
+    }
+
+    /** Still bounded by the installation clamp, the same as every other spacing. */
+    @Test
+    fun `physical is still intersected with the installation clamp`() {
+        // MIN_INCLINE..MAX_INCLINE is -6.0..40.0 -- the same range PHYSICAL_INCLINE_RUNGS itself
+        // spans -- so a wildly over-reported machine range like -60..100 is still cut down to it,
+        // it just no longer removes any of the twelve rungs the way it did before the installation
+        // clamp was widened to match this console. See `a narrower range gets only the rungs it
+        // actually contains` above for a case that still visibly narrows the physical list.
+        val out = MachinePresets.inclineLadder(-60.0, 100.0, physical)
+        assertEquals(MachinePresets.PHYSICAL_INCLINE_RUNGS, out)
     }
 }

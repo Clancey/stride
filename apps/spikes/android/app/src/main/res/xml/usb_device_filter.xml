@@ -1,0 +1,18 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  The ICON Generic HID controller board this project's consoles have on the other end of their
+  one USB host port (see docs/DIRECT_MACHINE_PROTOCOL.md and ~/x22i-debug/INVESTIGATION_NOTES.md
+  §1: vendor 0x213C / 8508, product 0x0002, "ICON Generic HID", a vendor-defined HID report pipe).
+
+  Declaring this alongside a USB_DEVICE_ATTACHED intent-filter (see MainActivity's manifest entry)
+  is what lets Android grant Stride permission for this specific device automatically on attach,
+  the same way ifit-standalone.apk already does (its own usb_device_filter.xml, confirmed by
+  unpacking the APK, declares this identical vendor/product pair). Without it, permission depends
+  entirely on ERU's privileged broker re-granting it on every attach, which this console's own
+  attach/re-enumerate cycling has been observed to skip for Stride's uid while still granting
+  itself (com.ifit.eru) every time. This filter does not replace ERU's broker; it gives Stride a
+  second, independent path to the same grant that does not depend on ERU choosing to extend it.
+-->
+<resources>
+    <usb-device vendor-id="8508" product-id="2" />
+</resources>

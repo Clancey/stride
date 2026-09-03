@@ -1033,8 +1033,23 @@ object FitProValues {
      */
     fun metresToMiles(metres: Int): Double = metres / METRES_PER_MILE
 
-    /** Minutes per mile at [mph], or null when stopped — dividing by zero would render as "∞". */
-    fun paceMinPerMile(mph: Double): Double? = if (mph > 0.1) 60.0 / mph else null
+    /**
+     * Minutes per mile at [mph], or null when stopped — dividing by zero would render as "∞".
+     *
+     * Rounds [mph] to the tenth already shown on screen (the overlay's speed readout formats to one
+     * decimal place) before dividing, rather than dividing the raw register value. `KPH` only holds
+     * hundredths of a km/h, so a requested 4 mph reads back as something like 3.9956 or 4.0044 — at most
+     * ~0.006 mph off, confirmed live to pace a 15:01 mile instead of 15:00. That residual is an
+     * order of magnitude smaller than half a tenth of a mile per hour (0.05), so rounding to the
+     * displayed precision absorbs it completely and makes the pace shown agree with the speed shown,
+     * for any speed a rider would actually select — without having to track which write produced
+     * the reading. Two decimals would not be safe here: the residual is close enough to a
+     * hundredth's own half-width (0.005) that it would not always round away.
+     */
+    fun paceMinPerMile(mph: Double): Double? {
+        val rounded = Math.round(mph * 10.0) / 10.0
+        return if (rounded > 0.1) 60.0 / rounded else null
+    }
 
     /**
      * Translates FitPro's [FitProCodec.WorkoutMode] to the console-state *names* that
@@ -1209,6 +1224,7 @@ class DirectMachineClient(private val session: DirectMachineSession) {
                 ?.let(FitProCodec::decodeCalories),
             speedWritable = duringWorkout && session.supports(FitProCodec.Register.KPH) != false,
             inclineWritable = duringWorkout && session.supports(FitProCodec.Register.GRADE) != false,
+            wattsW = response.value(FitProCodec.Register.WATTS)?.let(FitProCodec::decodeInt),
             fanWritable = writable && session.fanRegister != null,
             // Whichever register this console said it implements, decoded to the shared FAN_*
             // numbering. Auto survives here where it used to be flattened away, because the
@@ -1308,6 +1324,10 @@ class DirectMachineClient(private val session: DirectMachineSession) {
             FitProCodec.Register.ACTUAL_KPH,
             FitProCodec.Register.ACTUAL_INCLINE,
             FitProCodec.Register.CURRENT_CALORIES,
+            // Motor power draw. Not shown anywhere on its own — it exists for
+            // MachineLink.everReportedLoad, issue #34's fallback for a console whose ACTUAL_KPH
+            // never proves itself.
+            FitProCodec.Register.WATTS,
         )
 
         /**
