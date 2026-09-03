@@ -7,6 +7,65 @@ what shipped rather than what was intended. Notes for a version come from
 `docs/release-notes/<version>.md` when that file exists, and from the commit subjects since the previous
 tag when it does not.
 
+## 1.2.4 — versionCode 18 — 2026-08-29
+
+**The buttons work again.** This release is mostly about controls that looked fine and did nothing.
+
+**Home was being refused by Android, not by Stride.** This console never ran a setup wizard, so Android still believed setup was in progress — and in that state it declines to open *any* home app. The Home button did nothing, the quick-pick columns did nothing, and anyone who opened Netflix on a machine with no physical buttons had no way back to Stride. Stride already puts back the permissions Android drops when it updates itself; it now fixes this too, the moment it starts.
+
+**The speed and incline columns had gone blank.** They opened onto nothing at all. The console publishes its buttons from the workout that is running, so a machine sitting idle answers "none" — and Stride believed that answer for good. It now asks again, and falls back to its own ladder rather than showing an empty column.
+
+**Speed and incline respond from a stopped machine.** The treadmill refuses to change either until a workout is running, so the columns were drawn dead and told you to press Start first. Tapping 5 means you want the belt at 5, so tapping a speed now starts the workout and takes it there. Incline does not start the belt — asking to tilt the deck is not asking to run, and that is how the machine's own buttons behave too.
+
+**Tap a number twice for a half step.** 5 then 5 asks for 5.5; 6 then 4 asks for 6.4. Pause a moment between taps and they stay two separate choices, so changing your mind still works the way it always did.
+
+**The incline column can be given wider steps.** Settings → Advanced → Incline quick picks. It is off by default and the column you have now does not change unless you turn it on. Turning it on spaces the buttons 5% apart climbing and 3% apart declining — not one step for both, because a treadmill that declines at all rarely goes past -6%, so a single wide step would leave you one decline button. The highest and lowest values Stride can actually command are always present. Machine-published and generated controls now use the intersection of the machine's range and Stride's installation safety limits, so a button never says 20% and silently sends 12%.
+
+**A machine with no decline no longer shows two buttons both reading 0.** They did different things. Nothing about it looked wrong, which is how it survived.
+
+**Pressing Stop on the treadmill now pauses Stride.** The console's own Stop used to leave the overlay counting a workout that had visibly ended — "Pause workout" over a belt standing still. Starting it again from the console picks the session back up.
+
+**Switching on no longer looks like a fault.** A console takes about a minute to find its treadmill from cold, and Stride was reporting that minute as a machine that had lost its belt and needed unplugging at the wall. It now says the treadmill is still starting up, and only raises the real alarm for a machine that had found its belt and then lost it.
+
+**The launcher does less work before it draws.** Restoring the app catalog used to enumerate every installed package and parse the cached catalog on Android's main thread during every launch. That work now happens in the background, with an honest loading or failure state until it finishes rather than a briefly empty catalog.
+
+**Direct hardware access will not take the treadmill away from iFit.** This one matters even if you never turn it on. Selecting it used to grab the console's USB connection out from under iFit's own service, which then could not get it back — leaving a treadmill nothing could drive until the machine was power-cycled, and on occasion until its cable was physically unplugged. Stride now refuses to take that connection while iFit is using it, and says so, rather than trading a working treadmill for an experiment that cannot succeed on this console anyway.
+
+**On an X22i, the direct connection now works.** Separately from everything above, 1.2.3 got that console through its handshake and then looped forever without ever reading anything. The console stamps its replies with its own address on the bus rather than the one it was asked, and Stride was treating that as a malformed frame — so every reading after the handshake was thrown away and the connection restarted, over and over, looking exactly like no console at all. Reads are confirmed working end to end on that machine now.
+
+**And a workout can now start on one.** That console was refusing to start a workout no matter what Stride sent. The reason turned out to be two settings iFit's own app writes immediately after unlocking, which no other treadmill generation uses and which nothing here had ever seen — the console will not accept a start until it has been told how starts are going to work. Stride now sends them, only to consoles that say they understand them, so nothing changes on any other machine.
+
+The corrected two-frame sequence was subsequently confirmed twice on a real X22i from a current-main debug build: `startWorkout()` returned `Ok` and the belt ran both times. That proves the complete initialization sequence end to end, not the effect of either setting in isolation. Pause and resume were not part of those runs.
+
+**The X22i shows a useful live speed.** Its `ACTUAL_KPH` register reports a valid-looking zero even while the belt is moving, although iFit still shows speed. Stride now follows iFit's belt-machine behavior and uses the console's read-back speed for the rider-facing speed and pace while a workout is active, until raw actual-speed telemetry proves it works. Safety and motion decisions continue to use only raw observed speed; a commanded value is never treated as proof that the belt moved.
+
+The direct connection itself is better understood than it was. Stride had been mis-reading the console's replies — dropping a padding byte, mistaking the console repeating a question for it answering one, and reading a checksum as a status — which is why it appeared to be refusing commands it had never actually been asked. That is fixed, along with a malformed command and the missing sync a USB console expects before it will talk. It still does not drive a Commercial 1750, but it now fails honestly.
+
+**The fan turns off when the workout ends.** Stride has switched the fan on at the start of every workout since that arrived and never once switched it off, so a console left alone after a run sat there blowing until somebody noticed. Ending a workout now shuts it off. Pausing does not — a pause is something you come back to, and a fan that stopped every time you caught your breath would be its own annoyance.
+
+**Ending also re-sends a zero speed**, rather than trusting that the stop landed. This is belt and braces, not a fix for a known failure: the stop already went out and this simply says it again, because End is a deliberate, final action and it is worth being certain. It is sent *after* the stop and can never delay it.
+
+**The deck flattens at the end of a run — but only when Stride can see the belt has stopped.** Finishing on a hill and leaving the deck there is untidy, so a workout now ends flat. It will decline to move it when it cannot confirm the belt is at rest, including on machines that report a speed Stride has learned not to believe. Moving a physical part under someone stepping off it is a worse outcome than a deck left on an incline, which is exactly where it sat before.
+
+**Vertical gain is no longer blank.** Stride integrates distance and incline throughout the workout and reports climbed feet without subtracting descents. Missing or backward readings do not erase progress, and a new workout or connection starts a fresh total.
+
+**A plain backdrop behind the track.** The virtual track used to sit over the app grid, so "Stride", "Your workout apps, one tap away" and the rest competed with it for attention. There is now a choice in Settings to put a plain, colour-matched screen behind it instead. Off by default, so nothing changes unless you ask. Tapping anywhere brings the apps back, and there is a labelled button too — the console has no Back button and a screen you cannot leave is not a feature.
+
+**Finished laps keep their colour.** The track used to empty back to bare lane every time you came round, so a long run looked the same at four miles as at one. Each completed lap now keeps the colour it was filled with and the next lap paints over it in a new one, cycling through a handful. Your first lap is the colours you already know, in the same places — the ground you have covered reads very slightly purer now that there is no second layer tinting it.
+
+**Stride is harder to talk into moving a belt it should not.** Before it will accept any command that moves anything, Stride runs one check to satisfy itself it is talking to a treadmill. That check was not confirming the reply came from the machine it had introduced itself to — on a shared wire, something else answering could have unlocked control and supplied the speed and incline limits everything else is measured against. It now checks. No machine has been seen doing this; it was a gap rather than a fault.
+
+
+Android's navigation bar stays hidden, as it was before — Stride supplies Back, Home and Recents itself, at a size you can hit from the deck.
+
+**The safety key is still the only emergency stop.** Nothing here changes what protects you, and Stride's stop remains best-effort.
+
+Installs as an update over 1.2.3.
+
+Tested on a NordicTrack Commercial 1750, including the belt: tapping a speed from a stopped machine started the workout and drove it to that speed, and a second tap on the same pill took it to a half step.
+
+The later changes above were tested on a second console — an Eway Xenon1 running GlassOS — including the belt: a workout was started, paused and ended, confirming the fan keeps running through a pause and stops at the end, and that the stop goes out before anything that tidies up after it. The X22i direct start sequence and vertical-gain calculation were also exercised on real hardware. The case the re-sent zero exists for — a stop that never landed — cannot be staged safely on a real treadmill, so it is covered by tests and by reasoning rather than by observation.
+
 ## 1.2.3 — versionCode 17 — 2026-08-24
 
 **Stride now speaks the rest of the X22i's handshake.** The last release got the console's USB pipe open. This one fixes what Stride said once it was.
