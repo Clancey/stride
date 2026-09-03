@@ -803,6 +803,16 @@ object MachineCoordinator {
      *
      * The ramp only ever applies upward. Asking for a lower speed is a single immediate command,
      * because slowing down is never the dangerous direction.
+     *
+     * The baseline for "how large" is [MachineLink.speedMph], not [MachineLink.observedSpeedMph].
+     * That reads as raw telemetry everywhere it matters for safety -- arrival, deck movement, stop
+     * confirmation -- but here it decided the *size of the step*, and on a console whose actual-speed
+     * register reports a confident zero without ever moving (the X22i's `ACTUAL_KPH`, see
+     * `MachineLink.speedMph`'s own doc), that made every request from a real cruising speed look like
+     * a request from a dead stop: the ramp's first step landed below where the belt already was,
+     * commanding a real, visible slowdown before climbing back to the target. `speedMph` only
+     * substitutes a value here in that same narrow case -- a console that has ever proven real motion,
+     * or isn't a FitPro belt console at all, sees the identical raw number either way.
      */
     fun setSpeedMph(mph: Double, onDone: ((Outcome) -> Unit)? = null) {
         val target = clampSpeed(mph)
@@ -811,7 +821,7 @@ object MachineCoordinator {
         // belt keeps accelerating after the rider has asked it not to. The generation is bumped
         // before anything is queued so the new jobs carry the new value.
         val gen = speedGeneration.incrementAndGet()
-        val current = MachineLink.observedSpeedMph
+        val current = MachineLink.speedMph
         if (current == null || target <= current || target - current <= MAX_STEP_UP_MPH) {
             submit(label = "Speed ${format(target)} mph", speedGen = gen, onDone = onDone) {
                 it.setSpeedKph(target * MPH_TO_KPH).toOutcome()
